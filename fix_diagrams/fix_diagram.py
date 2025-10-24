@@ -51,7 +51,7 @@ def find_complete_box(lines: List[str], start_row: int, start_col: int) -> Optio
             bottom_left_col = start_col
             break
         # Then look in a wider range for the bottom-left corner
-        for col in range(max(0, start_col - 5), min(len(line), start_col + 10)):
+        for col in range(max(0, start_col), min(len(line), start_col + 15)):  # Search forward more
             if line[col] == '└':
                 # Check if this could be a valid bottom-left for this box
                 # by looking for a corresponding bottom-right corner
@@ -62,7 +62,7 @@ def find_complete_box(lines: List[str], start_row: int, start_col: int) -> Optio
                     actual_width = potential_bottom_right - col + 1
 
                     # If widths are similar (within tolerance), accept this as the box
-                    if abs(expected_width - actual_width) <= 3:
+                    if abs(expected_width - actual_width) <= 10:  # Increased tolerance
                         bottom_row = row
                         bottom_left_col = col
                         break
@@ -191,6 +191,13 @@ def fix_diagram_improved(text: str) -> str:
         # Store the correct right position based on top border
         box['right_correct'] = box['right_top']
 
+        # Validate and fix bottom border alignment issues
+        if box['right_bottom'] - box['left'] + 1 != top_width:
+            # Bottom border doesn't match top border width - need to fix during reconstruction
+            box['bottom_needs_fix'] = True
+        else:
+            box['bottom_needs_fix'] = False
+
     # Process each line
     fixed_lines = []
     for line_num, original_line in enumerate(lines):
@@ -225,7 +232,7 @@ def reconstruct_line_corrected(original_line: str, boxes_on_line: List[dict], li
             # Top border - use the existing top border (it's authoritative)
             result += original_line[box['left']:box['right_top'] + 1]
         elif line_num == box['bottom']:
-            # Bottom border - fix to match top width
+            # Bottom border - always fix to match top width for consistency
             top_width = box['correct_width']
             corrected_bottom = '└' + '─' * (top_width - 2) + '┘'
             result += corrected_bottom
@@ -245,12 +252,19 @@ def reconstruct_line_corrected(original_line: str, boxes_on_line: List[dict], li
 
             result += '│' + content + '│'
 
-        # Update position to after this box's correct width
-        last_pos = box['left'] + box['correct_width']
+        # Update position to after this box's correct right position
+        last_pos = box['right_correct'] + 1
 
     # Add any remaining content after last box (this preserves arrows, spaces, etc.)
     if last_pos < len(original_line):
         remaining = original_line[last_pos:]
+
+        # Check if this is a bottom border line - if so, filter out border characters
+        is_bottom_border_line = any(line_num == box['bottom'] for box in boxes_on_line)
+        if is_bottom_border_line:
+            # Only preserve spaces and connectors, not malformed border characters
+            remaining = ''.join(c for c in remaining if c not in '└─┘')
+
         result += remaining
 
     return result
@@ -269,17 +283,21 @@ def extract_content_preserved(line: str, box: dict, all_lines: List[str], line_n
         if char == '│':
             pipe_positions.append(i)
 
-    # Find the pipe that comes after this box's left edge
+    # Find the pipe that comes after this box's left edge AND makes sense for this box
     right_col = -1
+    expected_right = left_col + box['correct_width'] - 1
+
     for pipe_pos in pipe_positions:
         if pipe_pos > left_col:
-            # This should be the right border of this box
-            right_col = pipe_pos
-            break
+            # Check if this pipe could be the right border of this box
+            # by comparing with the expected right position
+            if abs(pipe_pos - expected_right) <= 5:  # Allow some tolerance
+                right_col = pipe_pos
+                break
 
-    # If no pipe found, use the expected position based on top border
+    # If no suitable pipe found, use the expected position based on top border
     if right_col == -1:
-        right_col = left_col + box['correct_width'] - 1
+        right_col = expected_right
 
     # Extract content between the pipes
     if right_col > left_col + 1:
