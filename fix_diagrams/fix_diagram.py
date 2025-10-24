@@ -105,11 +105,34 @@ def calculate_box_width_improved(box: dict, lines: List[str]) -> int:
 
 def fix_diagram_improved(text: str) -> str:
     """Fix all boxes in a diagram with improved multi-box handling."""
-    lines = text.split('\\n')
+    lines = text.split('\n')
     boxes = find_all_boxes(lines)
 
     if not boxes:
         return text
+
+    # CORE FUNCTIONALITY: Simple single box fix
+    if len(boxes) == 1:
+        box = boxes[0]
+        # Calculate correct width from top border
+        top_width = box['right_top'] - box['left'] + 1
+
+        # Replace bottom border with correct width
+        bottom_line_num = box['bottom']
+        if bottom_line_num < len(lines):
+            original_line = lines[bottom_line_num]
+            # Find the original bottom border end position
+            original_end = original_line.find('┘', box['left'])
+            if original_end > box['left']:
+                # Create corrected bottom border
+                corrected_bottom = '└' + '─' * (top_width - 2) + '┘'
+                # Replace the entire original bottom border
+                before = original_line[:box['left']]
+                after = original_line[original_end + 1:]
+                lines[bottom_line_num] = before + corrected_bottom + after
+
+        # Return immediately for single boxes - skip complex multi-box logic
+        return '\n'.join(lines)
 
     # Calculate aligned widths
     for box in boxes:
@@ -132,7 +155,7 @@ def fix_diagram_improved(text: str) -> str:
         result_line = reconstruct_line(original_line, boxes_on_line, line_num, lines)
         fixed_lines.append(result_line)
 
-    return '\\n'.join(fixed_lines)
+    return '\n'.join(fixed_lines)
 
 def reconstruct_line(original_line: str, boxes_on_line: List[dict], line_num: int, all_lines: List[str]) -> str:
     """Reconstruct a line with properly aligned boxes."""
