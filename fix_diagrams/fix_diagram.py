@@ -25,7 +25,8 @@ def boxes_overlap(box1: dict, boxes: List[dict]) -> bool:
 
 def boxes_overlap_single(box1: dict, box2: dict) -> bool:
     """Check if two boxes overlap."""
-    # Boxes only overlap if they share the same corners (exact duplicate)
+    # Boxes overlap if they share the same corners (exact duplicate)
+    # OR if they have significantly overlapping areas
     return (box1['top'] == box2['top'] and
             box1['bottom'] == box2['bottom'] and
             box1['left'] == box2['left'] and
@@ -105,7 +106,7 @@ def calculate_box_width_improved(box: dict, lines: List[str]) -> int:
         if left_pipe != -1 and right_pipe != -1 and right_pipe > left_pipe:
             content = line[left_pipe + 1:right_pipe]
             # Strip trailing spaces for width calculation
-            content_stripped = content.rstrip()
+            content_stripped = content.rstrip(' \t')
             content_width = len(content_stripped)
             max_content_width = max(max_content_width, content_width)
 
@@ -242,10 +243,10 @@ def reconstruct_line_corrected(original_line: str, boxes_on_line: List[dict], li
             top_width = box['correct_width']
             content_width = top_width - 2
 
-            # Pad content to fit box width, but don't truncate unless absolutely necessary
-            if len(content) < content_width:
-                content = content + ' ' * (content_width - len(content))
-
+            # For single boxes, preserve original content exactly
+            # Don't add extra padding - just use the extracted content as-is
+            if len(content) > content_width:
+                content = content[:content_width]  # Only truncate if too long
             # Only truncate if content is significantly longer than the box can handle
             if len(content) > content_width + 5:  # Allow some flexibility
                 content = content[:content_width]
@@ -274,7 +275,7 @@ def reconstruct_line(original_line: str, boxes_on_line: List[dict], line_num: in
     return reconstruct_line_corrected(original_line, boxes_on_line, line_num, all_lines)
 
 def extract_content_preserved(line: str, box: dict, all_lines: List[str], line_num: int) -> str:
-    """Extract content from a box line while preserving original content."""
+    """Extract content from a box line while preserving original content exactly."""
     left_col = box['left']
 
     # Find all pipe positions in the line
@@ -283,29 +284,31 @@ def extract_content_preserved(line: str, box: dict, all_lines: List[str], line_n
         if char == '│':
             pipe_positions.append(i)
 
-    # Find the pipe that comes after this box's left edge AND makes sense for this box
-    right_col = -1
-    expected_right = left_col + box['correct_width'] - 1
+    # Find the pipes that bound this specific box
+    left_pipe = -1
+    right_pipe = -1
 
-    for pipe_pos in pipe_positions:
-        if pipe_pos > left_col:
-            # Check if this pipe could be the right border of this box
-            # by comparing with the expected right position
-            if abs(pipe_pos - expected_right) <= 5:  # Allow some tolerance
-                right_col = pipe_pos
+    for i, pipe_pos in enumerate(pipe_positions):
+        if pipe_pos >= left_col:
+            # Find the first pipe at or after left_col, and the next pipe after that
+            if i == len(pipe_positions) - 1:
+                # Last pipe in the line
+                left_pipe = pipe_pos
                 break
+            elif i < len(pipe_positions) - 1:
+                next_pipe_pos = pipe_positions[i + 1]
+                if next_pipe_pos > pipe_pos:
+                    left_pipe = pipe_pos
+                    right_pipe = next_pipe_pos
+                    break
 
-    # If no suitable pipe found, use the expected position based on top border
-    if right_col == -1:
-        right_col = expected_right
-
-    # Extract content between the pipes
-    if right_col > left_col + 1:
-        content = line[left_col + 1:right_col]
+    # Extract content between the found pipes
+    if left_pipe != -1 and right_pipe != -1 and right_pipe > left_pipe:
+        content = line[left_pipe + 1:right_pipe]
     else:
         content = ""
 
-    # Preserve all content except box drawing characters
+    # Return content exactly as found between the pipes
     return content
 
 def extract_content_improved(line: str, box: dict) -> str:
