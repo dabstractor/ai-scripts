@@ -25,10 +25,11 @@ def boxes_overlap(box1: dict, boxes: List[dict]) -> bool:
 
 def boxes_overlap_single(box1: dict, box2: dict) -> bool:
     """Check if two boxes overlap."""
-    # Boxes overlap if they share any boundary points
-    return (box1['top'] == box2['top'] and box1['bottom'] == box2['bottom'] and
-            (abs(box1['left'] - box2['left']) < 5 or
-             abs(box1['right_top'] - box2['right_top']) < 5))
+    # Boxes only overlap if they share the same corners (exact duplicate)
+    return (box1['top'] == box2['top'] and
+            box1['bottom'] == box2['bottom'] and
+            box1['left'] == box2['left'] and
+            box1['right_top'] == box2['right_top'])
 
 def find_complete_box(lines: List[str], start_row: int, start_col: int) -> Optional[dict]:
     """Find complete box with improved boundary detection."""
@@ -38,22 +39,33 @@ def find_complete_box(lines: List[str], start_row: int, start_col: int) -> Optio
     if top_right_col == -1:
         return None
 
-    # Find bottom-left corner
+    # Find bottom-left corner - look in a wider range and be more flexible
     bottom_row = None
     bottom_left_col = None
 
     for row in range(start_row + 1, len(lines)):
         line = lines[row]
+        # First check the exact same column
         if start_col < len(line) and line[start_col] == '└':
             bottom_row = row
             bottom_left_col = start_col
             break
-        # Look nearby
-        for col in range(max(0, start_col - 2), min(len(line), start_col + 3)):
+        # Then look in a wider range for the bottom-left corner
+        for col in range(max(0, start_col - 5), min(len(line), start_col + 10)):
             if line[col] == '└':
-                bottom_row = row
-                bottom_left_col = col
-                break
+                # Check if this could be a valid bottom-left for this box
+                # by looking for a corresponding bottom-right corner
+                potential_bottom_right = line.find('┘', col)
+                if potential_bottom_right != -1:
+                    # Calculate expected width based on top border
+                    expected_width = top_right_col - start_col + 1
+                    actual_width = potential_bottom_right - col + 1
+
+                    # If widths are similar (within tolerance), accept this as the box
+                    if abs(expected_width - actual_width) <= 3:
+                        bottom_row = row
+                        bottom_left_col = col
+                        break
         if bottom_row is not None:
             break
 
@@ -114,30 +126,70 @@ def fix_diagram_improved(text: str) -> str:
     # CORE FUNCTIONALITY: Simple single box fix
     if len(boxes) == 1:
         box = boxes[0]
-        # Calculate correct width from top border
+        # Calculate correct width from top border (this is the authoritative source)
         top_width = box['right_top'] - box['left'] + 1
 
-        # Replace bottom border with correct width
-        bottom_line_num = box['bottom']
-        if bottom_line_num < len(lines):
-            original_line = lines[bottom_line_num]
-            # Find the original bottom border end position
-            original_end = original_line.find('┘', box['left'])
-            if original_end > box['left']:
-                # Create corrected bottom border
-                corrected_bottom = '└' + '─' * (top_width - 2) + '┘'
-                # Replace the entire original bottom border
+        # Process all lines of the single box to ensure consistency
+        for line_num in range(box['top'], box['bottom'] + 1):
+            if line_num >= len(lines):
+                continue
+
+            original_line = lines[line_num]
+
+            if line_num == box['top']:
+                # Top border - should already be correct, but validate
+                expected_top = '┌' + '─' * (top_width - 2) + '┐'
+                # Replace only the box portion, preserve everything else
                 before = original_line[:box['left']]
-                after = original_line[original_end + 1:]
-                lines[bottom_line_num] = before + corrected_bottom + after
+                after = original_line[box['right_top'] + 1:]
+                lines[line_num] = before + expected_top + after
+
+            elif line_num == box['bottom']:
+                # Bottom border - fix to match top width
+                corrected_bottom = '└' + '─' * (top_width - 2) + '┘'
+                # Find the original bottom border end position
+                original_end = original_line.find('┘', box['left'])
+                if original_end > box['left']:
+                    # Replace the entire original bottom border
+                    before = original_line[:box['left']]
+                    after = original_line[original_end + 1:]
+                    lines[line_num] = before + corrected_bottom + after
+                else:
+                    # Fallback: replace at expected position
+                    before = original_line[:box['left']]
+                    after = original_line[box['left'] + top_width:]
+                    lines[line_num] = before + corrected_bottom + after
+
+            else:
+                # Content lines - ensure proper width
+                # Extract original content between pipes
+                left_pipe = original_line.find('│', box['left'])
+                right_pipe = original_line.rfind('│', box['left'])
+
+                if left_pipe != -1 and right_pipe != -1 and right_pipe > left_pipe:
+                    content = original_line[left_pipe + 1:right_pipe]
+                    # Pad or truncate content to fit the box width
+                    content_width = top_width - 2
+                    if len(content) < content_width:
+                        content = content + ' ' * (content_width - len(content))
+                    elif len(content) > content_width:
+                        content = content[:content_width]
+
+                    # Reconstruct the line with properly sized content
+                    before = original_line[:box['left']]
+                    after = original_line[right_pipe + 1:]
+                    lines[line_num] = before + '│' + content + '│' + after
 
         # Return immediately for single boxes - skip complex multi-box logic
         return '\n'.join(lines)
 
-    # Calculate aligned widths
+    # Calculate individual box widths based on top borders (authoritative source)
     for box in boxes:
-        width = calculate_box_width_improved(box, lines)
-        box['right_aligned'] = box['left'] + width + 1
+        # Use the top border width as the correct width for this box
+        top_width = box['right_top'] - box['left'] + 1
+        box['correct_width'] = top_width
+        # Store the correct right position based on top border
+        box['right_correct'] = box['right_top']
 
     # Process each line
     fixed_lines = []
@@ -151,56 +203,92 @@ def fix_diagram_improved(text: str) -> str:
         # Sort boxes by left position
         boxes_on_line.sort(key=lambda b: b['left'])
 
-        # Reconstruct the line with aligned boxes
-        result_line = reconstruct_line(original_line, boxes_on_line, line_num, lines)
+        # Reconstruct the line with individually corrected boxes
+        result_line = reconstruct_line_corrected(original_line, boxes_on_line, line_num, lines)
         fixed_lines.append(result_line)
 
     return '\n'.join(fixed_lines)
 
-def reconstruct_line(original_line: str, boxes_on_line: List[dict], line_num: int, all_lines: List[str]) -> str:
-    """Reconstruct a line with properly aligned boxes."""
+def reconstruct_line_corrected(original_line: str, boxes_on_line: List[dict], line_num: int, all_lines: List[str]) -> str:
+    """Reconstruct a line with individually corrected boxes, preserving content between them."""
     result = ""
     last_pos = 0
 
     for box in boxes_on_line:
-        # Add content before this box (preserve exactly)
+        # Add content before this box (preserve exactly - includes spaces, arrows, etc.)
         if last_pos < box['left']:
             before_content = original_line[last_pos:box['left']]
             result += before_content
 
-        # Add the properly aligned box
+        # Add the corrected box based on its top border width
         if line_num == box['top']:
-            # Top border
-            box_width = box['right_aligned'] - box['left'] + 1
-            result += '┌' + '─' * (box_width - 2) + '┐'
+            # Top border - use the existing top border (it's authoritative)
+            result += original_line[box['left']:box['right_top'] + 1]
         elif line_num == box['bottom']:
-            # Bottom border
-            box_width = box['right_aligned'] - box['left'] + 1
-            result += '└' + '─' * (box_width - 2) + '┘'
+            # Bottom border - fix to match top width
+            top_width = box['correct_width']
+            corrected_bottom = '└' + '─' * (top_width - 2) + '┘'
+            result += corrected_bottom
         else:
-            # Content line
-            content = extract_content_improved(original_line, box)
-            box_width = box['right_aligned'] - box['left'] + 1
-            content_width = box_width - 2
+            # Content line - extract and preserve content exactly as it appears
+            content = extract_content_preserved(original_line, box, all_lines, line_num)
+            top_width = box['correct_width']
+            content_width = top_width - 2
 
+            # Pad content to fit box width, but don't truncate unless absolutely necessary
             if len(content) < content_width:
-                content += ' ' * (content_width - len(content))
-            elif len(content) > content_width:
+                content = content + ' ' * (content_width - len(content))
+
+            # Only truncate if content is significantly longer than the box can handle
+            if len(content) > content_width + 5:  # Allow some flexibility
                 content = content[:content_width]
 
             result += '│' + content + '│'
 
-        # Update position to after this box
-        last_pos = box['right_aligned'] + 1
+        # Update position to after this box's correct width
+        last_pos = box['left'] + box['correct_width']
 
-    # Add any remaining content after last box
+    # Add any remaining content after last box (this preserves arrows, spaces, etc.)
     if last_pos < len(original_line):
         remaining = original_line[last_pos:]
-        # Preserve content if it looks meaningful
-        if remaining.strip() and any(c not in '│─└┘┌┐' for c in remaining):
-            result += remaining
+        result += remaining
 
     return result
+
+def reconstruct_line(original_line: str, boxes_on_line: List[dict], line_num: int, all_lines: List[str]) -> str:
+    """Legacy function - kept for compatibility."""
+    return reconstruct_line_corrected(original_line, boxes_on_line, line_num, all_lines)
+
+def extract_content_preserved(line: str, box: dict, all_lines: List[str], line_num: int) -> str:
+    """Extract content from a box line while preserving original content."""
+    left_col = box['left']
+
+    # Find all pipe positions in the line
+    pipe_positions = []
+    for i, char in enumerate(line):
+        if char == '│':
+            pipe_positions.append(i)
+
+    # Find the pipe that comes after this box's left edge
+    right_col = -1
+    for pipe_pos in pipe_positions:
+        if pipe_pos > left_col:
+            # This should be the right border of this box
+            right_col = pipe_pos
+            break
+
+    # If no pipe found, use the expected position based on top border
+    if right_col == -1:
+        right_col = left_col + box['correct_width'] - 1
+
+    # Extract content between the pipes
+    if right_col > left_col + 1:
+        content = line[left_col + 1:right_col]
+    else:
+        content = ""
+
+    # Preserve all content except box drawing characters
+    return content
 
 def extract_content_improved(line: str, box: dict) -> str:
     """Extract content from a box line with improved detection."""
