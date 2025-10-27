@@ -101,6 +101,19 @@ def find_complete_box(lines: List[str], start_row: int, start_col: int) -> Optio
         if line.count('────▶') > 1 or line.count('◀────') > 1:
             return None  # Multiple horizontal arrows suggest separate boxes, not one large box
 
+    # Check for incomplete box patterns that suggest separate structures
+    # Look for multiple top corners without corresponding bottom corners in the same columns
+    top_corners_in_box = 0
+    for row in range(start_row, bottom_row + 1):
+        line = lines[row]
+        for col in range(start_col, top_right_col + 1):
+            if col < len(line) and line[col] == '┌':
+                top_corners_in_box += 1
+
+    # If we find multiple top corners, this suggests multiple boxes shouldn't be merged
+    if top_corners_in_box > 1:
+        return None  # Multiple top corners suggest separate incomplete/complete boxes
+
     return {
         'top': start_row,
         'bottom': bottom_row,
