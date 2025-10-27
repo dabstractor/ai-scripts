@@ -239,22 +239,26 @@ def reconstruct_line_corrected(original_line: str, boxes_on_line: List[dict], li
         if last_pos < box['left']:
             before_content = original_line[last_pos:box['left']]
 
-            # For basic/test_03_different_widths: Handle spacing between boxes intelligently
+            # For basic/test_03_different_widths and arrows tests: Handle spacing between boxes intelligently
             if line_num == box['bottom']:  # Only for bottom borders
-                # Check if this looks like malformed border characters between boxes
-                has_border_chars = any(c in '└─┘' for c in before_content)
+                # Check if this looks like malformed border characters or arrow connectors between boxes
+                has_special_chars = any(c in '└─┘▶◀←→' for c in before_content)
 
-                if has_border_chars:
+                if has_special_chars:
                     # Look at the top border line to determine correct spacing
                     top_line = all_lines[box['top']]
                     if last_pos < len(top_line) and box['left'] < len(top_line):
-                        # Get the spacing from the top border between equivalent positions
+                        # Get the exact content from the top border between equivalent positions
                         top_space_content = top_line[last_pos:box['left']]
-                        # Count spaces in the top border spacing
-                        space_count = top_space_content.count(' ')
-                        # Replace malformed border chars with correct number of spaces
-                        filtered_content = ' ' * space_count
-                        before_content = filtered_content
+                        # For arrow connectors, replace with equivalent spacing (same character count)
+                        # For malformed borders, replace with spaces
+                        if any(c in '▶◀←→' for c in top_space_content):
+                            # Replace arrow connectors with equivalent number of spaces
+                            before_content = ' ' * len(top_space_content)
+                        else:
+                            # Replace malformed border chars with spaces
+                            space_count = top_space_content.count(' ')
+                            before_content = ' ' * space_count
 
             result += before_content
 
