@@ -93,6 +93,14 @@ def find_complete_box(lines: List[str], start_row: int, start_col: int) -> Optio
         if '▼' in line or '▲' in line:
             return None  # Arrow connectors suggest separate boxes, not one large box
 
+    # Additional check for horizontal arrows in multi-row scenarios
+    # Check if box area contains horizontal arrow patterns (suggesting separate connected boxes)
+    for row in range(start_row, bottom_row + 1):
+        line = lines[row]
+        # Look for patterns with multiple arrows suggesting multiple connected boxes
+        if line.count('────▶') > 1 or line.count('◀────') > 1:
+            return None  # Multiple horizontal arrows suggest separate boxes, not one large box
+
     return {
         'top': start_row,
         'bottom': bottom_row,
