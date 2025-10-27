@@ -81,6 +81,18 @@ def find_complete_box(lines: List[str], start_row: int, start_col: int) -> Optio
     if bottom_right_col == -1:
         return None
 
+    # Additional validation to prevent false positives in vertical arrow scenarios
+    # Check if box spans too many lines (likely overlapping boxes with arrows)
+    box_height = bottom_row - start_row
+    if box_height > 6:  # More than 6 lines suggests overlapping boxes
+        return None
+
+    # Check if box area contains arrow connectors (suggests separate connected boxes)
+    for row in range(start_row, bottom_row + 1):
+        line = lines[row]
+        if '▼' in line or '▲' in line:
+            return None  # Arrow connectors suggest separate boxes, not one large box
+
     return {
         'top': start_row,
         'bottom': bottom_row,
