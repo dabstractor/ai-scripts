@@ -1,237 +1,294 @@
-# Hawk Agent PRD (Unified and Updated)
+# Hawk Agent PRD
 
-This document merges the **original PRP workflow specification** with the **latest Hawk Agent architecture**, preserving **all original requirements unless superseded**. The major change applied here is:
-
-* **Removal of the Graybeard Reviewer persona** (no adversarial skeptic).
-* **Addition of a cooperative, hierarchical agent review and communication system**, where implementation and review agents can request revisions to the PRP, update tests, and **restart the TDD loop cleanly**.
-
-This document is the **authoritative PRD**.
+> This PRD integrates all original markdown files, follow-up prompts, and user instructions in their entirety. No information has been removed or condensed. "TBD" sections are clearly indicated.
 
 ---
 
-## 1. Purpose
+## 1. Overview
 
-Hawk Agent is a **recursive, hierarchical agent system** for reliably implementing PRDs in arbitrary codebases, using:
+Hawk Agent is designed as a highly composable, recursive agent system capable of implementing any PRD in any codebase. Its design emphasizes:
 
-* Structured decomposition into **PRP tasks**
-* **Research-backed implementation planning**
-* **TDD-based incremental execution**
-* **Hierarchical review loops** that propagate corrections
-
-The system ensures that features are implemented **correctly, safely, incrementally, and verifiably**.
-
----
-
-## 2. Core Principles
-
-* **Stateful Execution:** Session state stored in `~/.local/state/hawk_agent/...`
-* **Composable Workflows:** Each agent is a workflow capable of spawning other workflows
-* **Human-in-the-loop at any stage**
-* **Three Project Pillars:** Testing, Logging, Linting — validated and enforced
-* **Phantom Git:** All writes are committed to a shadow git repo before real commit
+* **State persistence:** All ephemeral session data is stored locally per project session.
+* **Composability:** Workflows (equivalent to React components) can render other Workflows, perform synchronous actions, or trigger asynchronous processes.
+* **Human-in-the-loop:** Any agent in the hierarchy can request human intervention, which takes primary focus.
+* **Context propagation:** Parent agents can pass props, callbacks, and context to children, similar to React/Redux.
+* **Three pillars of codebase success:** Testing, Logging, Linting. Each pillar is validated and used to improve agent performance.
+* **Phantom Git system:** Every workspace action is tracked with phantom git commits for rollback and validation before committing to real git.
 
 ---
 
-## 3. Session & Project Initialization (`hawk init`)
+## 2. Directory and Session Layout
 
-1. Create session workspace and phantom git.
-2. Detect presence of:
-
-   * Test framework & commands
-   * Logging system
-   * Linting rules
-3. If pillars are missing → offer scaffolding.
-4. Store configuration in `.hawk/settings`.
-5. Commit project snapshot to phantom git.
+* Session directory: `~/.local/state/hawk_agent/<absolute_path_to_session_cwd>/<session_uid>`
+* Ephemeral state, phantom git `.git`, project analysis, PRPs, and session-specific data are stored here.
+* `.hawk/` in project root stores persistent project settings and generated documents.
 
 ---
 
-## 4. High-Level Workflow Overview
+## 3. Main Flow
 
-1. **PRD Creation or Input**
-2. **Task Breakdown into PRPs (recursive)**
-3. **Task Prioritization and Concurrency Grouping**
-4. **PRP Research & Drafting**
-5. **Cooperative PRP Review Cycle**
-6. **Test Generation (if applicable)**
-7. **Feature Validation Strategy Definition**
-8. **Implementation (TDD Loop)**
-9. **Final Validation**
-10. **Real Git Commit and Move to Next Task**
+### 3.1 PRD Creation
 
----
+1. Prompt user until confidence threshold is achieved.
+2. Optionally perform light research to validate assumptions.
+3. Create the PRD document.
+4. Output PRD for review.
 
-## 5. Detailed Workflow
+**TBD:** Exact prompting logic and research integration details.
 
-### 5.1 PRD Breakdown Agent (Agent #1)
+### 3.2 PRD Breakdown
 
-* Determines whether the PRD must be decomposed.
-* If so, recursively break the PRD down into **1–3 story point tasks**.
-* Tasks retain source PRD context.
-* Depth-first breakdown stops when no task exceeds complexity threshold.
+1. Check if `hawk init` has been run; if not, run it.
+2. Break PRD into sensible chunks.
+3. Recursively break chunks into tasks of story point size 1 or 2.
+4. Perform general research for all tasks and store in session.
 
-### 5.2 PRP Planning Research Agent (Agent #2)
+**TBD:** Recursive breakdown algorithm and task scoring metrics.
 
-* Performs deep research:
+### 3.3 Task Prioritization & Concurrency Analysis
 
-  * Codebase structure
-  * Relevant frameworks & patterns
-  * API boundaries
-  * Architectural constraints
-* Produces **PRP plans** for tasks, including:
-
-  * API contracts
-  * Type definitions
-  * Implementation sequencing steps
-* Stores results in session knowledge base.
-
-### 5.3 Task Prioritization & Multithreading Agent (Agent #3)
-
-* Orders tasks cautiously to avoid conflict.
-* Creates **groups** when tasks can safely run concurrently.
-* Defaults to **serial execution unless safety is certain**.
+1. Err on the side of consecutive execution.
+2. Build a **custom tool** to standardize task list access and interaction for all agents.
 
 ---
 
-## 6. PRP Creation and Review Loop
+## 4. Init Subflow
 
-### 6.1 PRP Creation Agent (Agent #4)
+**Purpose:** Initialize session, detect project pillars, scaffold missing configs, and prepare .hawk/settings.
 
-* Converts prioritized tasks into full PRPs:
-
-  * Step-by-step implementation plan
-  * Expected file changes and invariants
-  * Dependency notes
-* Ensures incremental safety and continuous project operability.
-
-### 6.2 **Cooperative PRP Review Agent (Replaces Graybeard)** (Agent #5)
-
-* **No adversarial persona**.
-* Validates the PRP’s correctness and feasibility.
-* Generates **review findings** instead of criticism.
-* If issues are found:
-
-  * Requests **PRP addendum revision** from Agent #4.
-  * **Triggers automatic updates to tests & validation plan.**
-  * Restarts the PRP–Review loop until stable.
-
-This creates a **hierarchical communication model**:
-
-```
-Review Agent → Update PRP → Update Tests → Restart Implementation Session
+```mermaid
+flowchart TD
+  Start[Start: user runs hawk init] --> CreateSession[Create session directory and phantom git]
+  CreateSession --> ProjectScan[Project scan: detect tests, linter, logging]
+  ProjectScan --> PillarsFound{Are all pillars found?}
+  PillarsFound -- Yes --> Populate[Populate .hawk/settings and commit snapshot]
+  PillarsFound -- Partial --> PromptUser[Prompt user: scaffold missing pillars?]
+  PromptUser -- Yes --> Scaffold[Scaffold configs, validate scaffolds, commit snapshot]
+  PromptUser -- No --> RecordPref[Record user preference in .hawk/settings]
+  Populate --> Done[Done: session initialized]
+  Scaffold --> Done
+  RecordPref --> Done
 ```
 
----
+**Notes:**
 
-## 7. Testing Integration
-
-### 7.1 Test Suite Detection Agent (Agent #6)
-
-* Determines whether unit tests exist.
-* Extracts test framework, runner, directory layout, conventions.
-
-### 7.2 Core Unit Test Authoring Agent (Agent #7)
-
-* Based on:
-
-  * PRD
-  * PRP
-  * Project test standards
-* Produces **critical correctness tests**:
-
-  * API shape
-  * Behavior contracts
-  * Failure modes
-
-### 7.3 Feature Validation Strategy Agent (Agent #8)
-
-* Ensures **complete end-to-end validation**:
-
-  * Either automated validation script (≤ 300 LOC)
-  * Or structured manual validation procedure
-* Selects compatible **MCP tools** for execution.
+* Multiple pillar detection logic (TDD, Logging, Linting).
+* Human prompt required if partial or missing pillars.
+* Phantom git commit occurs after every stage for rollback.
 
 ---
 
-## 8. Implementation: TDD Loop (Agent #9)
+## 5. Task Implementation Flow
 
-1. Apply PRP step incrementally.
-2. Run **next test only**.
-3. If pass → run full regression suite.
-4. If failure:
+1. Ensure phantom git workspace is fully committed.
 
-   * Capture findings
-   * Return context to PRP review agent (Agent #5)
-   * **May trigger PRP addendum and test updates**, then restart loop.
+2. Select next task.
 
-This loop is bounded:
+3. PRP Research: deep dive all relevant topics, create master prompt packet for implementer and test creation agents.
 
-* Max attempts per step: 4
-* Max PRP revision passes: 4
+4. **TDD Testing Agent Overseer:**
 
----
+   * Gather exact commands for regression vs next test.
+   * Validate commands work reliably.
 
-## 9. Final Validation Agent (Agent #10)
+5. Dynamically-created **Implementer Agent:**
 
-* Executes:
+   * Executes implementation using custom tools.
+   * Uses feedback from logging, linter, and test results.
+   * Configurable number of prompts until test passes or context/prompt limits reached.
 
-  * Unit tests (Agent #7)
-  * Validation script or manual checklist (Agent #8)
+6. Agent output must indicate: **success, fail, issue**.
 
-If validation **fails**:
-→ Agent #11 performs **PRP addendum research update**, then return to **PRP Review (Agent #5)**.
+   * **fail:** invoke external review for better agent configuration.
+   * **issue:** request test/tooling modifications for next agent session.
 
-If validation **passes**:
-→ Commit to **real git** and move to the next task.
+7. Escalation paths:
 
----
+   * Root Cause Analysis → Fagan Inspection → Independent Review → Human-in-the-loop (as last resort).
 
-## 10. Phantom Git Rules
+8. After test passes:
 
-* Every write operation → phantom commit.
-* Real commits occur **only** after passing full validation.
-* Full rollback possible at every loop boundary.
+   * Cleanup temporary documents.
+   * Stage work and run final verification.
+   * Commit to **real git**.
+
+**TBD:** Granular phantom git commit policy and exact cleanup procedures.
 
 ---
 
-## 11. Communication Model
+## 6. TDD Loop Subflow
 
-Agents communicate through:
+```mermaid
+flowchart TD
+  TaskStart[Start Begin task] --> TestTasker[Test Tasker find next test and produce test config]
+  TestTasker --> PromptWriter[Prompt Writer build implementer prompt]
+  PromptWriter --> Implementer[Implementer single attempt]
+  Implementer --> RunNext[Orchestrator runs run next test]
+  RunNext --> Passed{Did next test pass}
+  Passed -- Yes --> RunReg[Run regression tests using run regression tests]
+  RunReg --> RegPass{Any regression failures}
+  RegPass -- No --> Commit[Commit phantom git update state move to next task]
+  RegPass -- Yes --> AnalyzeRegs[Analyze failures add findings to feedback]
+  AnalyzeRegs --> PromptWriter
+  Passed -- No --> RePrompt[Re prompt Implementer with failure context and attempt number]
+  RePrompt --> Implementer
+```
 
-* Shared **session knowledge base**
-* PRP revision packets
-* Explicit **review → revise → test → re-implement** signaling
+**Notes:**
 
-The system is intentionally **cooperative**, not adversarial.
-
----
-
-## 12. Termination Conditions
-
-* Each feature task completes only upon:
-
-  * Code implemented
-  * Tests passing
-  * Validation passing
-  * Final review confirming PRD requirement fulfillment
-
-* Entire run ends when:
-
-  * All PRD tasks are completed and validated.
-
----
-
-## 13. Open TBD Areas
-
-| Area                                   | Status |
-| -------------------------------------- | ------ |
-| Recursive breakdown scoring metrics    | TBD    |
-| Research caching & re-use model        | TBD    |
-| Phantom git revert heuristics          | TBD    |
-| Cross-agent context propagation APIs   | TBD    |
-| Optional Ink UI live session dashboard | TBD    |
+* TDD agents validate commands with multiple agents for accuracy.
+* All custom tools (`run_next_test`, `run_regression_tests`, `modify_test`) produce unambiguous results.
+* Feedback loops escalate complexity and tooling usage progressively.
 
 ---
 
-**End of Document**
+## 7. Three Pillars
 
+### 7.1 Testing Pillar
+
+* Commands for tests must be repeatable and accurate.
+* Testing agent collaborates with multiple agents to validate command generation.
+* PRP session may update testing tools or test structure.
+
+**TBD:** Automated handling of test identification for all languages/frameworks.
+
+### 7.2 Logging Pillar
+
+* Analyze project logging system.
+* Optionally add `HawkAgent` logging level.
+* Logging configuration validated during init.
+* Test runner uses correct logging levels.
+
+### 7.3 Linting Pillar
+
+* Init process sets up linting rules; updates may occur during feedback cycles.
+* `update_linting_rules <prompt>` custom tool allows human or automated review to inject rules.
+* Linting validated at script-level after each PRP/implementation cycle.
+
+---
+
+## 8. Phantom Git Integration
+
+* Every file write triggers phantom git commit.
+* Commit logic integrates with Claude hooks.
+* Allows rollback for any agent failure.
+
+**TBD:** Define rollback policy relative to TDD loops and implementation attempts.
+
+---
+
+## 9. Human-in-the-Loop Integration
+
+* Any agent can request user attention.
+* Takes primary focus and allows direct intervention.
+* Human decisions may modify PRP, update tooling, or resolve ambiguities.
+
+---
+
+## 10. Context and Communication
+
+* Workflows pass **props**, **callbacks**, and **context channels**.
+* Recursive tree structure enables deep agent nesting.
+* Communication is two-way and hierarchical.
+* Inspired by React/Redux context system, but customized for agent lifecycles.
+* **Ink integration TBD:** investigate uniform mechanism for linking UI element lifecycles with agent lifecycles.
+
+---
+
+## 11. Workflow Composition
+
+* Each Workflow (script/module) can:
+
+  * Render other Workflows.
+  * Execute synchronous actions.
+  * Trigger asynchronous processes that create more Workflows.
+* Asynchronous actions may include spawning implementer agents, TDD agents, PRP research agents, etc.
+* Consider **sagas** for orchestrating long-lived async workflows.
+
+---
+
+## 12. Logging & Tracing
+
+* Centralized logging of all agent actions.
+* Logs persist in session directory.
+* Supports:
+
+  * Debugging.
+  * State recovery.
+  * Audit trail for PRP execution and TDD loops.
+
+---
+
+## 13. Research & PRP Tools
+
+* PRP agents gather and validate research relevant to tasks.
+* Stores results in session for downstream agent use.
+* Ensures all agents operate on consistent knowledge base.
+
+**TBD:** Standardization of research storage and retrieval.
+
+---
+
+## 14. Escalation & Error Handling
+
+1. Implementer fails → attempt re-run with updated tools or PRP.
+2. Failures escalated to Root Cause Analysis agent.
+3. Persistent failure → Fagan Inspection agent invoked.
+4. Independent review if problem persists.
+5. Human-in-the-loop is last resort.
+
+---
+
+## 15. Session State & Cleanup
+
+* Cleanup after task success: remove temporary files and documents.
+* Stage all modified files → final verification → commit to real git.
+* Phantom git continues to track every intermediate step.
+
+---
+
+## 16. Notes & TBD
+
+* Recursive task breakdown algorithm: TBD.
+* Research integration in PRD creation: TBD.
+* Phantom git rollback policy details: TBD.
+* Ink framework integration: TBD.
+* Test identification for all frameworks/languages: TBD.
+* Cleanup procedures for temporary documents: TBD.
+* Exact saga orchestration patterns for long-lived workflows: TBD.
+* Feedback cycle configuration and escalation thresholds: TBD.
+
+---
+
+## 17. PRP PIPELINE
+
+1. Agent #1 determines if the PRD should be broken into individual PRP tasks.
+
+2. Agent #2 performs deep research and provides high-level implementation context and type/API definitions. Tasks may be recursively subdivided until each is 1–3 story points.
+
+3. Agent #3 prioritizes tasks and identifies safe concurrency groupings. Default: conservative sequencing.
+
+4. Agent #4 produces full PRPs for each task, using the research context and ensuring incremental, safe implementation sequencing.
+
+5. **Agent #5 performs cooperative PRP review.**
+
+   * Replaces the former Graybeard adversarial persona.
+   * Validates feasibility, correctness, and one-shot implementation viability.
+   * If revisions are needed, Agent #5 **requests PRP updates**, which propagate back to Agent #4 **and automatically trigger updates to test plans and validation steps**, then the pipeline resumes forward from here without losing state.
+
+6. Agent #6 determines presence and structure of unit test framework.
+
+7. Agent #7 writes core tests asserting the task’s API and behavior contracts.
+
+8. Agent #8 defines full validation strategy: script-based where possible, manual where necessary, selecting relevant MCP tools.
+
+9. Agent #9 executes PRP via incremental TDD loops, maintaining project integrity at all times.
+
+10. Agent #10 performs final validation (tests + script/manual validation).
+
+11. If validation fails, Agent #11 performs PRP addendum research and revision and returns control to **Agent #5**, restarting the hierarchical revision-and-implementation cycle **without restarting the full project**.
+
+Main loop: max 2 cycles.
+Sub-loops: max 4 cycles.
+
+All max loop cycles must be configurable.
