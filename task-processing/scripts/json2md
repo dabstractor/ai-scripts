@@ -1,0 +1,13 @@
+#!/usr/bin/env node
+
+const path = require('path');
+
+const projectDir = '/home/dustin/projects/ai-scripts/task-processing';
+
+// Save original cwd before changing directories
+const originalCwd = process.cwd();
+process.env.ORIGINAL_CWD = originalCwd;
+
+// Change to project directory and run
+process.chdir(projectDir);
+require(path.join(projectDir, 'dist/json2md'));

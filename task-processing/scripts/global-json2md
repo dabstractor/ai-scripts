@@ -1,0 +1,7 @@
+#!/bin/bash
+
+# JSON to Markdown converter - works from any directory
+# Save original cwd before changing directories
+export ORIGINAL_CWD="$PWD"
+cd /home/dustin/projects/ai-scripts/task-processing
+npm run json2md -- "$@"

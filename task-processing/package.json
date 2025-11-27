@@ -1,0 +1,34 @@
+{
+  "name": "ass-ez-loop",
+  "version": "1.0.0",
+  "description": "",
+  "license": "ISC",
+  "author": "",
+  "type": "commonjs",
+  "main": "index.js",
+  "bin": {
+    "json2md": "./scripts/json2md",
+    "tsk": "./scripts/tsk"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "ts-node src",
+    "json2md": "ts-node src/json2md.ts",
+    "tsk": "ts-node src/tsk.ts",
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "install-global": "npm run build && npm link"
+  },
+  "keywords": [],
+  "devDependencies": {
+    "@types/node": "^24.10.1",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "@types/inquirer": "^9.0.9",
+    "chalk": "^5.6.2",
+    "cli-progress": "^3.12.0",
+    "commander": "^14.0.2",
+    "zod": "^4.1.12"
+  }
+}

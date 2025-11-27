@@ -1,0 +1,51 @@
+{
+  "backlog": [
+    {
+      "type": "Phase",
+      "id": "P1",
+      "title": "Ass-Easy-Loop V1.0 Firmware Implementation",
+      "status": "Planned",
+      "description": "Complete firmware implementation for the RP2040-based loop pedal",
+      "milestones": [
+        {
+          "type": "Milestone",
+          "id": "P1.M1",
+          "title": "Environment & Infrastructure",
+          "status": "Ready",
+          "description": "Set up development environment and basic infrastructure",
+          "tasks": [
+            {
+              "type": "Task",
+              "id": "P1.M1.T1",
+              "title": "Project Configuration",
+              "status": "Researching",
+              "description": "Configure PlatformIO for RP2040-Zero and external libraries",
+              "subtasks": [
+                {
+                  "type": "Subtask",
+                  "id": "P1.M1.T1.S1",
+                  "title": "PlatformIO Configuration",
+                  "status": "Researching",
+                  "story_points": 1,
+                  "dependencies": [],
+                  "context_scope": "CONTRACT DEFINITION:\\n1. INPUT: PRD Section 5.1 (Toolchain).\\n2. LOGIC: Create platformio.ini with RP2040-Zero configuration\\n3. OUTPUT: Valid platformio.ini file"
+                },
+                {
+                  "type": "Subtask",
+                  "id": "P1.M1.T1.S2",
+                  "title": "Library Dependencies",
+                  "status": "Planned",
+                  "story_points": 1,
+                  "dependencies": [
+                    "P1.M1.T1.S1"
+                  ],
+                  "context_scope": "CONTRACT DEFINITION:\\n1. INPUT: PRD Section 5.2 (Libraries).\\n2. LOGIC: Add required libraries to platformio.ini\\n3. OUTPUT: Working library configuration"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
