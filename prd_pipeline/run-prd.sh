@@ -225,14 +225,14 @@ Be aware that the executing AI agent only receives:
    - Use the batch tools to spawn subagents to search the codebase for similar features/patterns
 
 2. **Internal Research at scale**
-   - Use relevant research and plan information in the \`$PLAN_DIR/M#P#\` directory according to the current plan/milestone assigned
+   - Use relevant research and plan information in the milestone directory (path provided below) according to the current plan/milestone assigned
    - Consider the scope of the subtask within the overall PRD. Respect the boundaries of scope of implementation for this task. Ensure cohesion across
    previously completed tasks and guard against harming future task completion in your plan
 
 2. **External Research at scale**
    - Create clear todos and spawn subagents with instructions to do deep research for similar features/patterns online and include urls to documentation and examples
    - Library documentation (include specific URLs)
-   - Store all research in plans/\[M#P#]/research according to the current task and reference critical pieces of documentation in the PRP with clear
+   - Store all research in the milestone's research/ subdirectory and reference critical pieces of documentation in the PRP with clear
    reasoning and instructions
    - Implementation examples (GitHub/StackOverflow/blogs)
    - New validation approach none found in existing codebase and user confirms they would like one added
@@ -283,8 +283,7 @@ After research completion, create comprehensive PRP writing plan using TodoWrite
 
 ## Output
 
-Store the PRP at \`$PLAN_DIR/M#P#/PRP.md\`
-Store documentation at \`$PLAN_DIR/M#P#/research/\`
+Store the PRP and documentation at the paths specified in the task assignment below.
 
 ## PRP Quality Gates
 
@@ -642,7 +641,7 @@ EOF
 read -r -d '' PRP_EXECUTE_PROMPT <<EOF
 # Execute BASE PRP
 
-## PRP File: plans/M#P#/PRP.md
+## PRP File: (path provided below)
 
 ## Mission: One-Pass Implementation Success
 
@@ -657,8 +656,9 @@ PRPs enable working code on the first attempt through:
 
 ## Execution Process
 
-1. **Load PRP**
-   - Read the specified PRP file completely
+1. **Load PRP (CRITICAL FIRST STEP)**
+   - **ACTION**: Use the \`Read\` tool to read the PRP file at the path provided in the instructions below.
+   - You MUST read this file before doing anything else. It contains your instructions.
    - Absorb all context, patterns, requirements and gather codebase intelligence
    - Use the provided documentation references and file patterns, consume the right documentation before the appropriate todo/task
    - Trust the PRP's context and guidance - it's designed for one-pass success
@@ -763,6 +763,7 @@ smart_commit() {
 # A. Task Breakdown (Only run if we are starting at P1.M1 or if tasks.json is missing)
 if [[ ! -f "$TASKS_FILE" ]]; then
     print -P "%F{magenta}[PHASE 0]%f Generating breakdown..."
+    mkdir -p "$PLAN_DIR/architecture"
     run_with_retry $AGENT --system-prompt="$TASK_BREAKDOWN_SYSTEM_PROMPT" -p "$TASK_BREAKDOWN_PROMPT"
     [ -f "$TASKS_FILE" ] && print -P "%F{green}[PHASE 0]%f Task breakdown complete."
 fi
@@ -793,23 +794,27 @@ for (( i=0; i<$total_phases; i++ )); do
 
         print -P "\n%B%F{green}>>> EXECUTING $ID%f%b"
 
+        # Ensure plan directories exist
+        mkdir -p "$DIRNAME/research"
+
         run_with_retry tsk update "$ID" Researching
         run_with_retry $AGENT -p "$PRP_CREATE_PROMPT Phase $PHASE_NUM Milestone $MS_NUM of $PRD_FILE. Store it at $DIRNAME/PRP.md.\n<plan_status>\n$(tsk status)\n</plan_status>"
         [ ! -f "$DIRNAME/PRP.md" ] && print -P "%F{red}[ERROR]%f PRP.md not found. Retrying..." && $AGENT --continue -p "You didn't write the file. Make sure you write the file to $DIRNAME/PRP.md"
         [ ! -f "$DIRNAME/PRP.md" ] && print -P "%F{red}[ERROR]%f PRP.md not found. Aborting..." && exit 1
 
         run_with_retry tsk update "$ID" Implementing
-        run_with_retry $AGENT -p "$PRP_EXECUTE_PROMPT Phase $PHASE_NUM Milestone $MS_NUM PRP at @$DIRNAME/PRP.md"
+        run_with_retry $AGENT -p "$PRP_EXECUTE_PROMPT Phase $PHASE_NUM Milestone $MS_NUM. The PRP file is located at: $DIRNAME/PRP.md. READ IT NOW."
 
         git add $TASKS_FILE
-        [ ! -f $(git diff) ] && print -P "%F{red}[ERROR]%f no diff found after Phase $PHASE_NUM Milestone $MS_NUM. Aborting..." && exit 1
+        [[ -z "$(git diff HEAD --name-only)" ]] && print -P "%F{red}[ERROR]%f no diff found after Phase $PHASE_NUM Milestone $MS_NUM. Aborting..." && exit 1
 
         run_with_retry tsk update "$ID" Complete
 
         # Reinforced Cleanup Instructions
         print -P "%F{blue}[CLEANUP]%f Cleaning up $ID..."
 
-        run_with_retry $AGENT -p "$CLEANUP_PROMPT"
+        # Allow cleanup to fail without breaking the loop (add || true)
+        run_with_retry $AGENT -p "$CLEANUP_PROMPT" || print -P "%F{yellow}[WARN]%f Cleanup failed, proceeding to commit..."
 
         smart_commit
     done
