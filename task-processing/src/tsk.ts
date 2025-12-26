@@ -10,6 +10,57 @@ import { Backlog, Status, Subtask, Task, Milestone, Phase, NextTaskContext, Cont
 // Zod schemas for validation
 const StatusSchema = z.enum(['Planned', 'Researching', 'Ready', 'Implementing', 'Complete', 'Failed']);
 
+const VALID_STATUSES: Status[] = ['Planned', 'Researching', 'Ready', 'Implementing', 'Complete', 'Failed'];
+
+/**
+ * Fuzzy match a string to a valid Status.
+ * Tries: exact (case-insensitive), prefix match, substring match.
+ * Throws if no match or ambiguous.
+ */
+function matchStatus(input: string): Status {
+  const inputLower = input.toLowerCase().trim();
+
+  // Exact match (case-insensitive)
+  for (const s of VALID_STATUSES) {
+    if (s.toLowerCase() === inputLower) return s;
+  }
+
+  // Prefix match
+  const prefixMatches = VALID_STATUSES.filter(s => s.toLowerCase().startsWith(inputLower));
+  if (prefixMatches.length === 1) return prefixMatches[0];
+  if (prefixMatches.length > 1) {
+    throw new Error(`Ambiguous status '${input}'. Matches: ${prefixMatches.join(', ')}`);
+  }
+
+  // Substring match
+  const substrMatches = VALID_STATUSES.filter(s => s.toLowerCase().includes(inputLower));
+  if (substrMatches.length === 1) return substrMatches[0];
+  if (substrMatches.length > 1) {
+    throw new Error(`Ambiguous status '${input}'. Matches: ${substrMatches.join(', ')}`);
+  }
+
+  throw new Error(`Unknown status '${input}'. Valid: ${VALID_STATUSES.join(', ')}`);
+}
+
+/**
+ * Normalize an ID to uppercase with periods (e.g., 'p1m1t1s1' -> 'P1.M1.T1.S1').
+ */
+function normalizeId(nodeId: string): string {
+  // Already has periods - just uppercase
+  if (nodeId.includes('.')) {
+    return nodeId.toUpperCase();
+  }
+
+  // Match segments like P1, M1, T1, S1 (case-insensitive)
+  const parts = nodeId.match(/[PMTSpmts]\d+/g);
+  if (parts && parts.length > 0) {
+    return parts.map(p => p.toUpperCase()).join('.');
+  }
+
+  // Fallback: just uppercase
+  return nodeId.toUpperCase();
+}
+
 const SubtaskSchema = z.object({
   type: z.literal('Subtask'),
   id: z.string(),
@@ -382,19 +433,17 @@ function main(): void {
   program
     .command('update')
     .description('Update task status')
-    .argument('<task-id>', 'Task ID (e.g., P1.M1.T1.S1)')
-    .argument('<status>', 'New status (Planned, Researching, Ready, Implementing, Complete, Failed)')
+    .argument('<task-id>', 'Task ID (e.g., P1.M1.T1.S1 or p1m1t1s1)')
+    .argument('<status>', 'New status (fuzzy matched, e.g., "comp" -> Complete)')
     .argument('[json-file]', 'JSON file containing tasks (default: tasks.json)')
-    .action((taskId, newStatus, jsonFile = 'tasks.json') => {
+    .action((taskId, statusInput, jsonFile = 'tasks.json') => {
       try {
-        // Validate status
-        if (!StatusSchema.safeParse(newStatus).success) {
-          throw new Error(`Invalid status: ${newStatus}. Must be one of: Planned, Researching, Ready, Implementing, Complete, Failed`);
-        }
+        const normalizedId = normalizeId(taskId);
+        const matchedStatus = matchStatus(statusInput);
 
         const manager = new TaskManager(jsonFile);
-        manager.updateTaskStatus(taskId, newStatus as Status);
-        console.log(chalk.green(`Updated ${taskId} status to ${newStatus}`));
+        manager.updateTaskStatus(normalizedId, matchedStatus);
+        console.log(chalk.green(`Updated ${normalizedId} status to ${matchedStatus}`));
       } catch (error) {
         console.error(chalk.red('Error:'), error instanceof Error ? error.message : String(error));
         process.exit(1);
@@ -429,7 +478,5 @@ function main(): void {
   program.parse();
 }
 
-// Run CLI if this file is executed directly
-if (require.main === module) {
-  main();
-}
+// Run CLI - always run main() since this is loaded by wrapper scripts
+main();
