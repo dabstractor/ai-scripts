@@ -3,9 +3,9 @@
     {
       "type": "Phase",
       "id": "P1",
-      "title": "Ass-Easy-Loop V1.0 Firmware Implementation",
+      "title": "Sample Project Phase 1",
       "status": "Planned",
-      "description": "Complete firmware implementation for the RP2040-based loop pedal",
+      "description": "Sample phase for task tracking demonstration",
       "milestones": [
         {
           "type": "Milestone",

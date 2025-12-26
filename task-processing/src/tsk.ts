@@ -158,6 +158,44 @@ class TaskManager {
     return this.findNextActiveSubtask();
   }
 
+  private completeChildrenRecursively(node: any): void {
+    if (node.subtasks) {
+      for (const subtask of node.subtasks) {
+        subtask.status = 'Complete';
+      }
+    }
+    if (node.tasks) {
+      for (const task of node.tasks) {
+        task.status = 'Complete';
+        this.completeChildrenRecursively(task);
+      }
+    }
+    if (node.milestones) {
+      for (const milestone of node.milestones) {
+        milestone.status = 'Complete';
+        this.completeChildrenRecursively(milestone);
+      }
+    }
+  }
+
+  private checkAndCompleteParent(parent: any): void {
+    if (!parent) return;
+
+    let allComplete = false;
+
+    if (parent.subtasks) {
+      allComplete = parent.subtasks.length > 0 && parent.subtasks.every((s: Subtask) => s.status === 'Complete');
+    } else if (parent.tasks) {
+      allComplete = parent.tasks.length > 0 && parent.tasks.every((t: Task) => t.status === 'Complete');
+    } else if (parent.milestones) {
+      allComplete = parent.milestones.length > 0 && parent.milestones.every((m: Milestone) => m.status === 'Complete');
+    }
+
+    if (allComplete && parent.status !== 'Complete') {
+      parent.status = 'Complete';
+    }
+  }
+
   public updateTaskStatus(id: string, newStatus: Status): void {
     const result = this.findNodeById(id);
     if (!result) {
@@ -165,6 +203,15 @@ class TaskManager {
     }
 
     result.node.status = newStatus;
+
+    // If marking a parent as Complete, complete all children
+    if (newStatus === 'Complete') {
+      this.completeChildrenRecursively(result.node);
+    }
+
+    // Check if all siblings are Complete, and if so, complete the parent
+    this.checkAndCompleteParent(result.parent);
+
     this.saveBacklog();
   }
 
@@ -220,9 +267,9 @@ class TaskManager {
         {
           type: 'Phase',
           id: 'P1',
-          title: 'Ass-Easy-Loop V1.0 Firmware Implementation',
+          title: 'Sample Project Phase 1',
           status: 'Planned',
-          description: 'Complete firmware implementation for the RP2040-based loop pedal',
+          description: 'Sample phase for task tracking demonstration',
           milestones: [
             {
               type: 'Milestone',
