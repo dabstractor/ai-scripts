@@ -11,19 +11,47 @@ unalias() { builtin unalias "$@" 2>/dev/null || true }
 setopt aliases
 
 # --- 2. Parameter Parsing ---
+SCOPE="${SCOPE:-task}"  # Default to task-level
 START_PHASE=1
 START_MS=1
+START_TASK=1
+START_SUBTASK=1
 
-while getopts "p:m:" opt; do
+while getopts "s:p:m:t:u:-:" opt; do
   case $opt in
+    s) SCOPE=$OPTARG ;;
     p) START_PHASE=$OPTARG ;;
     m) START_MS=$OPTARG ;;
-    *) print "Usage: $0 [-p phase_number] [-m milestone_number]"; exit 1 ;;
+    t) START_TASK=$OPTARG ;;
+    u) START_SUBTASK=$OPTARG ;;
+    -)
+      case "${OPTARG}" in
+        scope)       SCOPE="${!OPTIND}"; OPTIND=$(( OPTIND + 1 )) ;;
+        scope=*)     SCOPE="${OPTARG#*=}" ;;
+        phase)       START_PHASE="${!OPTIND}"; OPTIND=$(( OPTIND + 1 )) ;;
+        phase=*)     START_PHASE="${OPTARG#*=}" ;;
+        milestone)   START_MS="${!OPTIND}"; OPTIND=$(( OPTIND + 1 )) ;;
+        milestone=*) START_MS="${OPTARG#*=}" ;;
+        task)        START_TASK="${!OPTIND}"; OPTIND=$(( OPTIND + 1 )) ;;
+        task=*)      START_TASK="${OPTARG#*=}" ;;
+        subtask)     START_SUBTASK="${!OPTIND}"; OPTIND=$(( OPTIND + 1 )) ;;
+        subtask=*)   START_SUBTASK="${OPTARG#*=}" ;;
+        *) print "Usage: $0 [--scope=phase|milestone|task|subtask] [--phase=N] [--milestone=N] [--task=N] [--subtask=N]"; exit 1 ;;
+      esac ;;
+    *) print "Usage: $0 [-s phase|milestone|task|subtask] [-p phase_number] [-m milestone_number] [-t task_number] [-u subtask_number]
+   Or: $0 [--scope=phase|milestone|task|subtask] [--phase=N] [--milestone=N] [--task=N] [--subtask=N]"; exit 1 ;;
   esac
 done
 
+# Validate scope
+case $SCOPE in
+  phase|milestone|task|subtask) ;;
+  *) print -P "%F{red}[ERROR]%f Invalid scope: '$SCOPE'. Must be: phase, milestone, task, or subtask"; exit 1 ;;
+esac
+
 # --- 3. Configuration ---
 AGENT="${AGENT:-glp}"
+BREAKDOWN_AGENT="${BREAKDOWN_AGENT:-$AGENT}"
 TASKS_FILE="tasks.json"
 PRD_FILE="PRD.md"
 PLAN_DIR="plan"
@@ -194,9 +222,14 @@ $(cat "$PRD_FILE")
 EOF
 
 read -r -d '' PRP_CREATE_PROMPT <<EOF
-# Create BASE PRP
+# Create PRP for Work Item
 
-## Feature: Next milestone from task list
+## Work Item Information
+
+**ITEM TITLE**: <item_title>
+**ITEM DESCRIPTION**: <item_description>
+
+You are creating a PRP (Product Requirement Prompt) for this specific work item.
 
 ## PRP Creation Mission
 
@@ -225,24 +258,24 @@ Be aware that the executing AI agent only receives:
    - Use the batch tools to spawn subagents to search the codebase for similar features/patterns
 
 2. **Internal Research at scale**
-   - Use relevant research and plan information in the milestone directory (path provided below) according to the current plan/milestone assigned
-   - Consider the scope of the subtask within the overall PRD. Respect the boundaries of scope of implementation for this task. Ensure cohesion across
-   previously completed tasks and guard against harming future task completion in your plan
+   - Use relevant research and plan information in the plan/architecture directory
+   - Consider the scope of this work item within the overall PRD. Respect the boundaries of scope of implementation. Ensure cohesion across
+   previously completed work items and guard against harming future work items in your plan
 
-2. **External Research at scale**
+3. **External Research at scale**
    - Create clear todos and spawn subagents with instructions to do deep research for similar features/patterns online and include urls to documentation and examples
    - Library documentation (include specific URLs)
-   - Store all research in the milestone's research/ subdirectory and reference critical pieces of documentation in the PRP with clear
+   - Store all research in the work item's research/ subdirectory and reference critical pieces of documentation in the PRP with clear
    reasoning and instructions
    - Implementation examples (GitHub/StackOverflow/blogs)
    - New validation approach none found in existing codebase and user confirms they would like one added
    - Best practices and common pitfalls found during research
    - Use the batch tools to spawn subagents to search for similar features/patterns online and include urls to documentation and examples
 
-3. **User Clarification**
+4. **User Clarification**
    - Ask for clarification if you need it
    - If no testing framework is found, ask the user if they would like to set one up
-   - If a fundamental misalignemnt of objectives across tasks is detected, halt and produce a thorough explanation of the problem at a 10th grade level
+   - If a fundamental misalignemnt of objectives across work items is detected, halt and produce a thorough explanation of the problem at a 10th grade level
 
 ## PRP Generation Process
 
@@ -259,7 +292,7 @@ _"If someone knew nothing about this codebase, would they have everything needed
 
 Transform your research findings into the template sections:
 
-**Goal Section**: Use research to define specific, measurable Feature Goal and concrete Deliverable
+**Goal Section**: Use research to define specific, measurable Feature Goal and concrete Deliverable based on the work item title and description
 **Context Section**: Populate YAML structure with your research findings - specific URLs, file patterns, gotchas
 **Implementation Tasks**: Create dependency-ordered tasks using information-dense keywords from codebase analysis
 **Validation Gates**: Use project-specific validation commands that you've verified work in this codebase
@@ -283,7 +316,7 @@ After research completion, create comprehensive PRP writing plan using TodoWrite
 
 ## Output
 
-Store the PRP and documentation at the paths specified in the task assignment below.
+Store the PRP and documentation at the path specified in your instructions.
 
 ## PRP Quality Gates
 
@@ -712,15 +745,190 @@ $PRP_README
 EOF
 
 read -r -d '' CLEANUP_PROMPT <<EOF
-Clean up any temporary files you created. Check \`git diff\` for reference. \
-DO NOT DELETE OR MODIFY: \
-1. The 'plan' directory (or 'PRPs/templates', etc.) \
-2. The '$TASKS_FILE' file. \
-Only remove files that are not linked in the README or are clearly temporary junk.
+Clean up and organize files after implementation. Check \`git diff\` for reference.
+
+## DO NOT DELETE OR MODIFY:
+1. The 'plan' directory structure (except for organizing docs as specified below)
+2. The '$TASKS_FILE' file
+3. README.md and any readme-adjacent files (CONTRIBUTING.md, LICENSE, etc.)
+
+## DOCUMENTATION ORGANIZATION:
+First, ensure \`plan/docs\` exists: \`mkdir -p plan/docs\`
+
+Then, MOVE (not delete) any markdown documentation files you created during implementation to \`plan/docs/\`:
+- Research notes, design docs, architecture documentation
+- Implementation notes or technical writeups
+- Reference documentation or guides
+- Any other .md files that are not core project files
+
+## KEEP IN ROOT:
+Only these types of files should remain in the project root:
+- README.md and readme-adjacent files (CONTRIBUTING.md, LICENSE, etc.)
+- Core config files (package.json, tsconfig.json, etc.)
+- Build and script files
+
+## DELETE:
+- Temporary files clearly marked as temp or scratch
+- Duplicate files
+- Files that serve no ongoing purpose
+
+Be selective - keep the root clean and organized.
 EOF
 
 
 # --- 4. Helpers ---
+
+# Generate ID based on scope
+# Usage: generate_id <phase_num> <milestone_num> <task_num> <subtask_num>
+# Returns: P1, P1.M1, P1.M1.T1, or P1.M1.T1.S1 depending on SCOPE
+generate_id() {
+    local phase_num=$1
+    local milestone_num=$2
+    local task_num=$3
+    local subtask_num=$4
+
+    case $SCOPE in
+        phase)     echo "P${phase_num}" ;;
+        milestone) echo "P${phase_num}.M${milestone_num}" ;;
+        task)      echo "P${phase_num}.M${milestone_num}.T${task_num}" ;;
+        subtask)   echo "P${phase_num}.M${milestone_num}.T${task_num}.S${subtask_num}" ;;
+    esac
+}
+
+# Generate directory name based on scope
+# Usage: generate_dirname <phase_num> <milestone_num> <task_num> <subtask_num>
+# Returns: P1, P1M1, P1M1T1, or P1M1T1S1 depending on SCOPE
+generate_dirname() {
+    local phase_num=$1
+    local milestone_num=$2
+    local task_num=$3
+    local subtask_num=$4
+
+    case $SCOPE in
+        phase)     echo "P${phase_num}" ;;
+        milestone) echo "P${phase_num}M${milestone_num}" ;;
+        task)      echo "P${phase_num}M${milestone_num}T${task_num}" ;;
+        subtask)   echo "P${phase_num}M${milestone_num}T${task_num}S${subtask_num}" ;;
+    esac
+}
+
+# Get item title from tasks.json
+# Usage: get_item_title <phase_num> <milestone_num> <task_num> <subtask_num>
+get_item_title() {
+    local phase_num=$1
+    local milestone_num=$2
+    local task_num=$3
+    local subtask_num=$4
+    local phase_idx=$((phase_num - 1))
+    local ms_idx=$((milestone_num - 1))
+    local task_idx=$((task_num - 1))
+    local subtask_idx=$((subtask_num - 1))
+
+    case $SCOPE in
+        phase)
+            jq -r ".backlog[$phase_idx].title // empty" "$TASKS_FILE"
+            ;;
+        milestone)
+            jq -r ".backlog[$phase_idx].milestones[$ms_idx].title // empty" "$TASKS_FILE"
+            ;;
+        task)
+            jq -r ".backlog[$phase_idx].milestones[$ms_idx].tasks[$task_idx].title // empty" "$TASKS_FILE"
+            ;;
+        subtask)
+            jq -r ".backlog[$phase_idx].milestones[$ms_idx].tasks[$task_idx].subtasks[$subtask_idx].title // empty" "$TASKS_FILE"
+            ;;
+    esac
+}
+
+# Get item description from tasks.json
+# Usage: get_item_description <phase_num> <milestone_num> <task_num> <subtask_num>
+get_item_description() {
+    local phase_num=$1
+    local milestone_num=$2
+    local task_num=$3
+    local subtask_num=$4
+    local phase_idx=$((phase_num - 1))
+    local ms_idx=$((milestone_num - 1))
+    local task_idx=$((task_num - 1))
+    local subtask_idx=$((subtask_num - 1))
+
+    case $SCOPE in
+        phase)
+            jq -r ".backlog[$phase_idx].description // empty" "$TASKS_FILE"
+            ;;
+        milestone)
+            jq -r ".backlog[$phase_idx].milestones[$ms_idx].description // empty" "$TASKS_FILE"
+            ;;
+        task)
+            jq -r ".backlog[$phase_idx].milestones[$ms_idx].tasks[$task_idx].description // empty" "$TASKS_FILE"
+            ;;
+        subtask)
+            jq -r ".backlog[$phase_idx].milestones[$ms_idx].tasks[$task_idx].subtasks[$subtask_idx].context_scope // empty" "$TASKS_FILE"
+            ;;
+    esac
+}
+
+# Generate scope name for prompts (capitalized)
+get_scope_name() {
+    case $SCOPE in
+        phase)     echo "Phase" ;;
+        milestone) echo "Milestone" ;;
+        task)      echo "Task" ;;
+        subtask)   echo "Subtask" ;;
+    esac
+}
+
+# Generate scope article (a/an) for prompts
+get_scope_article() {
+    case $SCOPE in
+        phase)     echo "a" ;;
+        milestone) echo "a" ;;
+        task)      echo "a" ;;
+        subtask)   echo "a" ;;
+    esac
+}
+
+# Execute a single work item (phase/milestone/task/subtask)
+# Usage: execute_item <id> <dirname> <phase_num> <ms_num> <task_num> <subtask_num>
+execute_item() {
+    local id=$1
+    local dirname=$2
+    local phase_num=$3
+    local ms_num=$4
+    local task_num=$5
+    local subtask_num=$6
+
+    print -P "\n%B%F{green}>>> EXECUTING $id%f%b"
+
+    mkdir -p "$dirname/research"
+
+    # If PRP already exists, skip to implementation
+    if [[ -f "$dirname/PRP.md" ]]; then
+        print -P "%F{yellow}[SKIP]%f PRP exists, skipping to implementation"
+        run_with_retry tsk update "$id" Implementing
+    else
+        run_with_retry tsk update "$id" Researching
+        run_with_retry $AGENT -p "$PRP_CREATE_PROMPT Create a PRP for $(get_scope_name) $id of the PRD. Store it at $dirname/PRP.md.
+<item_title>$(get_item_title $phase_num $ms_num $task_num $subtask_num)</item_title>
+<item_description>$(get_item_description $phase_num $ms_num $task_num $subtask_num)</item_description>
+<plan_status>$(tsk status)</plan_status>"
+        [ ! -f "$dirname/PRP.md" ] && print -P "%F{red}[ERROR]%f PRP.md not found. Retrying..." && $AGENT --continue -p "You didn't write the file. Make sure you write the file to $dirname/PRP.md"
+        [ ! -f "$dirname/PRP.md" ] && print -P "%F{red}[ERROR]%f PRP.md not found. Aborting..." && exit 1
+        run_with_retry tsk update "$id" Implementing
+    fi
+
+    run_with_retry $AGENT -p "$PRP_EXECUTE_PROMPT Execute the PRP for $(get_scope_name) $id. The PRP file is located at: $dirname/PRP.md. READ IT NOW."
+
+    git add $TASKS_FILE
+    [[ -z "$(git diff HEAD --name-only)" ]] && print -P "%F{red}[ERROR]%f No diff found after $id. Aborting..." && exit 1
+
+    run_with_retry tsk update "$id" Complete
+
+    print -P "%F{blue}[CLEANUP]%f Cleaning up $id..."
+    run_with_retry $AGENT -p "$CLEANUP_PROMPT" || print -P "%F{yellow}[WARN]%f Cleanup failed, proceeding to commit..."
+
+    smart_commit
+}
 
 # Alias-aware retry logic
 run_with_retry() {
@@ -760,63 +968,99 @@ smart_commit() {
 
 # --- 5. Main Workflow ---
 
-# A. Task Breakdown (Only run if we are starting at P1.M1 or if tasks.json is missing)
+# A. Task Breakdown (Only run if tasks.json is missing)
 if [[ ! -f "$TASKS_FILE" ]]; then
     print -P "%F{magenta}[PHASE 0]%f Generating breakdown..."
     mkdir -p "$PLAN_DIR/architecture"
-    run_with_retry $AGENT --system-prompt="$TASK_BREAKDOWN_SYSTEM_PROMPT" -p "$TASK_BREAKDOWN_PROMPT"
+    run_with_retry $BREAKDOWN_AGENT --system-prompt="$TASK_BREAKDOWN_SYSTEM_PROMPT" -p "$TASK_BREAKDOWN_PROMPT"
     [ -f "$TASKS_FILE" ] && print -P "%F{green}[PHASE 0]%f Task breakdown complete."
 fi
 
 # Verify tasks file exists before looping
 [[ ! -f "$TASKS_FILE" ]] && print "Warning: $TASKS_FILE not found. Generating from PRD..." && exit 1
 
+# Print current scope configuration
+print -P "%F{cyan}[CONFIG]%f Scope: %F{yellow}$SCOPE%f (Default: task)"
+[[ $BREAKDOWN_AGENT != "$AGENT" ]] && print -P "%F{cyan}[CONFIG]%f Breakdown agent: %F{yellow}$BREAKDOWN_AGENT%f"
+print -P "%F{cyan}[CONFIG]%f Execution agent: %F{yellow}$AGENT%f"
+print -P "%F{cyan}[CONFIG]%f Starting positions: Phase=$START_PHASE"
+[[ $SCOPE != "phase" ]] && print -P "%F{cyan}[CONFIG]%f Starting positions: Milestone=$START_MS"
+[[ $SCOPE == "task" || $SCOPE == "subtask" ]] && print -P "%F{cyan}[CONFIG]%f Starting positions: Task=$START_TASK"
+[[ $SCOPE == "subtask" ]] && print -P "%F{cyan}[CONFIG]%f Starting positions: Subtask=$START_SUBTASK"
+
 total_phases=$(jq '.backlog | length' "$TASKS_FILE")
 
-for (( i=0; i<$total_phases; i++ )); do
-    PHASE_NUM=$((i+1))
+# Outer loop: Always iterate through phases
+for (( phase_idx=0; phase_idx<$total_phases; phase_idx++ )); do
+    PHASE_NUM=$((phase_idx+1))
 
     # Skip if we haven't reached the start phase yet
     [[ $PHASE_NUM -lt $START_PHASE ]] && continue
 
-    total_ms=$(jq ".backlog[$i].milestones | length" "$TASKS_FILE")
+    # For phase scope, process and continue
+    if [[ $SCOPE == "phase" ]]; then
+        ID=$(generate_id $PHASE_NUM 1 1 1)
+        DIRNAME="$PLAN_DIR/$(generate_dirname $PHASE_NUM 1 1 1)"
+        execute_item "$ID" "$DIRNAME" $PHASE_NUM 1 1 1
+        continue
+    fi
 
-    for (( j=0; j<$total_ms; j++ )); do
-        MS_NUM=$((j+1))
+    # Second loop: Milestones (for milestone, task, subtask scope)
+    total_ms=$(jq ".backlog[$phase_idx].milestones | length" "$TASKS_FILE")
+
+    for (( ms_idx=0; ms_idx<$total_ms; ms_idx++ )); do
+        MS_NUM=$((ms_idx+1))
 
         # Skip milestones until we reach the start milestone of the start phase
         if [[ $PHASE_NUM -eq $START_PHASE && $MS_NUM -lt $START_MS ]]; then
             continue
         fi
 
-        ID="P$PHASE_NUM.M$MS_NUM"
-        DIRNAME="$PLAN_DIR/P${PHASE_NUM}M${MS_NUM}"
+        # For milestone scope, process and continue
+        if [[ $SCOPE == "milestone" ]]; then
+            ID=$(generate_id $PHASE_NUM $MS_NUM 1 1)
+            DIRNAME="$PLAN_DIR/$(generate_dirname $PHASE_NUM $MS_NUM 1 1)"
+            execute_item "$ID" "$DIRNAME" $PHASE_NUM $MS_NUM 1 1
+            continue
+        fi
 
-        print -P "\n%B%F{green}>>> EXECUTING $ID%f%b"
+        # Third loop: Tasks (for task, subtask scope)
+        total_tasks=$(jq ".backlog[$phase_idx].milestones[$ms_idx].tasks | length" "$TASKS_FILE")
+        [[ $total_tasks == "null" || $total_tasks == "0" ]] && continue
 
-        # Ensure plan directories exist
-        mkdir -p "$DIRNAME/research"
+        for (( task_idx=0; task_idx<$total_tasks; task_idx++ )); do
+            TASK_NUM=$((task_idx+1))
 
-        run_with_retry tsk update "$ID" Researching
-        run_with_retry $AGENT -p "$PRP_CREATE_PROMPT Phase $PHASE_NUM Milestone $MS_NUM of $PRD_FILE. Store it at $DIRNAME/PRP.md.\n<plan_status>\n$(tsk status)\n</plan_status>"
-        [ ! -f "$DIRNAME/PRP.md" ] && print -P "%F{red}[ERROR]%f PRP.md not found. Retrying..." && $AGENT --continue -p "You didn't write the file. Make sure you write the file to $DIRNAME/PRP.md"
-        [ ! -f "$DIRNAME/PRP.md" ] && print -P "%F{red}[ERROR]%f PRP.md not found. Aborting..." && exit 1
+            # Skip tasks until we reach the start task of the start milestone/phase
+            if [[ $PHASE_NUM -eq $START_PHASE && $MS_NUM -eq $START_MS && $TASK_NUM -lt $START_TASK ]]; then
+                continue
+            fi
 
-        run_with_retry tsk update "$ID" Implementing
-        run_with_retry $AGENT -p "$PRP_EXECUTE_PROMPT Phase $PHASE_NUM Milestone $MS_NUM. The PRP file is located at: $DIRNAME/PRP.md. READ IT NOW."
+            # For task scope, process and continue
+            if [[ $SCOPE == "task" ]]; then
+                ID=$(generate_id $PHASE_NUM $MS_NUM $TASK_NUM 1)
+                DIRNAME="$PLAN_DIR/$(generate_dirname $PHASE_NUM $MS_NUM $TASK_NUM 1)"
+                execute_item "$ID" "$DIRNAME" $PHASE_NUM $MS_NUM $TASK_NUM 1
+                continue
+            fi
 
-        git add $TASKS_FILE
-        [[ -z "$(git diff HEAD --name-only)" ]] && print -P "%F{red}[ERROR]%f no diff found after Phase $PHASE_NUM Milestone $MS_NUM. Aborting..." && exit 1
+            # Fourth loop: Subtasks (for subtask scope only)
+            total_subtasks=$(jq ".backlog[$phase_idx].milestones[$ms_idx].tasks[$task_idx].subtasks | length" "$TASKS_FILE")
+            [[ $total_subtasks == "null" || $total_subtasks == "0" ]] && continue
 
-        run_with_retry tsk update "$ID" Complete
+            for (( subtask_idx=0; subtask_idx<$total_subtasks; subtask_idx++ )); do
+                SUBTASK_NUM=$((subtask_idx+1))
 
-        # Reinforced Cleanup Instructions
-        print -P "%F{blue}[CLEANUP]%f Cleaning up $ID..."
+                # Skip subtasks until we reach the start subtask of the start task/milestone/phase
+                if [[ $PHASE_NUM -eq $START_PHASE && $MS_NUM -eq $START_MS && $TASK_NUM -eq $START_TASK && $SUBTASK_NUM -lt $START_SUBTASK ]]; then
+                    continue
+                fi
 
-        # Allow cleanup to fail without breaking the loop (add || true)
-        run_with_retry $AGENT -p "$CLEANUP_PROMPT" || print -P "%F{yellow}[WARN]%f Cleanup failed, proceeding to commit..."
-
-        smart_commit
+ID=$(generate_id $PHASE_NUM $MS_NUM $TASK_NUM $SUBTASK_NUM)
+                DIRNAME="$PLAN_DIR/$(generate_dirname $PHASE_NUM $MS_NUM $TASK_NUM $SUBTASK_NUM)"
+                execute_item "$ID" "$DIRNAME" $PHASE_NUM $MS_NUM $TASK_NUM $SUBTASK_NUM
+            done
+        done
     done
 done
 
