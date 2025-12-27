@@ -18,28 +18,29 @@ START_TASK=1
 START_SUBTASK=1
 PARALLEL_RESEARCH="${PARALLEL_RESEARCH:-false}"  # Optional parallel research for next item
 ONLY_VALIDATE="${ONLY_VALIDATE:-false}" # Run only the validation step
+MANUAL_START=false
 
 while getopts "s:p:m:t:u:rv-:" opt; do
   case $opt in
     s) SCOPE=$OPTARG ;;
-    p) START_PHASE=$OPTARG ;;
-    m) START_MS=$OPTARG ;;
-    t) START_TASK=$OPTARG ;;
-    u) START_SUBTASK=$OPTARG ;;
+    p) START_PHASE=$OPTARG; MANUAL_START=true ;;
+    m) START_MS=$OPTARG; MANUAL_START=true ;;
+    t) START_TASK=$OPTARG; MANUAL_START=true ;;
+    u) START_SUBTASK=$OPTARG; MANUAL_START=true ;;
     r) PARALLEL_RESEARCH=true ;;
     v) ONLY_VALIDATE=true ;;
     -)
       case "${OPTARG}" in
         scope)       SCOPE="${!OPTIND}"; OPTIND=$(( OPTIND + 1 )) ;;
         scope=*)     SCOPE="${OPTARG#*=}" ;;
-        phase)       START_PHASE="${!OPTIND}"; OPTIND=$(( OPTIND + 1 )) ;;
-        phase=*)     START_PHASE="${OPTARG#*=}" ;;
-        milestone)   START_MS="${!OPTIND}"; OPTIND=$(( OPTIND + 1 )) ;;
-        milestone=*) START_MS="${OPTARG#*=}" ;;
-        task)        START_TASK="${!OPTIND}"; OPTIND=$(( OPTIND + 1 )) ;;
-        task=*)      START_TASK="${OPTARG#*=}" ;;
-        subtask)     START_SUBTASK="${!OPTIND}"; OPTIND=$(( OPTIND + 1 )) ;;
-        subtask=*)   START_SUBTASK="${OPTARG#*=}" ;;
+        phase)       START_PHASE="${!OPTIND}"; OPTIND=$(( OPTIND + 1 )); MANUAL_START=true ;;
+        phase=*)     START_PHASE="${OPTARG#*=}"; MANUAL_START=true ;;
+        milestone)   START_MS="${!OPTIND}"; OPTIND=$(( OPTIND + 1 )); MANUAL_START=true ;;
+        milestone=*) START_MS="${OPTARG#*=}"; MANUAL_START=true ;;
+        task)        START_TASK="${!OPTIND}"; OPTIND=$(( OPTIND + 1 )); MANUAL_START=true ;;
+        task=*)      START_TASK="${OPTARG#*=}"; MANUAL_START=true ;;
+        subtask)     START_SUBTASK="${!OPTIND}"; OPTIND=$(( OPTIND + 1 )); MANUAL_START=true ;;
+        subtask=*)   START_SUBTASK="${OPTARG#*=}"; MANUAL_START=true ;;
         parallel-research) PARALLEL_RESEARCH=true ;;
         validate)    ONLY_VALIDATE=true ;;
         *) print "Usage: $0 [--scope=phase|milestone|task|subtask] [--phase=N] [--milestone=N] [--task=N] [--subtask=N] [--parallel-research] [--validate]"; exit 1 ;;
@@ -61,6 +62,34 @@ BREAKDOWN_AGENT="${BREAKDOWN_AGENT:-$AGENT}"
 TASKS_FILE="tasks.json"
 PRD_FILE="PRD.md"
 PLAN_DIR="plan"
+
+# Auto-resume logic
+if [[ "$MANUAL_START" == "false" && -f "$TASKS_FILE" ]]; then
+    NEXT_ITEM=$(tsk next -s "$SCOPE" 2>/dev/null)
+    if [[ -n "$NEXT_ITEM" ]]; then
+        print -P "%F{cyan}[RESUME]%f Auto-resuming from: %F{yellow}$NEXT_ITEM%f"
+
+        # Parse P#
+        if [[ $NEXT_ITEM =~ P([0-9]+) ]]; then
+            START_PHASE=${match[1]}
+        fi
+
+        # Parse M#
+        if [[ $NEXT_ITEM =~ M([0-9]+) ]]; then
+             START_MS=${match[1]}
+        fi
+
+        # Parse T#
+        if [[ $NEXT_ITEM =~ T([0-9]+) ]]; then
+             START_TASK=${match[1]}
+        fi
+
+        # Parse S#
+        if [[ $NEXT_ITEM =~ S([0-9]+) ]]; then
+             START_SUBTASK=${match[1]}
+        fi
+    fi
+fi
 
 # --- 3a. Graceful Shutdown Handling ---
 SHUTDOWN_REQUESTED=false
@@ -781,7 +810,7 @@ $PRP_README
 EOF
 
 read -r -d '' CLEANUP_PROMPT <<EOF
-Clean up and organize files after implementation. Check \`git diff\` for reference.
+Clean up, organize files, and PREPARE FOR COMMIT. Check \`git diff\` for reference.
 
 ## DO NOT DELETE OR MODIFY:
 1. The 'plan' directory structure (except for organizing docs as specified below)
@@ -1450,5 +1479,52 @@ fi
 print -P "\n%F{magenta}[VALIDATION]%f Starting final validation..."
 run_with_retry $AGENT -p "$VALIDATION_PROMPT"
 print -P "\n%F{magenta}[VALIDATION]%f Validation complete. Check validation_report.md."
+
+if [[ -f "validation_report.md" ]]; then
+    print -P "\n%F{magenta}[ANALYSIS]%f Analyzing validation report..."
+
+    REPORT_CONTENT=$(cat validation_report.md)
+
+    # Check if report requires action using a restricted agent
+    # We use 'claude' directly to ensure we can disable tools
+    CHECK_PROMPT="Here is the validation report.
+
+    CONTENT:
+    $REPORT_CONTENT
+
+    INSTRUCTION:
+    - If the report shows ANY failures, bugs, or issues: output DIRTY
+    - If the report shows passing status and no issues: output CLEAN
+    - Output ONLY the single word."
+
+    # First attempt
+    RESULT=$(claude --print --allowed-tools "" --system-prompt "You are a binary classifier. Output only CLEAN or DIRTY." "$CHECK_PROMPT")
+    CLEAN_RESULT=$(echo "$RESULT" | tr -d '[:space:]')
+
+    # Validate response and retry if necessary
+    if [[ "$CLEAN_RESULT" != "CLEAN" && "$CLEAN_RESULT" != "DIRTY" ]]; then
+        print -P "%F{yellow}[RETRY]%f Invalid checker output: '$RESULT'. Retrying..."
+        RESULT=$(claude --print --continue --allowed-tools "" "ERROR: You replied with '$RESULT'. You MUST output exactly one word: CLEAN or DIRTY.")
+        CLEAN_RESULT=$(echo "$RESULT" | tr -d '[:space:]')
+    fi
+
+    print -P "%F{cyan}[STATUS]%f Report status: $CLEAN_RESULT"
+
+    if [[ "$CLEAN_RESULT" == "DIRTY" ]]; then
+        print -P "\n%F{red}[FIX]%f Issues found. Starting Fixer Agent..."
+        FIX_PROMPT="The validation report found issues. Please fix them.
+
+        VALIDATION REPORT:
+        $REPORT_CONTENT
+
+        INSTRUCTIONS:
+        1. Analyze the issues listed in the report.
+        2. Fix the code to resolve these issues.
+        3. Verify your fixes."
+
+        run_with_retry $AGENT -p "$FIX_PROMPT"
+        print -P "%F{green}[FIX]%f Fixes applied."
+    fi
+fi
 
 print -P "%F{green}[SUCCESS]%f Workflow completed."
