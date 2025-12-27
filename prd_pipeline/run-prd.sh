@@ -832,10 +832,20 @@ Only these types of files should remain in the project root:
 - Core config files (package.json, tsconfig.json, etc.)
 - Build and script files
 
-## DELETE:
-- Temporary files clearly marked as temp or scratch
-- Duplicate files
-- Files that serve no ongoing purpose
+## DELETE OR GITIGNORE:
+We are preparing to commit. Ensure the repo is clean.
+
+1. **Delete**:
+   - Temporary files clearly marked as temp or scratch
+   - Duplicate files
+   - Files that serve no ongoing purpose
+
+2. **Gitignore** (Update .gitignore if needed):
+   - Build artifacts (dist/, build/, etc.)
+   - Dependency directories (node_modules/, venv/, etc.)
+   - Environment files (.env)
+   - OS-specific files (.DS_Store)
+   - Any other generated files that should NOT be committed
 
 Be selective - keep the root clean and organized.
 EOF
