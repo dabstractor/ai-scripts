@@ -16,14 +16,18 @@ START_PHASE=1
 START_MS=1
 START_TASK=1
 START_SUBTASK=1
+PARALLEL_RESEARCH="${PARALLEL_RESEARCH:-false}"  # Optional parallel research for next item
+ONLY_VALIDATE="${ONLY_VALIDATE:-false}" # Run only the validation step
 
-while getopts "s:p:m:t:u:-:" opt; do
+while getopts "s:p:m:t:u:rv-:" opt; do
   case $opt in
     s) SCOPE=$OPTARG ;;
     p) START_PHASE=$OPTARG ;;
     m) START_MS=$OPTARG ;;
     t) START_TASK=$OPTARG ;;
     u) START_SUBTASK=$OPTARG ;;
+    r) PARALLEL_RESEARCH=true ;;
+    v) ONLY_VALIDATE=true ;;
     -)
       case "${OPTARG}" in
         scope)       SCOPE="${!OPTIND}"; OPTIND=$(( OPTIND + 1 )) ;;
@@ -36,10 +40,12 @@ while getopts "s:p:m:t:u:-:" opt; do
         task=*)      START_TASK="${OPTARG#*=}" ;;
         subtask)     START_SUBTASK="${!OPTIND}"; OPTIND=$(( OPTIND + 1 )) ;;
         subtask=*)   START_SUBTASK="${OPTARG#*=}" ;;
-        *) print "Usage: $0 [--scope=phase|milestone|task|subtask] [--phase=N] [--milestone=N] [--task=N] [--subtask=N]"; exit 1 ;;
+        parallel-research) PARALLEL_RESEARCH=true ;;
+        validate)    ONLY_VALIDATE=true ;;
+        *) print "Usage: $0 [--scope=phase|milestone|task|subtask] [--phase=N] [--milestone=N] [--task=N] [--subtask=N] [--parallel-research] [--validate]"; exit 1 ;;
       esac ;;
-    *) print "Usage: $0 [-s phase|milestone|task|subtask] [-p phase_number] [-m milestone_number] [-t task_number] [-u subtask_number]
-   Or: $0 [--scope=phase|milestone|task|subtask] [--phase=N] [--milestone=N] [--task=N] [--subtask=N]"; exit 1 ;;
+    *) print "Usage: $0 [-s phase|milestone|task|subtask] [-p phase_number] [-m milestone_number] [-t task_number] [-u subtask_number] [-r] [-v]
+   Or: $0 [--scope=phase|milestone|task|subtask] [--phase=N] [--milestone=N] [--task=N] [--subtask=N] [--parallel-research] [--validate]"; exit 1 ;;
   esac
 done
 
@@ -55,6 +61,36 @@ BREAKDOWN_AGENT="${BREAKDOWN_AGENT:-$AGENT}"
 TASKS_FILE="tasks.json"
 PRD_FILE="PRD.md"
 PLAN_DIR="plan"
+
+# --- 3a. Graceful Shutdown Handling ---
+SHUTDOWN_REQUESTED=false
+FORCE_SHUTDOWN=false
+
+handle_sigint() {
+    if [[ "$SHUTDOWN_REQUESTED" == "true" ]]; then
+        print -P "\n%F{red}[ABORT]%f Second interrupt received. Forcing immediate exit..."
+        FORCE_SHUTDOWN=true
+        # Kill any background research process
+        [[ -n "$RESEARCH_PID" ]] && kill $RESEARCH_PID 2>/dev/null
+        exit 130
+    else
+        print -P "\n%F{yellow}[SHUTDOWN]%f Graceful shutdown requested. Will exit after current item completes."
+        print -P "%F{yellow}[SHUTDOWN]%f Press Ctrl+C again to force immediate exit."
+        SHUTDOWN_REQUESTED=true
+    fi
+}
+
+trap handle_sigint SIGINT
+
+# Check if shutdown was requested (call after each item completes)
+check_shutdown() {
+    if [[ "$SHUTDOWN_REQUESTED" == "true" ]]; then
+        print -P "%F{yellow}[SHUTDOWN]%f Shutdown requested. Exiting gracefully..."
+        # Kill any background research process
+        [[ -n "$RESEARCH_PID" ]] && kill $RESEARCH_PID 2>/dev/null && print -P "%F{yellow}[SHUTDOWN]%f Terminated background research process."
+        exit 0
+    fi
+}
 
 read -r -d '' PRP_README <<EOF
 # Product Requirement Prompt (PRP) Concept
@@ -775,6 +811,111 @@ Only these types of files should remain in the project root:
 Be selective - keep the root clean and organized.
 EOF
 
+read -r -d '' VALIDATION_PROMPT <<EOF
+# Comprehensive Project Validation
+
+Analyze this codebase deeply, create a validation script, and report any issues found.
+
+**INPUTS:**
+- PRD: \$(cat "$PRD_FILE")
+- Tasks: \$(cat "$TASKS_FILE")
+
+## Step 0: Discover Real User Workflows
+
+**Before analyzing tooling, understand what users ACTUALLY do:**
+
+1. Read workflow documentation:
+   - README.md - Look for "Usage", "Quickstart", "Examples" sections
+   - CLAUDE.md/AGENTS.md or similar - Look for workflow patterns
+   - docs/ folder - User guides, tutorials
+
+2. Identify external integrations:
+   - What CLIs does the app use? (Check Dockerfile for installed tools)
+   - What external APIs does it call? (Telegram, Slack, GitHub, etc.)
+   - What services does it interact with?
+
+3. Extract complete user journeys from docs:
+   - Find examples like "Fix Issue (GitHub):" or "User does X → then Y → then Z"
+   - Each workflow becomes an E2E test scenario
+
+**Critical: Your E2E tests should mirror actual workflows from docs, not just test internal APIs.**
+
+## Step 1: Deep Codebase Analysis
+
+Explore the codebase to understand:
+
+**What validation tools already exist:**
+- Linting config: \`.eslintrc*\`, \`.pylintrc\`, \`ruff.toml\`, etc.
+- Type checking: \`tsconfig.json\`, \`mypy.ini\`, etc.
+- Style/formatting: \`.prettierrc*\`, \`black\`, \`.editorconfig\`
+- Unit tests: \`jest.config.*\`, \`pytest.ini\`, test directories
+- Package manager scripts: \`package.json\` scripts, \`Makefile\`, \`pyproject.toml\` tools
+
+**What the application does:**
+- Frontend: Routes, pages, components, user flows
+- Backend: API endpoints, authentication, database operations
+- Database: Schema, migrations, models
+- Infrastructure: Docker services, dependencies
+
+**Review Planning Documents:**
+- Compare implementation against \`tasks.json\` and the PRD to identify missing features or deviations.
+
+## Step 2: Generate Validation Script
+
+Create a script (e.g., \`validate.sh\`) that sits in the codebase and runs the following phases (ONLY include phases that exist in the codebase):
+
+### Phase 1: Linting
+Run the actual linter commands found in the project.
+
+### Phase 2: Type Checking
+Run the actual type checker commands found.
+
+### Phase 3: Style Checking
+Run the actual formatter check commands found.
+
+### Phase 4: Unit Testing
+Run the actual test commands found.
+
+### Phase 5: End-to-End Testing (BE CREATIVE AND COMPREHENSIVE)
+
+Test COMPLETE user workflows from documentation, not just internal APIs.
+Simulate the "User" persona defined in the PRD.
+
+**The Three Levels of E2E Testing:**
+
+1. **Internal APIs** (what you might naturally test):
+   - Test adapter endpoints work
+   - Database queries succeed
+   - Commands execute
+
+2. **External Integrations** (what you MUST test):
+   - CLI operations (GitHub CLI create issue/PR, etc.)
+   - Platform APIs (send Telegram message, post Slack message)
+   - Any external services the app depends on
+
+3. **Complete User Journeys** (what gives 100% confidence):
+   - Follow workflows from docs start-to-finish
+   - Test like a user would actually use the application in production
+
+## Step 3: Validation & Reporting
+
+1. **Execute the validation script** you created.
+2. **Manually simulate workflows** if the script cannot cover everything.
+3. **Generate a Bug Tracker Report**:
+   - Make an itemized list of everything found.
+   - Focus on big picture stuff that isn't already covered by unit tests.
+   - Use product end-to-end in a simulated workflow to uncover bugs.
+   - If any issues are found, list them clearly. This is NOT a fixer agent, it is a validator agent.
+
+## Output
+
+1. Write the generated validation script to \`validate.sh\` (or appropriate name).
+2. Write the bug tracker report to \`validation_report.md\`.
+
+The validation script should be executable, practical, and give complete confidence in the codebase.
+If validation passes, the user should have 100% confidence their application works correctly in production.
+EOF
+
 
 # --- 4. Helpers ---
 
@@ -888,6 +1029,192 @@ get_scope_article() {
     esac
 }
 
+# --- Parallel Research Helpers ---
+RESEARCH_PID=""
+RESEARCH_ITEM_ID=""
+RESEARCH_DIRNAME=""
+
+# Start research for an item in the background
+# Usage: start_background_research <id> <dirname> <phase_num> <ms_num> <task_num> <subtask_num> <prev_id> <prev_dirname>
+start_background_research() {
+    local id=$1
+    local dirname=$2
+    local phase_num=$3
+    local ms_num=$4
+    local task_num=$5
+    local subtask_num=$6
+    local prev_id=$7
+    local prev_dirname=$8
+
+    # Skip if PRP already exists
+    if [[ -f "$dirname/PRP.md" ]]; then
+        print -P "%F{yellow}[PARALLEL]%f PRP for $id already exists, skipping background research"
+        return 0
+    fi
+
+    print -P "%F{cyan}[PARALLEL]%f Starting background research for $id..."
+    mkdir -p "$dirname/research"
+
+    # Build context about the previous item being implemented
+    local prev_context=""
+    if [[ -n "$prev_id" && -f "$prev_dirname/PRP.md" ]]; then
+        prev_context="
+<parallel_execution_context>
+IMPORTANT: This research is running IN PARALLEL while $prev_id is being implemented.
+
+The previous work item ($prev_id) is currently being implemented. You MUST:
+1. Read the previous item's PRP at $prev_dirname/PRP.md to understand what it produces
+2. Treat that PRP as a CONTRACT - assume it will be implemented exactly as specified
+3. Design your PRP to consume/build upon the outputs defined in the previous PRP
+4. Do NOT duplicate or conflict with work specified in the previous PRP
+5. Reference specific interfaces, files, or outputs from the previous PRP in your context_scope
+
+The previous PRP defines what will exist when your item begins implementation.
+</parallel_execution_context>"
+    fi
+
+    # Run research in background subshell
+    (
+        run_with_retry tsk update "$id" Researching
+        run_with_retry $AGENT -p "$PRP_CREATE_PROMPT Create a PRP for $(get_scope_name) $id of the PRD. Store it at $dirname/PRP.md.
+<item_title>$(get_item_title $phase_num $ms_num $task_num $subtask_num)</item_title>
+<item_description>$(get_item_description $phase_num $ms_num $task_num $subtask_num)</item_description>
+<plan_status>$(tsk status)</plan_status>$prev_context"
+        if [[ ! -f "$dirname/PRP.md" ]]; then
+            print -P "%F{yellow}[PARALLEL]%f PRP.md not found for $id, retrying..."
+            $AGENT --continue -p "You didn't write the file. Make sure you write the file to $dirname/PRP.md"
+        fi
+    ) &
+
+    RESEARCH_PID=$!
+    RESEARCH_ITEM_ID=$id
+    RESEARCH_DIRNAME=$dirname
+    print -P "%F{cyan}[PARALLEL]%f Background research started (PID: $RESEARCH_PID)"
+}
+
+# Wait for background research to complete if it matches the given item
+# Usage: wait_for_background_research <id>
+wait_for_background_research() {
+    local id=$1
+
+    if [[ -n "$RESEARCH_PID" && "$RESEARCH_ITEM_ID" == "$id" ]]; then
+        print -P "%F{cyan}[PARALLEL]%f Waiting for background research of $id to complete..."
+        wait $RESEARCH_PID
+        local exit_code=$?
+        RESEARCH_PID=""
+        RESEARCH_ITEM_ID=""
+        RESEARCH_DIRNAME=""
+        if [[ $exit_code -ne 0 ]]; then
+            print -P "%F{yellow}[PARALLEL]%f Background research exited with code $exit_code"
+        else
+            print -P "%F{green}[PARALLEL]%f Background research for $id completed"
+        fi
+        return $exit_code
+    fi
+    return 0
+}
+
+# Get the next item coordinates based on current position and scope
+# Sets NEXT_* variables or returns 1 if no next item
+# Usage: get_next_item <phase_num> <ms_num> <task_num> <subtask_num>
+get_next_item() {
+    local phase_num=$1
+    local ms_num=$2
+    local task_num=$3
+    local subtask_num=$4
+    local phase_idx=$((phase_num - 1))
+    local ms_idx=$((ms_num - 1))
+    local task_idx=$((task_num - 1))
+    local subtask_idx=$((subtask_num - 1))
+
+    NEXT_PHASE=$phase_num
+    NEXT_MS=$ms_num
+    NEXT_TASK=$task_num
+    NEXT_SUBTASK=$subtask_num
+
+    case $SCOPE in
+        phase)
+            local total_phases=$(jq '.backlog | length' "$TASKS_FILE")
+            if (( phase_num < total_phases )); then
+                NEXT_PHASE=$((phase_num + 1))
+                return 0
+            fi
+            return 1
+            ;;
+        milestone)
+            local total_ms=$(jq ".backlog[$phase_idx].milestones | length" "$TASKS_FILE")
+            if (( ms_num < total_ms )); then
+                NEXT_MS=$((ms_num + 1))
+                return 0
+            fi
+            # Try next phase
+            local total_phases=$(jq '.backlog | length' "$TASKS_FILE")
+            if (( phase_num < total_phases )); then
+                NEXT_PHASE=$((phase_num + 1))
+                NEXT_MS=1
+                return 0
+            fi
+            return 1
+            ;;
+        task)
+            local total_tasks=$(jq ".backlog[$phase_idx].milestones[$ms_idx].tasks | length" "$TASKS_FILE")
+            if (( task_num < total_tasks )); then
+                NEXT_TASK=$((task_num + 1))
+                return 0
+            fi
+            # Try next milestone
+            local total_ms=$(jq ".backlog[$phase_idx].milestones | length" "$TASKS_FILE")
+            if (( ms_num < total_ms )); then
+                NEXT_MS=$((ms_num + 1))
+                NEXT_TASK=1
+                return 0
+            fi
+            # Try next phase
+            local total_phases=$(jq '.backlog | length' "$TASKS_FILE")
+            if (( phase_num < total_phases )); then
+                NEXT_PHASE=$((phase_num + 1))
+                NEXT_MS=1
+                NEXT_TASK=1
+                return 0
+            fi
+            return 1
+            ;;
+        subtask)
+            local total_subtasks=$(jq ".backlog[$phase_idx].milestones[$ms_idx].tasks[$task_idx].subtasks | length" "$TASKS_FILE")
+            if (( subtask_num < total_subtasks )); then
+                NEXT_SUBTASK=$((subtask_num + 1))
+                return 0
+            fi
+            # Try next task
+            local total_tasks=$(jq ".backlog[$phase_idx].milestones[$ms_idx].tasks | length" "$TASKS_FILE")
+            if (( task_num < total_tasks )); then
+                NEXT_TASK=$((task_num + 1))
+                NEXT_SUBTASK=1
+                return 0
+            fi
+            # Try next milestone
+            local total_ms=$(jq ".backlog[$phase_idx].milestones | length" "$TASKS_FILE")
+            if (( ms_num < total_ms )); then
+                NEXT_MS=$((ms_num + 1))
+                NEXT_TASK=1
+                NEXT_SUBTASK=1
+                return 0
+            fi
+            # Try next phase
+            local total_phases=$(jq '.backlog | length' "$TASKS_FILE")
+            if (( phase_num < total_phases )); then
+                NEXT_PHASE=$((phase_num + 1))
+                NEXT_MS=1
+                NEXT_TASK=1
+                NEXT_SUBTASK=1
+                return 0
+            fi
+            return 1
+            ;;
+    esac
+    return 1
+}
+
 # Execute a single work item (phase/milestone/task/subtask)
 # Usage: execute_item <id> <dirname> <phase_num> <ms_num> <task_num> <subtask_num>
 execute_item() {
@@ -899,6 +1226,9 @@ execute_item() {
     local subtask_num=$6
 
     print -P "\n%B%F{green}>>> EXECUTING $id%f%b"
+
+    # Wait for any background research for this item to complete
+    wait_for_background_research "$id"
 
     mkdir -p "$dirname/research"
 
@@ -917,6 +1247,16 @@ execute_item() {
         run_with_retry tsk update "$id" Implementing
     fi
 
+    # Start background research for next item if parallel research is enabled
+    if [[ "$PARALLEL_RESEARCH" == "true" ]]; then
+        if get_next_item $phase_num $ms_num $task_num $subtask_num; then
+            local next_id=$(generate_id $NEXT_PHASE $NEXT_MS $NEXT_TASK $NEXT_SUBTASK)
+            local next_dirname="$PLAN_DIR/$(generate_dirname $NEXT_PHASE $NEXT_MS $NEXT_TASK $NEXT_SUBTASK)"
+            # Pass current item as previous context so next item's research can reference it as a contract
+            start_background_research "$next_id" "$next_dirname" $NEXT_PHASE $NEXT_MS $NEXT_TASK $NEXT_SUBTASK "$id" "$dirname"
+        fi
+    fi
+
     run_with_retry $AGENT -p "$PRP_EXECUTE_PROMPT Execute the PRP for $(get_scope_name) $id. The PRP file is located at: $dirname/PRP.md. READ IT NOW."
 
     git add $TASKS_FILE
@@ -928,6 +1268,9 @@ execute_item() {
     run_with_retry $AGENT -p "$CLEANUP_PROMPT" || print -P "%F{yellow}[WARN]%f Cleanup failed, proceeding to commit..."
 
     smart_commit
+
+    # Check if graceful shutdown was requested
+    check_shutdown
 }
 
 # Alias-aware retry logic
@@ -961,12 +1304,41 @@ smart_commit() {
     fi
 
     # We unstage the tasks file so it isn't part of the AI's messy commit
-    git reset "$TASKS_FILE" > /dev/null 2>&1
+    git reset -- "$TASKS_FILE" > /dev/null 2>&1
+
+    # Unstage the next item's plan directory if parallel research is active
+    if [[ "$PARALLEL_RESEARCH" == "true" ]]; then
+        if [[ -n "$RESEARCH_DIRNAME" ]]; then
+            print -P "%F{cyan}[GIT]%f Unstaging next item's directory: $RESEARCH_DIRNAME"
+            # Unstage the directory and all its contents
+            git reset -- "$RESEARCH_DIRNAME" 2>&1 || true
+            # Verify nothing from that directory is staged
+            local staged_files=$(git diff --cached --name-only -- "$RESEARCH_DIRNAME" 2>/dev/null)
+            if [[ -n "$staged_files" ]]; then
+                print -P "%F{yellow}[WARN]%f Some files still staged in $RESEARCH_DIRNAME, forcing unstage..."
+                print "$staged_files" | while read -r file; do
+                    git reset -- "$file" 2>/dev/null || true
+                done
+            fi
+            # Final verification
+            staged_files=$(git diff --cached --name-only -- "$RESEARCH_DIRNAME" 2>/dev/null)
+            if [[ -n "$staged_files" ]]; then
+                print -P "%F{red}[ERROR]%f Failed to unstage files in $RESEARCH_DIRNAME:"
+                print "$staged_files"
+            else
+                print -P "%F{green}[GIT]%f Successfully unstaged $RESEARCH_DIRNAME"
+            fi
+        else
+            print -P "%F{yellow}[WARN]%f Parallel research enabled but RESEARCH_DIRNAME not set"
+        fi
+    fi
 
     run_with_retry git commit-claude
 }
 
 # --- 5. Main Workflow ---
+
+if [[ "$ONLY_VALIDATE" == "false" ]]; then
 
 # A. Task Breakdown (Only run if tasks.json is missing)
 if [[ ! -f "$TASKS_FILE" ]]; then
@@ -983,6 +1355,7 @@ fi
 print -P "%F{cyan}[CONFIG]%f Scope: %F{yellow}$SCOPE%f (Default: task)"
 [[ $BREAKDOWN_AGENT != "$AGENT" ]] && print -P "%F{cyan}[CONFIG]%f Breakdown agent: %F{yellow}$BREAKDOWN_AGENT%f"
 print -P "%F{cyan}[CONFIG]%f Execution agent: %F{yellow}$AGENT%f"
+[[ "$PARALLEL_RESEARCH" == "true" ]] && print -P "%F{cyan}[CONFIG]%f Parallel research: %F{green}enabled%f"
 print -P "%F{cyan}[CONFIG]%f Starting positions: Phase=$START_PHASE"
 [[ $SCOPE != "phase" ]] && print -P "%F{cyan}[CONFIG]%f Starting positions: Milestone=$START_MS"
 [[ $SCOPE == "task" || $SCOPE == "subtask" ]] && print -P "%F{cyan}[CONFIG]%f Starting positions: Task=$START_TASK"
@@ -1063,5 +1436,19 @@ ID=$(generate_id $PHASE_NUM $MS_NUM $TASK_NUM $SUBTASK_NUM)
         done
     done
 done
+
+else
+    # Validation Only Mode
+    print -P "%F{cyan}[CONFIG]%f Running in %F{magenta}VALIDATION ONLY%f mode"
+    if [[ ! -f "$TASKS_FILE" ]]; then
+        print -P "%F{red}[ERROR]%f $TASKS_FILE not found. Cannot validate without tasks."
+        exit 1
+    fi
+fi
+
+# Final Validation Step
+print -P "\n%F{magenta}[VALIDATION]%f Starting final validation..."
+run_with_retry $AGENT -p "$VALIDATION_PROMPT"
+print -P "\n%F{magenta}[VALIDATION]%f Validation complete. Check validation_report.md."
 
 print -P "%F{green}[SUCCESS]%f Workflow completed."
