@@ -379,39 +379,81 @@ function main(): void {
     .name('tsk')
     .description('Task processing utility for Agentic TDD environments')
     .argument('[json-file]', 'JSON file containing tasks (default: tasks.json)')
-    .option('-v, --verbose', 'Enable verbose output');
+    .option('-v, --verbose', 'Enable verbose output')
+    .option('-s, --scope <level>', 'Scope to specific level (phase, milestone, task, subtask)');
+
+  const handleNextCommand = (jsonFile: string | undefined, options: { scope?: string } | undefined, cmd: any) => {
+    try {
+      // Merge global options with command options
+      const globalOptions = cmd && cmd.parent ? cmd.parent.opts() : {};
+      const cmdOptions = (typeof options === 'object') ? options : {};
+      const mergedOptions = { ...globalOptions, ...cmdOptions };
+
+      let targetFile = 'tasks.json';
+
+      if (typeof jsonFile === 'string') {
+        targetFile = jsonFile;
+      }
+
+      const manager = new TaskManager(targetFile);
+      const nextTask = manager.getNextTask();
+
+      if (mergedOptions.scope) {
+        const scope = mergedOptions.scope.toLowerCase();
+
+        if (!['phase', 'milestone', 'task', 'subtask'].includes(scope)) {
+          throw new Error(`Invalid scope '${scope}'. Valid scopes: phase, milestone, task, subtask`);
+        }
+
+        if (nextTask.context === 'ALL_COMPLETE') {
+          return;
+        }
+
+        let result: ContextNode | undefined;
+
+        switch (scope) {
+          case 'phase':
+            result = nextTask.phase;
+            break;
+          case 'milestone':
+            result = nextTask.milestone;
+            break;
+          case 'task':
+            result = nextTask.task;
+            break;
+          case 'subtask':
+            result = nextTask.subtask;
+            break;
+        }
+
+        if (result && result.id) {
+          console.log(result.id);
+        } else {
+          console.error(chalk.red(`Error: Could not find ${scope} in next task context.`));
+          process.exit(1);
+        }
+      } else {
+        console.log(JSON.stringify(nextTask, null, 2));
+      }
+    } catch (error) {
+      console.error(chalk.red('Error:'), error instanceof Error ? error.message : String(error));
+      process.exit(1);
+    }
+  };
 
   // next command
   program
     .command('next')
     .description('Get next actionable subtask as JSON')
     .argument('[json-file]', 'JSON file containing tasks (default: tasks.json)')
-    .action((jsonFile = 'tasks.json') => {
-      try {
-        const manager = new TaskManager(jsonFile);
-        const nextTask = manager.getNextTask();
-        console.log(JSON.stringify(nextTask, null, 2));
-      } catch (error) {
-        console.error(chalk.red('Error:'), error instanceof Error ? error.message : String(error));
-        process.exit(1);
-      }
-    });
+    .action(handleNextCommand);
 
   // tsk command (alias for next)
   program
     .command('tsk')
     .description('Alias for next command')
     .argument('[json-file]', 'JSON file containing tasks (default: tasks.json)')
-    .action((jsonFile = 'tasks.json') => {
-      try {
-        const manager = new TaskManager(jsonFile);
-        const nextTask = manager.getNextTask();
-        console.log(JSON.stringify(nextTask, null, 2));
-      } catch (error) {
-        console.error(chalk.red('Error:'), error instanceof Error ? error.message : String(error));
-        process.exit(1);
-      }
-    });
+    .action(handleNextCommand);
 
   // status command
   program
@@ -465,10 +507,14 @@ function main(): void {
     });
 
   // Default action when no command specified
-  program.action((jsonFile = 'tasks.json') => {
+  program.action((jsonFile = 'tasks.json', options) => {
     try {
-      const manager = new TaskManager(jsonFile);
-      console.log(manager.getStatusSummary());
+      if (options.scope) {
+        handleNextCommand(jsonFile, options, undefined);
+      } else {
+        const manager = new TaskManager(jsonFile);
+        console.log(manager.getStatusSummary());
+      }
     } catch (error) {
       console.error(chalk.red('Error:'), error instanceof Error ? error.message : String(error));
       process.exit(1);
