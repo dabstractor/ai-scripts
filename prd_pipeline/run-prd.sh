@@ -94,18 +94,21 @@ fi
 # --- 3a. Graceful Shutdown Handling ---
 SHUTDOWN_REQUESTED=false
 FORCE_SHUTDOWN=false
+CURRENT_CMD_PID=""
 
 handle_sigint() {
     if [[ "$SHUTDOWN_REQUESTED" == "true" ]]; then
         print -P "\n%F{red}[ABORT]%f Second interrupt received. Forcing immediate exit..."
         FORCE_SHUTDOWN=true
-        # Kill any background research process
-        [[ -n "$RESEARCH_PID" ]] && kill $RESEARCH_PID 2>/dev/null
+        # Force kill current command and background research
+        [[ -n "$CURRENT_CMD_PID" ]] && kill -9 $CURRENT_CMD_PID 2>/dev/null
+        [[ -n "$RESEARCH_PID" ]] && kill -9 $RESEARCH_PID 2>/dev/null
         exit 130
     else
         print -P "\n%F{yellow}[SHUTDOWN]%f Graceful shutdown requested. Will exit after current item completes."
         print -P "%F{yellow}[SHUTDOWN]%f Press Ctrl+C again to force immediate exit."
         SHUTDOWN_REQUESTED=true
+        # Don't kill processes here - let poll loop detect shutdown and exit cleanly
     fi
 }
 
@@ -116,7 +119,7 @@ check_shutdown() {
     if [[ "$SHUTDOWN_REQUESTED" == "true" ]]; then
         print -P "%F{yellow}[SHUTDOWN]%f Shutdown requested. Exiting gracefully..."
         # Kill any background research process
-        [[ -n "$RESEARCH_PID" ]] && kill $RESEARCH_PID 2>/dev/null && print -P "%F{yellow}[SHUTDOWN]%f Terminated background research process."
+        [[ -n "$RESEARCH_PID" ]] && kill -TERM $RESEARCH_PID 2>/dev/null && print -P "%F{yellow}[SHUTDOWN]%f Terminated background research process."
         exit 0
     fi
 }
@@ -214,6 +217,8 @@ For every Subtask, the \`context_scope\` must be a **strict set of instructions*
 
 ## PROCESS
 
+ULTRATHINK & PLAN
+
 1.  **ANALYZE** the attached or referenced PRD.
 2.  **RESEARCH (SPAWN & VALIDATE):**
     *   **Spawn** subagents to map the codebase and verify PRD feasibility.
@@ -226,7 +231,11 @@ For every Subtask, the \`context_scope\` must be a **strict set of instructions*
 
 ## OUTPUT FORMAT
 
-**CONSTRAINT:** Output **ONLY** a valid JSON object. No conversational text.
+**CONSTRAINT:** You MUST write the JSON to the file \`./$TASKS_FILE\` (in the CURRENT WORKING DIRECTORY - do NOT search for or use any other tasks.json files from other projects/directories).
+
+Do NOT output JSON to the conversation - WRITE IT TO THE FILE at path \`./$TASKS_FILE\`.
+
+Use your file writing tools to create \`./$TASKS_FILE\` with this structure:
 
 \`\`\`json
 {
@@ -283,7 +292,7 @@ $(cat "$PRD_FILE")
 2.  **Spawn** subagents immediately to research the current codebase state and external documentation. validate that the PRD is feasible and identify architectural patterns to follow.
 3.  **Store** your high-level research findings in the \`$PLAN_DIR/architecture/\` directory. This is critical: the downstream PRP agents will rely on this documentation to generate implementation plans.
 4.  **Decompose** the project into the JSON Backlog format defined in the System Prompt. Ensure your breakdown is grounded in the reality of the research you just performed.
-5.  **Write** tasks to $TASKS_FILE
+5.  **CRITICAL: Write the JSON to \`./$TASKS_FILE\` (current working directory) using your file writing tools.** Do NOT output the JSON to the conversation. Do NOT search for or modify any existing tasks.json files in other directories. Create a NEW file at \`./$TASKS_FILE\`. The file MUST exist when you are done.
 EOF
 
 read -r -d '' PRP_CREATE_PROMPT <<EOF
@@ -829,6 +838,7 @@ Then, MOVE (not delete) any markdown documentation files you created during impl
 ## KEEP IN ROOT:
 Only these types of files should remain in the project root:
 - README.md and readme-adjacent files (CONTRIBUTING.md, LICENSE, etc.)
+- PRD.md and any other files that are already committed into the repository.
 - Core config files (package.json, tsconfig.json, etc.)
 - Build and script files
 
@@ -948,11 +958,14 @@ Simulate the "User" persona defined in the PRD.
 
 ## Output
 
-1. Write the generated validation script to \`validate.sh\` (or appropriate name).
-2. Write the bug tracker report to \`validation_report.md\`.
+**IMPORTANT: Use these EXACT file names:**
+1. Write the validation script to \`./validate.sh\` (this exact path, current directory)
+2. Write the bug tracker report to \`./validation_report.md\` (this exact path, current directory)
 
 The validation script should be executable, practical, and give complete confidence in the codebase.
 If validation passes, the user should have 100% confidence their application works correctly in production.
+
+**CLEANUP NOTE:** These files (validate.sh and validation_report.md) are temporary and will be deleted after validation completes.
 EOF
 
 
@@ -1312,13 +1325,47 @@ execute_item() {
     check_shutdown
 }
 
-# Alias-aware retry logic
+# Alias-aware retry logic with interruptible wait for graceful shutdown
 run_with_retry() {
     local n=1
     local max=3
     local delay=5
-    # eval + quoting forces zsh to re-parse the command and expand your aliases
-    until eval "${(q)@}"; do
+    local cmd_pid exit_status
+
+    while true; do
+        # Check shutdown before starting new attempt
+        if [[ "$SHUTDOWN_REQUESTED" == "true" ]]; then
+            return 130
+        fi
+
+        # Run in background subshell - preserves alias expansion via eval
+        ( eval "${(q)@}" ) &
+        cmd_pid=$!
+        CURRENT_CMD_PID=$cmd_pid
+
+        # Poll with sleep (sleep IS interruptible by signals, wait is NOT in zsh)
+        while kill -0 $cmd_pid 2>/dev/null; do
+            # Check shutdown - trap fires during sleep
+            if [[ "$SHUTDOWN_REQUESTED" == "true" ]]; then
+                kill -TERM $cmd_pid 2>/dev/null
+                wait $cmd_pid 2>/dev/null
+                CURRENT_CMD_PID=""
+                return 130
+            fi
+            sleep 0.1
+        done
+
+        # Process finished, get exit status
+        wait $cmd_pid 2>/dev/null
+        exit_status=$?
+        CURRENT_CMD_PID=""
+
+        # Success - return
+        if [[ $exit_status -eq 0 ]]; then
+            return 0
+        fi
+
+        # Retry logic
         if (( n < max )); then
             print -P "%F{yellow}[RETRY]%f Command failed. Attempt $n/$max. Retrying in ${delay}s..."
             sleep $delay
@@ -1341,9 +1388,6 @@ smart_commit() {
         git checkout HEAD -- "$TASKS_FILE"
         git add "$TASKS_FILE"
     fi
-
-    # We unstage the tasks file so it isn't part of the AI's messy commit
-    git reset -- "$TASKS_FILE" > /dev/null 2>&1
 
     # Unstage the next item's plan directory if parallel research is active
     if [[ "$PARALLEL_RESEARCH" == "true" ]]; then
@@ -1384,11 +1428,24 @@ if [[ ! -f "$TASKS_FILE" ]]; then
     print -P "%F{magenta}[PHASE 0]%f Generating breakdown..."
     mkdir -p "$PLAN_DIR/architecture"
     run_with_retry $BREAKDOWN_AGENT --system-prompt="$TASK_BREAKDOWN_SYSTEM_PROMPT" -p "$TASK_BREAKDOWN_PROMPT"
-    [ -f "$TASKS_FILE" ] && print -P "%F{green}[PHASE 0]%f Task breakdown complete."
+
+    # If file still doesn't exist, demand the agent write it
+    if [[ ! -f "$TASKS_FILE" ]]; then
+        print -P "%F{yellow}[PHASE 0]%f $TASKS_FILE not found. Demanding agent write it..."
+        run_with_retry $BREAKDOWN_AGENT --continue -p "You did NOT write the tasks file. You MUST write the JSON breakdown to \`./$TASKS_FILE\` (CURRENT WORKING DIRECTORY) immediately. Do NOT search for tasks.json in other directories. Create a NEW file at exactly \`./$TASKS_FILE\`. Use your file writing tools NOW."
+    fi
+
+    if [[ -f "$TASKS_FILE" ]]; then
+        print -P "%F{green}[PHASE 0]%f Task breakdown complete."
+        # Commit the task breakdown
+        print -P "%F{blue}[GIT]%f Committing task breakdown..."
+        git add "$TASKS_FILE" "$PLAN_DIR"
+        git commit -m "Add task breakdown and architecture research" 2>/dev/null || true
+    fi
 fi
 
 # Verify tasks file exists before looping
-[[ ! -f "$TASKS_FILE" ]] && print "Warning: $TASKS_FILE not found. Generating from PRD..." && exit 1
+[[ ! -f "$TASKS_FILE" ]] && print -P "%F{red}[ERROR]%f $TASKS_FILE not found after breakdown. Agent failed to write file." && exit 1
 
 # Print current scope configuration
 print -P "%F{cyan}[CONFIG]%f Scope: %F{yellow}$SCOPE%f (Default: task)"
@@ -1404,7 +1461,13 @@ total_phases=$(jq '.backlog | length' "$TASKS_FILE")
 
 # Outer loop: Always iterate through phases
 for (( phase_idx=0; phase_idx<$total_phases; phase_idx++ )); do
-    PHASE_NUM=$((phase_idx+1))
+    # Get actual phase ID from JSON (e.g., "P5" -> 5), not array index
+    PHASE_ID=$(jq -r ".backlog[$phase_idx].id // empty" "$TASKS_FILE")
+    if [[ $PHASE_ID =~ P([0-9]+) ]]; then
+        PHASE_NUM=${match[1]}
+    else
+        PHASE_NUM=$((phase_idx+1))  # Fallback to index-based
+    fi
 
     # Skip if we haven't reached the start phase yet
     [[ $PHASE_NUM -lt $START_PHASE ]] && continue
@@ -1421,7 +1484,13 @@ for (( phase_idx=0; phase_idx<$total_phases; phase_idx++ )); do
     total_ms=$(jq ".backlog[$phase_idx].milestones | length" "$TASKS_FILE")
 
     for (( ms_idx=0; ms_idx<$total_ms; ms_idx++ )); do
-        MS_NUM=$((ms_idx+1))
+        # Get actual milestone ID from JSON (e.g., "P5.M1" -> 1)
+        MS_ID=$(jq -r ".backlog[$phase_idx].milestones[$ms_idx].id // empty" "$TASKS_FILE")
+        if [[ $MS_ID =~ M([0-9]+) ]]; then
+            MS_NUM=${match[1]}
+        else
+            MS_NUM=$((ms_idx+1))  # Fallback to index-based
+        fi
 
         # Skip milestones until we reach the start milestone of the start phase
         if [[ $PHASE_NUM -eq $START_PHASE && $MS_NUM -lt $START_MS ]]; then
@@ -1441,7 +1510,13 @@ for (( phase_idx=0; phase_idx<$total_phases; phase_idx++ )); do
         [[ $total_tasks == "null" || $total_tasks == "0" ]] && continue
 
         for (( task_idx=0; task_idx<$total_tasks; task_idx++ )); do
-            TASK_NUM=$((task_idx+1))
+            # Get actual task ID from JSON (e.g., "P5.M1.T1" -> 1)
+            TASK_ID=$(jq -r ".backlog[$phase_idx].milestones[$ms_idx].tasks[$task_idx].id // empty" "$TASKS_FILE")
+            if [[ $TASK_ID =~ T([0-9]+) ]]; then
+                TASK_NUM=${match[1]}
+            else
+                TASK_NUM=$((task_idx+1))  # Fallback to index-based
+            fi
 
             # Skip tasks until we reach the start task of the start milestone/phase
             if [[ $PHASE_NUM -eq $START_PHASE && $MS_NUM -eq $START_MS && $TASK_NUM -lt $START_TASK ]]; then
@@ -1461,7 +1536,13 @@ for (( phase_idx=0; phase_idx<$total_phases; phase_idx++ )); do
             [[ $total_subtasks == "null" || $total_subtasks == "0" ]] && continue
 
             for (( subtask_idx=0; subtask_idx<$total_subtasks; subtask_idx++ )); do
-                SUBTASK_NUM=$((subtask_idx+1))
+                # Get actual subtask ID from JSON (e.g., "P5.M1.T1.S1" -> 1)
+                SUBTASK_ID=$(jq -r ".backlog[$phase_idx].milestones[$ms_idx].tasks[$task_idx].subtasks[$subtask_idx].id // empty" "$TASKS_FILE")
+                if [[ $SUBTASK_ID =~ S([0-9]+) ]]; then
+                    SUBTASK_NUM=${match[1]}
+                else
+                    SUBTASK_NUM=$((subtask_idx+1))  # Fallback to index-based
+                fi
 
                 # Skip subtasks until we reach the start subtask of the start task/milestone/phase
                 if [[ $PHASE_NUM -eq $START_PHASE && $MS_NUM -eq $START_MS && $TASK_NUM -eq $START_TASK && $SUBTASK_NUM -lt $START_SUBTASK ]]; then
@@ -1536,5 +1617,26 @@ if [[ -f "validation_report.md" ]]; then
         print -P "%F{green}[FIX]%f Fixes applied."
     fi
 fi
+
+# Cleanup: Delete validation artifacts
+print -P "%F{blue}[CLEANUP]%f Removing validation artifacts..."
+
+# Ask agent to delete the files (in case they were created elsewhere)
+run_with_retry $AGENT -p "Delete the validation artifacts: remove ./validate.sh and ./validation_report.md from the current directory. These are temporary files that should not be committed."
+
+# Manual deletion as backup (in case agent didn't delete them)
+rm -f "./validate.sh" "./validation_report.md" 2>/dev/null
+
+# Mark final task as complete before committing
+print -P "%F{blue}[STATUS]%f Marking final task as complete..."
+FINAL_TASK=$(tsk next -s "$SCOPE" 2>/dev/null)
+if [[ -n "$FINAL_TASK" ]]; then
+    run_with_retry tsk update "$FINAL_TASK" Complete
+fi
+
+# Final commit
+print -P "%F{blue}[GIT]%f Committing final changes..."
+git add -A
+git commit -m "Complete validation and finalize implementation" 2>/dev/null || true
 
 print -P "%F{green}[SUCCESS]%f Workflow completed."
