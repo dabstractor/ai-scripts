@@ -59,9 +59,9 @@ esac
 # --- 3. Configuration ---
 AGENT="${AGENT:-glp}"
 BREAKDOWN_AGENT="${BREAKDOWN_AGENT:-$AGENT}"
-TASKS_FILE="tasks.json"
-PRD_FILE="PRD.md"
-PLAN_DIR="plan"
+TASKS_FILE="${TASKS_FILE:-tasks.json}"
+PRD_FILE="${PRD_FILE:-PRD.md}"
+PLAN_DIR="${PLAN_DIR:-plan}"
 
 # Auto-resume logic
 if [[ "$MANUAL_START" == "false" && -f "$TASKS_FILE" ]]; then
@@ -971,6 +971,15 @@ EOF
 
 # --- 4. Helpers ---
 
+# Get the current status of an item from tsk
+# Usage: get_item_status <id>
+# Returns: The status string (Planned, Researching, Implementing, Complete, Failed) or empty if not found
+get_item_status() {
+    local id=$1
+    # Get status as JSON and extract the status for this specific item
+    tsk status -s "$SCOPE" 2>/dev/null | jq -r --arg iid "$id" '.[] | select(.id == $iid) | .status // empty'
+}
+
 # Generate ID based on scope
 # Usage: generate_id <phase_num> <milestone_num> <task_num> <subtask_num>
 # Returns: P1, P1.M1, P1.M1.T1, or P1.M1.T1.S1 depending on SCOPE
@@ -1277,16 +1286,25 @@ execute_item() {
     local task_num=$5
     local subtask_num=$6
 
-    print -P "\n%B%F{green}>>> EXECUTING $id%f%b"
+    # Check current status from tsk
+    local current_status=$(get_item_status "$id")
+
+    # Skip if already completed
+    if [[ "$current_status" == "Completed" || "$current_status" == "Complete" ]]; then
+        print -P "\n%F{green}[SKIP]%f $id is already %F{green}Completed%f. Skipping..."
+        return 0
+    fi
+
+    print -P "\n%B%F{green}>>> EXECUTING $id%f%b %F{cyan}(current status: $current_status)%f%b"
 
     # Wait for any background research for this item to complete
     wait_for_background_research "$id"
 
     mkdir -p "$dirname/research"
 
-    # If PRP already exists, skip to implementation
-    if [[ -f "$dirname/PRP.md" ]]; then
-        print -P "%F{yellow}[SKIP]%f PRP exists, skipping to implementation"
+    # If PRP already exists OR status is Implementing, skip to implementation
+    if [[ -f "$dirname/PRP.md" || "$current_status" == "Implementing" ]]; then
+        print -P "%F{yellow}[SKIP]%f PRP exists or status is Implementing, skipping to implementation"
         run_with_retry tsk update "$id" Implementing
     else
         run_with_retry tsk update "$id" Researching
@@ -1390,30 +1408,9 @@ smart_commit() {
     fi
 
     # Unstage the next item's plan directory if parallel research is active
-    if [[ "$PARALLEL_RESEARCH" == "true" ]]; then
-        if [[ -n "$RESEARCH_DIRNAME" ]]; then
-            print -P "%F{cyan}[GIT]%f Unstaging next item's directory: $RESEARCH_DIRNAME"
-            # Unstage the directory and all its contents
-            git reset -- "$RESEARCH_DIRNAME" 2>&1 || true
-            # Verify nothing from that directory is staged
-            local staged_files=$(git diff --cached --name-only -- "$RESEARCH_DIRNAME" 2>/dev/null)
-            if [[ -n "$staged_files" ]]; then
-                print -P "%F{yellow}[WARN]%f Some files still staged in $RESEARCH_DIRNAME, forcing unstage..."
-                print "$staged_files" | while read -r file; do
-                    git reset -- "$file" 2>/dev/null || true
-                done
-            fi
-            # Final verification
-            staged_files=$(git diff --cached --name-only -- "$RESEARCH_DIRNAME" 2>/dev/null)
-            if [[ -n "$staged_files" ]]; then
-                print -P "%F{red}[ERROR]%f Failed to unstage files in $RESEARCH_DIRNAME:"
-                print "$staged_files"
-            else
-                print -P "%F{green}[GIT]%f Successfully unstaged $RESEARCH_DIRNAME"
-            fi
-        else
-            print -P "%F{yellow}[WARN]%f Parallel research enabled but RESEARCH_DIRNAME not set"
-        fi
+    if [[ "$PARALLEL_RESEARCH" == "true" && -n "$RESEARCH_DIRNAME" ]]; then
+        print -P "%F{cyan}[GIT]%f Unstaging next item's directory: $RESEARCH_DIRNAME"
+        git reset HEAD -- "$RESEARCH_DIRNAME" 2>/dev/null || true
     fi
 
     run_with_retry git commit-claude
@@ -1437,6 +1434,11 @@ if [[ ! -f "$TASKS_FILE" ]]; then
 
     if [[ -f "$TASKS_FILE" ]]; then
         print -P "%F{green}[PHASE 0]%f Task breakdown complete."
+
+        # Cleanup phase: organize .md files created during breakdown
+        print -P "%F{blue}[CLEANUP]%f Organizing files after task breakdown..."
+        run_with_retry $AGENT -p "$CLEANUP_PROMPT" || print -P "%F{yellow}[WARN]%f Cleanup failed, proceeding to commit..."
+
         # Commit the task breakdown
         print -P "%F{blue}[GIT]%f Committing task breakdown..."
         git add "$TASKS_FILE" "$PLAN_DIR"
@@ -1634,9 +1636,8 @@ if [[ -n "$FINAL_TASK" ]]; then
     run_with_retry tsk update "$FINAL_TASK" Complete
 fi
 
-# Final commit
-print -P "%F{blue}[GIT]%f Committing final changes..."
-git add -A
-git commit -m "Complete validation and finalize implementation" 2>/dev/null || true
+# Final smart commit after validation
+print -P "%F{blue}[GIT]%f Committing final changes with smart commit..."
+smart_commit
 
 print -P "%F{green}[SUCCESS]%f Workflow completed."
