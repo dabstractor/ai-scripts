@@ -12,6 +12,17 @@ const StatusSchema = z.enum(['Planned', 'Researching', 'Ready', 'Implementing', 
 
 const VALID_STATUSES: Status[] = ['Planned', 'Researching', 'Ready', 'Implementing', 'Complete', 'Failed'];
 
+// Status priority for determining parent status (lower = earlier in workflow)
+// Failed is special: excluded from min calculation unless all children failed
+const STATUS_PRIORITY: Record<Status, number> = {
+  'Planned': 0,
+  'Researching': 1,
+  'Ready': 2,
+  'Implementing': 3,
+  'Complete': 4,
+  'Failed': -1
+};
+
 /**
  * Fuzzy match a string to a valid Status.
  * Tries: exact (case-insensitive), prefix match, substring match.
@@ -229,21 +240,96 @@ class TaskManager {
     }
   }
 
-  private checkAndCompleteParent(parent: any): void {
-    if (!parent) return;
+  /**
+   * Compute the minimum status from a list of children.
+   * Failed items are excluded unless all children are Failed.
+   */
+  private getMinChildStatus(children: { status: Status }[]): Status {
+    if (children.length === 0) return 'Planned';
 
-    let allComplete = false;
+    // Separate failed and non-failed children
+    const nonFailed = children.filter(c => c.status !== 'Failed');
 
-    if (parent.subtasks) {
-      allComplete = parent.subtasks.length > 0 && parent.subtasks.every((s: Subtask) => s.status === 'Complete');
-    } else if (parent.tasks) {
-      allComplete = parent.tasks.length > 0 && parent.tasks.every((t: Task) => t.status === 'Complete');
-    } else if (parent.milestones) {
-      allComplete = parent.milestones.length > 0 && parent.milestones.every((m: Milestone) => m.status === 'Complete');
+    // If all children failed, parent is Failed
+    if (nonFailed.length === 0) return 'Failed';
+
+    // Find the minimum status (lowest priority = earliest in workflow)
+    let minStatus = nonFailed[0].status;
+    let minPriority = STATUS_PRIORITY[minStatus];
+
+    for (const child of nonFailed) {
+      const priority = STATUS_PRIORITY[child.status];
+      if (priority < minPriority) {
+        minPriority = priority;
+        minStatus = child.status;
+      }
     }
 
-    if (allComplete && parent.status !== 'Complete') {
-      parent.status = 'Complete';
+    return minStatus;
+  }
+
+  /**
+   * Update parent status to reflect the minimum status of its children.
+   */
+  private updateParentStatus(parent: any): void {
+    if (!parent) return;
+
+    let children: { status: Status }[] = [];
+
+    if (parent.subtasks && parent.subtasks.length > 0) {
+      children = parent.subtasks;
+    } else if (parent.tasks && parent.tasks.length > 0) {
+      children = parent.tasks;
+    } else if (parent.milestones && parent.milestones.length > 0) {
+      children = parent.milestones;
+    }
+
+    if (children.length > 0) {
+      const newStatus = this.getMinChildStatus(children);
+      parent.status = newStatus;
+    }
+  }
+
+  /**
+   * Find the full ancestry chain for a node by ID.
+   * Returns array from root (phase) to immediate parent, or empty if node is a phase.
+   */
+  private findAncestors(id: string): any[] {
+    const ancestors: any[] = [];
+
+    for (const phase of this.data.backlog) {
+      if (phase.id === id) return []; // Phase has no ancestors
+
+      if (phase.milestones) {
+        for (const milestone of phase.milestones) {
+          if (milestone.id === id) return [phase];
+
+          if (milestone.tasks) {
+            for (const task of milestone.tasks) {
+              if (task.id === id) return [phase, milestone];
+
+              if (task.subtasks) {
+                for (const subtask of task.subtasks) {
+                  if (subtask.id === id) return [phase, milestone, task];
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    return [];
+  }
+
+  /**
+   * Update all ancestors of a node to reflect their children's statuses.
+   * Processes from immediate parent up to root (phase).
+   */
+  private updateAllAncestors(id: string): void {
+    const ancestors = this.findAncestors(id);
+    // Update from immediate parent up to root (reverse order)
+    for (let i = ancestors.length - 1; i >= 0; i--) {
+      this.updateParentStatus(ancestors[i]);
     }
   }
 
@@ -260,8 +346,8 @@ class TaskManager {
       this.completeChildrenRecursively(result.node);
     }
 
-    // Check if all siblings are Complete, and if so, complete the parent
-    this.checkAndCompleteParent(result.parent);
+    // Update all ancestors to reflect the minimum status of their children
+    this.updateAllAncestors(id);
 
     this.saveBacklog();
   }
