@@ -398,7 +398,10 @@ class TaskManager {
     }
   }
 
-  public static createSampleFile(filePath: string): void {
+  public static createSampleFile(inputPath: string): void {
+    // Resolve path relative to the original cwd
+    const cwd = process.env.ORIGINAL_CWD || process.env.INIT_CWD || process.cwd();
+    const filePath = path.resolve(cwd, inputPath);
     const sampleData: Backlog = {
       backlog: [
         {
