@@ -75,7 +75,7 @@ SKIP_BUG_FINDING="${SKIP_BUG_FINDING:-false}"
 
 # Auto-resume logic
 if [[ "$MANUAL_START" == "false" && -f "$TASKS_FILE" ]]; then
-    NEXT_ITEM=$(tsk next -s "$SCOPE" 2>/dev/null)
+    NEXT_ITEM=$(tsk_cmd next -s "$SCOPE" 2>/dev/null)
     if [[ -n "$NEXT_ITEM" ]]; then
         print -P "%F{cyan}[RESUME]%f Auto-resuming from: %F{yellow}$NEXT_ITEM%f"
 
@@ -1089,13 +1089,19 @@ EOF
 
 # --- 4. Helpers ---
 
+# Wrapper for tsk command to always use the correct tasks file
+# Usage: tsk_cmd <args...>
+tsk_cmd() {
+    tsk -f "$TASKS_FILE" "$@"
+}
+
 # Get the current status of an item from tsk
 # Usage: get_item_status <id>
 # Returns: The status string (Planned, Researching, Implementing, Complete, Failed) or empty if not found
 get_item_status() {
     local id=$1
     # Get status as JSON and extract the status for this specific item
-    tsk status -s "$SCOPE" 2>/dev/null | jq -r --arg iid "$id" '.[] | select(.id == $iid) | .status // empty'
+    tsk_cmd status -s "$SCOPE" 2>/dev/null | jq -r --arg iid "$id" '.[] | select(.id == $iid) | .status // empty'
 }
 
 # Generate ID based on scope
@@ -1254,11 +1260,11 @@ The previous PRP defines what will exist when your item begins implementation.
 
     # Run research in background subshell
     (
-        run_with_retry tsk update "$id" Researching
+        run_with_retry tsk_cmd update "$id" Researching
         run_with_retry $AGENT -p "$PRP_CREATE_PROMPT Create a PRP for $(get_scope_name) $id of the PRD. Store it at $dirname/PRP.md.
 <item_title>$(get_item_title $phase_num $ms_num $task_num $subtask_num)</item_title>
 <item_description>$(get_item_description $phase_num $ms_num $task_num $subtask_num)</item_description>
-<plan_status>$(tsk status)</plan_status>$prev_context"
+<plan_status>$(tsk_cmd status)</plan_status>$prev_context"
         if [[ ! -f "$dirname/PRP.md" ]]; then
             print -P "%F{yellow}[PARALLEL]%f PRP.md not found for $id, retrying..."
             $AGENT --continue -p "You didn't write the file. Make sure you write the file to $dirname/PRP.md"
@@ -1423,16 +1429,16 @@ execute_item() {
     # If PRP already exists OR status is Implementing, skip to implementation
     if [[ -f "$dirname/PRP.md" || "$current_status" == "Implementing" ]]; then
         print -P "%F{yellow}[SKIP]%f PRP exists or status is Implementing, skipping to implementation"
-        run_with_retry tsk update "$id" Implementing
+        run_with_retry tsk_cmd update "$id" Implementing
     else
-        run_with_retry tsk update "$id" Researching
+        run_with_retry tsk_cmd update "$id" Researching
         run_with_retry $AGENT -p "$PRP_CREATE_PROMPT Create a PRP for $(get_scope_name) $id of the PRD. Store it at $dirname/PRP.md.
 <item_title>$(get_item_title $phase_num $ms_num $task_num $subtask_num)</item_title>
 <item_description>$(get_item_description $phase_num $ms_num $task_num $subtask_num)</item_description>
-<plan_status>$(tsk status)</plan_status>"
+<plan_status>$(tsk_cmd status)</plan_status>"
         [ ! -f "$dirname/PRP.md" ] && print -P "%F{red}[ERROR]%f PRP.md not found. Retrying..." && $AGENT --continue -p "You didn't write the file. Make sure you write the file to $dirname/PRP.md"
         [ ! -f "$dirname/PRP.md" ] && print -P "%F{red}[ERROR]%f PRP.md not found. Aborting..." && exit 1
-        run_with_retry tsk update "$id" Implementing
+        run_with_retry tsk_cmd update "$id" Implementing
     fi
 
     # Start background research for next item if parallel research is enabled
@@ -1450,7 +1456,7 @@ execute_item() {
     git add $TASKS_FILE
     [[ -z "$(git diff HEAD --name-only)" ]] && print -P "%F{red}[ERROR]%f No diff found after $id. Aborting..." && exit 1
 
-    run_with_retry tsk update "$id" Complete
+    run_with_retry tsk_cmd update "$id" Complete
 
     print -P "%F{blue}[CLEANUP]%f Cleaning up $id..."
     run_with_retry $AGENT -p "$CLEANUP_PROMPT" || print -P "%F{yellow}[WARN]%f Cleanup failed, proceeding to commit..."
@@ -1540,13 +1546,34 @@ smart_commit() {
 if [[ "$ONLY_BUG_HUNT" == "true" ]]; then
     print -P "%F{cyan}[CONFIG]%f Running in %F{magenta}BUG HUNT ONLY%f mode"
     print -P "%F{cyan}[CONFIG]%f Bug finder agent: %F{yellow}$BUG_FINDER_AGENT%f"
-    if [[ ! -f "$PRD_FILE" ]]; then
-        print -P "%F{red}[ERROR]%f $PRD_FILE not found. Cannot bug hunt without PRD."
-        exit 1
-    fi
-    if [[ ! -f "$TASKS_FILE" ]]; then
-        print -P "%F{red}[ERROR]%f $TASKS_FILE not found. Cannot bug hunt without completed tasks."
-        exit 1
+
+    # Check if we're resuming a bug fix cycle (bugfix tasks file exists)
+    if [[ -f "$BUGFIX_TASKS_FILE" ]]; then
+        print -P "%F{yellow}[BUG HUNT]%f Existing bug fix tasks found: $BUGFIX_TASKS_FILE"
+        print -P "%F{cyan}[BUG HUNT]%f Resuming bug fix implementation..."
+        # Re-run with bugfix parameters to resume
+        SKIP_BUG_FINDING=true \
+        PRD_FILE="$BUG_RESULTS_FILE" \
+        TASKS_FILE="$BUGFIX_TASKS_FILE" \
+        SCOPE="$BUGFIX_SCOPE" \
+        AGENT="$AGENT" \
+        PLAN_DIR="${PLAN_DIR}_bugfix" \
+        exec "$0"
+    # If bug report already exists, skip bug finding and go straight to fix pipeline
+    elif [[ -f "$BUG_RESULTS_FILE" ]]; then
+        print -P "%F{yellow}[BUG HUNT]%f Existing bug report found: $BUG_RESULTS_FILE"
+        print -P "%F{cyan}[BUG HUNT]%f Skipping to bug fix pipeline..."
+        # Skip to bug finding stage which will detect the file and run fix pipeline
+    else
+        # Only require PRD and tasks if we need to run bug finding
+        if [[ ! -f "$PRD_FILE" ]]; then
+            print -P "%F{red}[ERROR]%f $PRD_FILE not found. Cannot bug hunt without PRD."
+            exit 1
+        fi
+        if [[ ! -f "$TASKS_FILE" ]]; then
+            print -P "%F{red}[ERROR]%f $TASKS_FILE not found. Cannot bug hunt without completed tasks."
+            exit 1
+        fi
     fi
     # Skip to bug finding stage (handled at end of script)
 
@@ -1765,9 +1792,9 @@ rm -f "./validate.sh" "./validation_report.md" 2>/dev/null
 
 # Mark final task as complete before committing
 print -P "%F{blue}[STATUS]%f Marking final task as complete..."
-FINAL_TASK=$(tsk next -s "$SCOPE" 2>/dev/null)
+FINAL_TASK=$(tsk_cmd next -s "$SCOPE" 2>/dev/null)
 if [[ -n "$FINAL_TASK" ]]; then
-    run_with_retry tsk update "$FINAL_TASK" Complete
+    run_with_retry tsk_cmd update "$FINAL_TASK" Complete
 fi
 
 # Final smart commit after validation
@@ -1778,9 +1805,14 @@ fi  # End of validation block (skip if bug-hunt only mode)
 
 # --- Creative Bug Finding Stage ---
 if [[ "$SKIP_BUG_FINDING" == "false" ]]; then
-    print -P "\n%F{magenta}[BUG HUNT]%f Starting creative bug finding with $BUG_FINDER_AGENT..."
-
-    run_with_retry $BUG_FINDER_AGENT -p "$BUG_FINDING_PROMPT"
+    # Check if bug report already exists - skip bug finding and go straight to fix pipeline
+    if [[ -f "$BUG_RESULTS_FILE" ]]; then
+        print -P "\n%F{yellow}[BUG HUNT]%f Existing bug report found: $BUG_RESULTS_FILE"
+        print -P "%F{cyan}[BUG HUNT]%f Skipping bug finding, proceeding to bug fix pipeline..."
+    else
+        print -P "\n%F{magenta}[BUG HUNT]%f Starting creative bug finding with $BUG_FINDER_AGENT..."
+        run_with_retry $BUG_FINDER_AGENT -p "$BUG_FINDING_PROMPT"
+    fi
 
     if [[ -f "$BUG_RESULTS_FILE" ]]; then
         print -P "%F{cyan}[BUG HUNT]%f Bug report generated: $BUG_RESULTS_FILE"
@@ -1828,7 +1860,15 @@ if [[ "$SKIP_BUG_FINDING" == "false" ]]; then
             SCOPE="$BUGFIX_SCOPE" \
             AGENT="$AGENT" \
             PLAN_DIR="${PLAN_DIR}_bugfix" \
-            exec "$0"
+            "$0"
+
+            # Delete bug report file after successful bug fix pipeline completion
+            if [[ $? -eq 0 ]]; then
+                print -P "%F{green}[CLEANUP]%f Bug fix pipeline completed successfully. Deleting bug report..."
+                rm -f "$BUG_RESULTS_FILE" 2>/dev/null
+            else
+                print -P "%F{yellow}[WARN]%f Bug fix pipeline exited with errors. Keeping bug report for review."
+            fi
         else
             print -P "%F{green}[BUG HUNT]%f No critical or major bugs found. Quality looks good!"
             # Clean up bug results file since no issues
