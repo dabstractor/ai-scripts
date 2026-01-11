@@ -469,20 +469,25 @@ function main(): void {
     .description('Task processing utility for Agentic TDD environments')
     .argument('[json-file]', 'JSON file containing tasks (default: tasks.json)')
     .option('-v, --verbose', 'Enable verbose output')
-    .option('-s, --scope <level>', 'Scope to specific level (phase, milestone, task, subtask)');
+    .option('-s, --scope <level>', 'Scope to specific level (phase, milestone, task, subtask)')
+    .option('-f, --file <path>', 'Path to tasks JSON file (overrides positional argument and TASKS_FILE env var)');
 
-  const handleNextCommand = (jsonFile: string | undefined, options: { scope?: string } | undefined, cmd: any) => {
+  // Helper to resolve target file: -f option > positional arg > TASKS_FILE env > default
+  const resolveTargetFile = (jsonFile: string | undefined, options: any): string => {
+    if (options?.file) return options.file;
+    if (typeof jsonFile === 'string') return jsonFile;
+    if (process.env.TASKS_FILE) return process.env.TASKS_FILE;
+    return 'tasks.json';
+  };
+
+  const handleNextCommand = (jsonFile: string | undefined, options: { scope?: string; file?: string } | undefined, cmd: any) => {
     try {
       // Merge global options with command options
       const globalOptions = cmd && cmd.parent ? cmd.parent.opts() : {};
       const cmdOptions = (typeof options === 'object') ? options : {};
       const mergedOptions = { ...globalOptions, ...cmdOptions };
 
-      let targetFile = 'tasks.json';
-
-      if (typeof jsonFile === 'string') {
-        targetFile = jsonFile;
-      }
+      const targetFile = resolveTargetFile(jsonFile, mergedOptions);
 
       const manager = new TaskManager(targetFile);
       const nextTask = manager.getNextTask();
@@ -549,10 +554,13 @@ function main(): void {
     .command('status')
     .description('Show current status of all tasks')
     .argument('[json-file]', 'JSON file containing tasks (default: tasks.json)')
-    .option('-f, --full', 'Show hierarchical tree view with details')
-    .action((jsonFile = 'tasks.json', options) => {
+    .option('--full', 'Show hierarchical tree view with details')
+    .action((jsonFile, options, cmd) => {
       try {
-        const manager = new TaskManager(jsonFile);
+        const globalOptions = cmd.parent ? cmd.parent.opts() : {};
+        const mergedOptions = { ...globalOptions, ...options };
+        const targetFile = resolveTargetFile(jsonFile, mergedOptions);
+        const manager = new TaskManager(targetFile);
         console.log(manager.getStatusSummary());
       } catch (error) {
         console.error(chalk.red('Error:'), error instanceof Error ? error.message : String(error));
@@ -567,12 +575,14 @@ function main(): void {
     .argument('<task-id>', 'Task ID (e.g., P1.M1.T1.S1 or p1m1t1s1)')
     .argument('<status>', 'New status (fuzzy matched, e.g., "comp" -> Complete)')
     .argument('[json-file]', 'JSON file containing tasks (default: tasks.json)')
-    .action((taskId, statusInput, jsonFile = 'tasks.json') => {
+    .action((taskId, statusInput, jsonFile, cmd) => {
       try {
+        const globalOptions = cmd.parent ? cmd.parent.opts() : {};
+        const targetFile = resolveTargetFile(jsonFile, globalOptions);
         const normalizedId = normalizeId(taskId);
         const matchedStatus = matchStatus(statusInput);
 
-        const manager = new TaskManager(jsonFile);
+        const manager = new TaskManager(targetFile);
         manager.updateTaskStatus(normalizedId, matchedStatus);
         console.log(chalk.green(`Updated ${normalizedId} status to ${matchedStatus}`));
       } catch (error) {
@@ -596,12 +606,13 @@ function main(): void {
     });
 
   // Default action when no command specified
-  program.action((jsonFile = 'tasks.json', options) => {
+  program.action((jsonFile, options) => {
     try {
+      const targetFile = resolveTargetFile(jsonFile, options);
       if (options.scope) {
         handleNextCommand(jsonFile, options, undefined);
       } else {
-        const manager = new TaskManager(jsonFile);
+        const manager = new TaskManager(targetFile);
         console.log(manager.getStatusSummary());
       }
     } catch (error) {
