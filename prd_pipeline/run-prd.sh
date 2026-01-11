@@ -1070,20 +1070,14 @@ Small improvements or polish items.
 5. **Prioritize**: Focus on what matters most to users
 6. **Document Everything**: Even if you're not sure it's a bug, note it
 
-## Output
+## Output - IMPORTANT
 
-Write your complete bug report to \`./$BUG_RESULTS_FILE\`.
+**It is IMPORTANT that you follow these rules exactly:**
 
-If no bugs are found, still write the file with:
-\`\`\`markdown
-# Bug Fix Requirements
+- **If you find Critical or Major bugs**: You MUST write the bug report to \`./$BUG_RESULTS_FILE\`. It is imperative that actionable bugs are documented.
+- **If you find NO Critical or Major bugs**: Do NOT write any file. Do NOT create \`./$BUG_RESULTS_FILE\`. Leave no trace. The absence of the file signals success.
 
-## Overview
-Comprehensive testing completed. No issues found.
-
-## Testing Summary
-[Describe what was tested]
-\`\`\`
+This is imperative. The presence or absence of the bug report file controls the entire bugfix pipeline. Writing an empty or "no bugs found" file will cause unnecessary work. Not writing the file when there ARE bugs will cause bugs to be missed.
 EOF
 
 
@@ -1557,8 +1551,17 @@ if [[ "$ONLY_BUG_HUNT" == "true" ]]; then
         TASKS_FILE="$BUGFIX_TASKS_FILE" \
         SCOPE="$BUGFIX_SCOPE" \
         AGENT="$AGENT" \
-        PLAN_DIR="${PLAN_DIR}_bugfix" \
-        exec "$0"
+        PLAN_DIR="${PLAN_DIR}/bugfix" \
+        "$0"
+
+        # Cleanup after successful bugfix implementation
+        if [[ $? -eq 0 ]]; then
+            print -P "%F{green}[CLEANUP]%f Bug fix implementation completed. Cleaning up..."
+            rm -f "$BUG_RESULTS_FILE" 2>/dev/null
+            rm -f "$BUGFIX_TASKS_FILE" 2>/dev/null
+            rm -rf "${PLAN_DIR}/bugfix" 2>/dev/null
+        fi
+        exit $?
     # If bug report already exists, skip bug finding and go straight to fix pipeline
     elif [[ -f "$BUG_RESULTS_FILE" ]]; then
         print -P "%F{yellow}[BUG HUNT]%f Existing bug report found: $BUG_RESULTS_FILE"
@@ -1804,79 +1807,63 @@ smart_commit
 fi  # End of validation block (skip if bug-hunt only mode)
 
 # --- Creative Bug Finding Stage ---
+# Loops until no bugs are found (no bug report file created)
 if [[ "$SKIP_BUG_FINDING" == "false" ]]; then
-    # Check if bug report already exists - skip bug finding and go straight to fix pipeline
-    if [[ -f "$BUG_RESULTS_FILE" ]]; then
-        print -P "\n%F{yellow}[BUG HUNT]%f Existing bug report found: $BUG_RESULTS_FILE"
-        print -P "%F{cyan}[BUG HUNT]%f Skipping bug finding, proceeding to bug fix pipeline..."
-    else
-        print -P "\n%F{magenta}[BUG HUNT]%f Starting creative bug finding with $BUG_FINDER_AGENT..."
-        run_with_retry $BUG_FINDER_AGENT -p "$BUG_FINDING_PROMPT"
-    fi
+    BUG_HUNT_ITERATION=1
 
-    if [[ -f "$BUG_RESULTS_FILE" ]]; then
-        print -P "%F{cyan}[BUG HUNT]%f Bug report generated: $BUG_RESULTS_FILE"
+    while true; do
+        print -P "\n%F{magenta}[BUG HUNT]%f Iteration $BUG_HUNT_ITERATION: Starting creative bug finding with $BUG_FINDER_AGENT..."
 
-        # Check if bugs were found
-        BUG_REPORT_CONTENT=$(cat "$BUG_RESULTS_FILE")
-
-        BUG_CHECK_PROMPT="Here is the bug report.
-
-        CONTENT:
-        $BUG_REPORT_CONTENT
-
-        INSTRUCTION:
-        - If the report lists ANY Critical Issues or Major Issues: output BUGS_FOUND
-        - If the report shows no issues or only Minor Issues: output NO_BUGS
-        - Output ONLY one of these two phrases."
-
-        BUG_RESULT=$(claude --print --allowed-tools "" --system-prompt "You are a binary classifier. Output only BUGS_FOUND or NO_BUGS." "$BUG_CHECK_PROMPT")
-        CLEAN_BUG_RESULT=$(echo "$BUG_RESULT" | tr -d '[:space:]')
-
-        # Validate response and retry if necessary
-        if [[ "$CLEAN_BUG_RESULT" != "BUGS_FOUND" && "$CLEAN_BUG_RESULT" != "NO_BUGS" ]]; then
-            print -P "%F{yellow}[RETRY]%f Invalid bug checker output: '$BUG_RESULT'. Retrying..."
-            BUG_RESULT=$(claude --print --continue --allowed-tools "" "ERROR: You replied with '$BUG_RESULT'. You MUST output exactly: BUGS_FOUND or NO_BUGS.")
-            CLEAN_BUG_RESULT=$(echo "$BUG_RESULT" | tr -d '[:space:]')
-        fi
-
-        print -P "%F{cyan}[BUG HUNT]%f Bug check result: $CLEAN_BUG_RESULT"
-
-        if [[ "$CLEAN_BUG_RESULT" == "BUGS_FOUND" ]]; then
-            print -P "\n%F{yellow}[BUG FIX]%f Bugs found! Starting bug fix pipeline..."
-            print -P "%F{yellow}[BUG FIX]%f PRD: $BUG_RESULTS_FILE"
-            print -P "%F{yellow}[BUG FIX]%f Tasks: $BUGFIX_TASKS_FILE"
-            print -P "%F{yellow}[BUG FIX]%f Scope: $BUGFIX_SCOPE"
-
-            # Commit the bug report before starting fix cycle
-            git add "$BUG_RESULTS_FILE"
-            git commit -m "Add bug report from creative testing" 2>/dev/null || true
-
-            # Re-run the pipeline with bug fixes
-            # Use SKIP_BUG_FINDING=true to prevent infinite loops
-            SKIP_BUG_FINDING=true \
-            PRD_FILE="$BUG_RESULTS_FILE" \
-            TASKS_FILE="$BUGFIX_TASKS_FILE" \
-            SCOPE="$BUGFIX_SCOPE" \
-            AGENT="$AGENT" \
-            PLAN_DIR="${PLAN_DIR}_bugfix" \
-            "$0"
-
-            # Delete bug report file after successful bug fix pipeline completion
-            if [[ $? -eq 0 ]]; then
-                print -P "%F{green}[CLEANUP]%f Bug fix pipeline completed successfully. Deleting bug report..."
-                rm -f "$BUG_RESULTS_FILE" 2>/dev/null
-            else
-                print -P "%F{yellow}[WARN]%f Bug fix pipeline exited with errors. Keeping bug report for review."
-            fi
+        # Check if bug report already exists (resuming interrupted session)
+        if [[ -f "$BUG_RESULTS_FILE" ]]; then
+            print -P "%F{yellow}[BUG HUNT]%f Existing bug report found: $BUG_RESULTS_FILE"
+            print -P "%F{cyan}[BUG HUNT]%f Skipping discovery, proceeding to bug fix pipeline..."
         else
-            print -P "%F{green}[BUG HUNT]%f No critical or major bugs found. Quality looks good!"
-            # Clean up bug results file since no issues
-            rm -f "$BUG_RESULTS_FILE" 2>/dev/null
+            # Run bug finding - agent will ONLY create file if bugs found
+            run_with_retry $BUG_FINDER_AGENT -p "$BUG_FINDING_PROMPT"
         fi
-    else
-        print -P "%F{yellow}[BUG HUNT]%f Bug report file not generated. Skipping bug fix cycle."
-    fi
+
+        # If no file was created, no bugs were found - we're done!
+        if [[ ! -f "$BUG_RESULTS_FILE" ]]; then
+            print -P "%F{green}[BUG HUNT]%f No bugs found. Quality looks good!"
+            break
+        fi
+
+        # Bug report exists - run the fix pipeline
+        print -P "%F{cyan}[BUG HUNT]%f Bug report generated: $BUG_RESULTS_FILE"
+        print -P "\n%F{yellow}[BUG FIX]%f Bugs found! Starting bug fix pipeline..."
+        print -P "%F{yellow}[BUG FIX]%f PRD: $BUG_RESULTS_FILE"
+        print -P "%F{yellow}[BUG FIX]%f Tasks: $BUGFIX_TASKS_FILE"
+        print -P "%F{yellow}[BUG FIX]%f Scope: $BUGFIX_SCOPE"
+
+        # Commit the bug report before starting fix cycle
+        git add "$BUG_RESULTS_FILE"
+        git commit -m "Add bug report from creative testing (iteration $BUG_HUNT_ITERATION)" 2>/dev/null || true
+
+        # Re-run the pipeline with bug fixes
+        SKIP_BUG_FINDING=true \
+        PRD_FILE="$BUG_RESULTS_FILE" \
+        TASKS_FILE="$BUGFIX_TASKS_FILE" \
+        SCOPE="$BUGFIX_SCOPE" \
+        AGENT="$AGENT" \
+        PLAN_DIR="${PLAN_DIR}/bugfix" \
+        "$0"
+
+        # Check if bugfix pipeline succeeded
+        if [[ $? -ne 0 ]]; then
+            print -P "%F{red}[ERROR]%f Bug fix pipeline failed. Keeping bug report for review."
+            break
+        fi
+
+        # Cleanup after successful bugfix - delete all bugfix artifacts for next iteration
+        print -P "%F{green}[CLEANUP]%f Bug fix pipeline completed. Cleaning up for next iteration..."
+        rm -f "$BUG_RESULTS_FILE" 2>/dev/null
+        rm -f "$BUGFIX_TASKS_FILE" 2>/dev/null
+        rm -rf "${PLAN_DIR}/bugfix" 2>/dev/null
+
+        ((BUG_HUNT_ITERATION++))
+        print -P "%F{cyan}[BUG HUNT]%f Re-running bug discovery to verify fixes..."
+    done
 else
     print -P "%F{cyan}[CONFIG]%f Bug finding skipped (SKIP_BUG_FINDING=true)"
 fi
