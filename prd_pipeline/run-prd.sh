@@ -11,7 +11,7 @@ unalias() { builtin unalias "$@" 2>/dev/null || true }
 setopt aliases
 
 # --- 2. Parameter Parsing ---
-SCOPE="${SCOPE:-task}"  # Default to task-level
+SCOPE="${SCOPE:-subtask}"  # Default to task-level
 START_PHASE=1
 START_MS=1
 START_TASK=1
@@ -1561,14 +1561,18 @@ if [[ "$ONLY_BUG_HUNT" == "true" ]]; then
         PLAN_DIR="${PLAN_DIR}/bugfix" \
         "$0"
 
-        # Cleanup after successful bugfix implementation
-        if [[ $? -eq 0 ]]; then
+        # Handle bugfix subprocess result
+        BUGFIX_EXIT_CODE=$?
+        if [[ $BUGFIX_EXIT_CODE -eq 0 ]]; then
             print -P "%F{green}[CLEANUP]%f Bug fix implementation completed. Cleaning up..."
             rm -f "$BUG_RESULTS_FILE" 2>/dev/null
             rm -f "$BUGFIX_TASKS_FILE" 2>/dev/null
             rm -rf "${PLAN_DIR}/bugfix" 2>/dev/null
+            # Don't exit - fall through to bug finding loop to verify fixes
+        else
+            print -P "%F{red}[ERROR]%f Bug fix implementation failed."
+            exit $BUGFIX_EXIT_CODE
         fi
-        exit $?
     # If bug report already exists, skip bug finding and go straight to fix pipeline
     elif [[ -f "$BUG_RESULTS_FILE" ]]; then
         print -P "%F{yellow}[BUG HUNT]%f Existing bug report found: $BUG_RESULTS_FILE"
@@ -1818,6 +1822,14 @@ print -P "%F{blue}[STATUS]%f Marking final task as complete..."
 FINAL_TASK=$(tsk_cmd next -s "$SCOPE" 2>/dev/null)
 if [[ -n "$FINAL_TASK" ]]; then
     run_with_retry tsk_cmd update "$FINAL_TASK" Complete
+fi
+
+# If in bugfix mode, delete bugfix artifacts before final commit
+if [[ "$SKIP_BUG_FINDING" == "true" ]]; then
+    print -P "%F{blue}[CLEANUP]%f Removing bugfix artifacts before final commit..."
+    rm -f "$BUG_RESULTS_FILE" 2>/dev/null
+    rm -f "$BUGFIX_TASKS_FILE" 2>/dev/null
+    git add -A  # Stage the deletions
 fi
 
 # Final smart commit after validation
