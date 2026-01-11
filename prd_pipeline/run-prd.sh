@@ -843,9 +843,19 @@ EOF
 read -r -d '' CLEANUP_PROMPT <<EOF
 Clean up, organize files, and PREPARE FOR COMMIT. Check \`git diff\` for reference.
 
+## CRITICAL - NEVER DELETE THESE FILES:
+**IMPORTANT**: The following files are CRITICAL to the pipeline and must NEVER be deleted, moved, or modified:
+- **tasks.json** - Pipeline state tracking (NEVER DELETE)
+- **bug_fix_tasks.json** - Bug fix pipeline state (NEVER DELETE)
+- **PRD.md** - Product requirements document (NEVER DELETE)
+- **TEST_RESULTS.md** - Bug report file (NEVER DELETE)
+- Any file matching \`*tasks*.json\` pattern (NEVER DELETE)
+
+If you delete any of the above files, the entire pipeline will break. Do NOT delete them under any circumstances.
+
 ## DO NOT DELETE OR MODIFY:
 1. The 'plan' directory structure (except for organizing docs as specified below)
-2. The '$TASKS_FILE' file
+2. The '$TASKS_FILE' file (CRITICAL - this is the pipeline state)
 3. README.md and any readme-adjacent files (CONTRIBUTING.md, LICENSE, etc.)
 
 ## DOCUMENTATION ORGANIZATION:
