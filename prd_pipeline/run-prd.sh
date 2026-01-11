@@ -18,6 +18,7 @@ START_TASK=1
 START_SUBTASK=1
 PARALLEL_RESEARCH="${PARALLEL_RESEARCH:-false}"  # Optional parallel research for next item
 ONLY_VALIDATE="${ONLY_VALIDATE:-false}" # Run only the validation step
+ONLY_BUG_HUNT="${ONLY_BUG_HUNT:-false}" # Run only the bug finding step
 MANUAL_START=false
 
 while getopts "s:p:m:t:u:rv-:" opt; do
@@ -43,10 +44,12 @@ while getopts "s:p:m:t:u:rv-:" opt; do
         subtask=*)   START_SUBTASK="${OPTARG#*=}"; MANUAL_START=true ;;
         parallel-research) PARALLEL_RESEARCH=true ;;
         validate)    ONLY_VALIDATE=true ;;
-        *) print "Usage: $0 [--scope=phase|milestone|task|subtask] [--phase=N] [--milestone=N] [--task=N] [--subtask=N] [--parallel-research] [--validate]"; exit 1 ;;
+        bug-hunt)    ONLY_BUG_HUNT=true ;;
+        skip-bug-finding) SKIP_BUG_FINDING=true ;;
+        *) print "Usage: $0 [--scope=...] [--phase=N] [--milestone=N] [--task=N] [--subtask=N] [--parallel-research] [--validate] [--bug-hunt] [--skip-bug-finding]"; exit 1 ;;
       esac ;;
-    *) print "Usage: $0 [-s phase|milestone|task|subtask] [-p phase_number] [-m milestone_number] [-t task_number] [-u subtask_number] [-r] [-v]
-   Or: $0 [--scope=phase|milestone|task|subtask] [--phase=N] [--milestone=N] [--task=N] [--subtask=N] [--parallel-research] [--validate]"; exit 1 ;;
+    *) print "Usage: $0 [-s phase|milestone|task|subtask] [-p N] [-m N] [-t N] [-u N] [-r] [-v]
+   Or: $0 [--scope=...] [--phase=N] [--milestone=N] [--task=N] [--subtask=N] [--parallel-research] [--validate] [--bug-hunt] [--skip-bug-finding]"; exit 1 ;;
   esac
 done
 
@@ -62,6 +65,13 @@ BREAKDOWN_AGENT="${BREAKDOWN_AGENT:-$AGENT}"
 TASKS_FILE="${TASKS_FILE:-tasks.json}"
 PRD_FILE="${PRD_FILE:-PRD.md}"
 PLAN_DIR="${PLAN_DIR:-plan}"
+
+# Bug finding configuration
+BUG_FINDER_AGENT="${BUG_FINDER_AGENT:-glp}"
+BUG_RESULTS_FILE="${BUG_RESULTS_FILE:-TEST_RESULTS.md}"
+BUGFIX_TASKS_FILE="${BUGFIX_TASKS_FILE:-bug_fix_tasks.json}"
+BUGFIX_SCOPE="${BUGFIX_SCOPE:-subtask}"
+SKIP_BUG_FINDING="${SKIP_BUG_FINDING:-false}"
 
 # Auto-resume logic
 if [[ "$MANUAL_START" == "false" && -f "$TASKS_FILE" ]]; then
@@ -968,6 +978,114 @@ If validation passes, the user should have 100% confidence their application wor
 **CLEANUP NOTE:** These files (validate.sh and validation_report.md) are temporary and will be deleted after validation completes.
 EOF
 
+read -r -d '' BUG_FINDING_PROMPT <<EOF
+# Creative Bug Finding - End-to-End PRD Validation
+
+You are a creative QA engineer and bug hunter. Your mission is to rigorously test the implementation against the original PRD scope and find any issues that the standard validation might have missed.
+
+## Inputs
+
+**Original PRD:**
+\$(cat "$PRD_FILE")
+
+**Completed Tasks:**
+\$(cat "$TASKS_FILE")
+
+## Your Mission
+
+### Phase 1: PRD Scope Analysis
+1. Read and deeply understand the original PRD requirements
+2. Map each requirement to what should have been implemented
+3. Identify the expected user journeys and workflows
+4. Note any edge cases or corner cases implied by the requirements
+
+### Phase 2: Creative End-to-End Testing
+Think like a user, then think like an adversary. Test the implementation:
+
+1. **Happy Path Testing**: Does the primary use case work as specified?
+2. **Edge Case Testing**: What happens at boundaries? (empty inputs, max values, unicode, special chars)
+3. **Workflow Testing**: Can a user complete the full journey described in the PRD?
+4. **Integration Testing**: Do all the pieces work together correctly?
+5. **Error Handling**: What happens when things go wrong? Are errors graceful?
+6. **State Testing**: Does the system handle state transitions correctly?
+7. **Concurrency Testing** (if applicable): What if multiple operations happen at once?
+8. **Regression Testing**: Did fixing one thing break another?
+
+### Phase 3: Adversarial Testing
+Think creatively about what could go wrong:
+
+1. **Unexpected Inputs**: What inputs did the PRD not explicitly define?
+2. **Missing Features**: What did the PRD ask for that might not be implemented?
+3. **Incomplete Features**: What is partially implemented but not fully working?
+4. **Implicit Requirements**: What should obviously work but wasn't explicitly stated?
+5. **User Experience Issues**: Is the implementation usable and intuitive?
+
+### Phase 4: Documentation as Bug Report
+
+Write a structured bug report to \`./$BUG_RESULTS_FILE\` that can be used as a PRD for fixes:
+
+\`\`\`markdown
+# Bug Fix Requirements
+
+## Overview
+Brief summary of testing performed and overall quality assessment.
+
+## Critical Issues (Must Fix)
+Issues that prevent core functionality from working.
+
+### Issue 1: [Title]
+**Severity**: Critical
+**PRD Reference**: [Which section/requirement]
+**Expected Behavior**: What should happen
+**Actual Behavior**: What actually happens
+**Steps to Reproduce**: How to see the bug
+**Suggested Fix**: Brief guidance on resolution
+
+## Major Issues (Should Fix)
+Issues that significantly impact user experience or functionality.
+
+### Issue N: [Title]
+[Same format as above]
+
+## Minor Issues (Nice to Fix)
+Small improvements or polish items.
+
+### Issue N: [Title]
+[Same format as above]
+
+## Testing Summary
+- Total tests performed: X
+- Passing: X
+- Failing: X
+- Areas with good coverage: [list]
+- Areas needing more attention: [list]
+\`\`\`
+
+## Important Guidelines
+
+1. **Be Thorough**: Test everything you can think of
+2. **Be Creative**: Think outside the box - what would a real user do?
+3. **Be Specific**: Provide exact reproduction steps for every bug
+4. **Be Constructive**: Frame issues as improvements, not criticisms
+5. **Prioritize**: Focus on what matters most to users
+6. **Document Everything**: Even if you're not sure it's a bug, note it
+
+## Output
+
+Write your complete bug report to \`./$BUG_RESULTS_FILE\`.
+
+If no bugs are found, still write the file with:
+\`\`\`markdown
+# Bug Fix Requirements
+
+## Overview
+Comprehensive testing completed. No issues found.
+
+## Testing Summary
+[Describe what was tested]
+\`\`\`
+EOF
+
 
 # --- 4. Helpers ---
 
@@ -1418,7 +1536,21 @@ smart_commit() {
 
 # --- 5. Main Workflow ---
 
-if [[ "$ONLY_VALIDATE" == "false" ]]; then
+# Bug Hunt Only Mode - skip everything and go straight to bug finding
+if [[ "$ONLY_BUG_HUNT" == "true" ]]; then
+    print -P "%F{cyan}[CONFIG]%f Running in %F{magenta}BUG HUNT ONLY%f mode"
+    print -P "%F{cyan}[CONFIG]%f Bug finder agent: %F{yellow}$BUG_FINDER_AGENT%f"
+    if [[ ! -f "$PRD_FILE" ]]; then
+        print -P "%F{red}[ERROR]%f $PRD_FILE not found. Cannot bug hunt without PRD."
+        exit 1
+    fi
+    if [[ ! -f "$TASKS_FILE" ]]; then
+        print -P "%F{red}[ERROR]%f $TASKS_FILE not found. Cannot bug hunt without completed tasks."
+        exit 1
+    fi
+    # Skip to bug finding stage (handled at end of script)
+
+elif [[ "$ONLY_VALIDATE" == "false" ]]; then
 
 # A. Task Breakdown (Only run if tasks.json is missing)
 if [[ ! -f "$TASKS_FILE" ]]; then
@@ -1454,6 +1586,7 @@ print -P "%F{cyan}[CONFIG]%f Scope: %F{yellow}$SCOPE%f (Default: task)"
 [[ $BREAKDOWN_AGENT != "$AGENT" ]] && print -P "%F{cyan}[CONFIG]%f Breakdown agent: %F{yellow}$BREAKDOWN_AGENT%f"
 print -P "%F{cyan}[CONFIG]%f Execution agent: %F{yellow}$AGENT%f"
 [[ "$PARALLEL_RESEARCH" == "true" ]] && print -P "%F{cyan}[CONFIG]%f Parallel research: %F{green}enabled%f"
+[[ "$SKIP_BUG_FINDING" == "true" ]] && print -P "%F{cyan}[CONFIG]%f Bug finding: %F{yellow}skipped%f" || print -P "%F{cyan}[CONFIG]%f Bug finder agent: %F{yellow}$BUG_FINDER_AGENT%f"
 print -P "%F{cyan}[CONFIG]%f Starting positions: Phase=$START_PHASE"
 [[ $SCOPE != "phase" ]] && print -P "%F{cyan}[CONFIG]%f Starting positions: Milestone=$START_MS"
 [[ $SCOPE == "task" || $SCOPE == "subtask" ]] && print -P "%F{cyan}[CONFIG]%f Starting positions: Task=$START_TASK"
@@ -1568,7 +1701,8 @@ else
     fi
 fi
 
-# Final Validation Step
+# Final Validation Step (skip if bug-hunt only mode)
+if [[ "$ONLY_BUG_HUNT" != "true" ]]; then
 print -P "\n%F{magenta}[VALIDATION]%f Starting final validation..."
 run_with_retry $AGENT -p "$VALIDATION_PROMPT"
 print -P "\n%F{magenta}[VALIDATION]%f Validation complete. Check validation_report.md."
@@ -1639,5 +1773,72 @@ fi
 # Final smart commit after validation
 print -P "%F{blue}[GIT]%f Committing final changes with smart commit..."
 smart_commit
+
+fi  # End of validation block (skip if bug-hunt only mode)
+
+# --- Creative Bug Finding Stage ---
+if [[ "$SKIP_BUG_FINDING" == "false" ]]; then
+    print -P "\n%F{magenta}[BUG HUNT]%f Starting creative bug finding with $BUG_FINDER_AGENT..."
+
+    run_with_retry $BUG_FINDER_AGENT -p "$BUG_FINDING_PROMPT"
+
+    if [[ -f "$BUG_RESULTS_FILE" ]]; then
+        print -P "%F{cyan}[BUG HUNT]%f Bug report generated: $BUG_RESULTS_FILE"
+
+        # Check if bugs were found
+        BUG_REPORT_CONTENT=$(cat "$BUG_RESULTS_FILE")
+
+        BUG_CHECK_PROMPT="Here is the bug report.
+
+        CONTENT:
+        $BUG_REPORT_CONTENT
+
+        INSTRUCTION:
+        - If the report lists ANY Critical Issues or Major Issues: output BUGS_FOUND
+        - If the report shows no issues or only Minor Issues: output NO_BUGS
+        - Output ONLY one of these two phrases."
+
+        BUG_RESULT=$(claude --print --allowed-tools "" --system-prompt "You are a binary classifier. Output only BUGS_FOUND or NO_BUGS." "$BUG_CHECK_PROMPT")
+        CLEAN_BUG_RESULT=$(echo "$BUG_RESULT" | tr -d '[:space:]')
+
+        # Validate response and retry if necessary
+        if [[ "$CLEAN_BUG_RESULT" != "BUGS_FOUND" && "$CLEAN_BUG_RESULT" != "NO_BUGS" ]]; then
+            print -P "%F{yellow}[RETRY]%f Invalid bug checker output: '$BUG_RESULT'. Retrying..."
+            BUG_RESULT=$(claude --print --continue --allowed-tools "" "ERROR: You replied with '$BUG_RESULT'. You MUST output exactly: BUGS_FOUND or NO_BUGS.")
+            CLEAN_BUG_RESULT=$(echo "$BUG_RESULT" | tr -d '[:space:]')
+        fi
+
+        print -P "%F{cyan}[BUG HUNT]%f Bug check result: $CLEAN_BUG_RESULT"
+
+        if [[ "$CLEAN_BUG_RESULT" == "BUGS_FOUND" ]]; then
+            print -P "\n%F{yellow}[BUG FIX]%f Bugs found! Starting bug fix pipeline..."
+            print -P "%F{yellow}[BUG FIX]%f PRD: $BUG_RESULTS_FILE"
+            print -P "%F{yellow}[BUG FIX]%f Tasks: $BUGFIX_TASKS_FILE"
+            print -P "%F{yellow}[BUG FIX]%f Scope: $BUGFIX_SCOPE"
+
+            # Commit the bug report before starting fix cycle
+            git add "$BUG_RESULTS_FILE"
+            git commit -m "Add bug report from creative testing" 2>/dev/null || true
+
+            # Re-run the pipeline with bug fixes
+            # Use SKIP_BUG_FINDING=true to prevent infinite loops
+            SKIP_BUG_FINDING=true \
+            PRD_FILE="$BUG_RESULTS_FILE" \
+            TASKS_FILE="$BUGFIX_TASKS_FILE" \
+            SCOPE="$BUGFIX_SCOPE" \
+            AGENT="$AGENT" \
+            PLAN_DIR="${PLAN_DIR}_bugfix" \
+            exec "$0"
+        else
+            print -P "%F{green}[BUG HUNT]%f No critical or major bugs found. Quality looks good!"
+            # Clean up bug results file since no issues
+            rm -f "$BUG_RESULTS_FILE" 2>/dev/null
+        fi
+    else
+        print -P "%F{yellow}[BUG HUNT]%f Bug report file not generated. Skipping bug fix cycle."
+    fi
+else
+    print -P "%F{cyan}[CONFIG]%f Bug finding skipped (SKIP_BUG_FINDING=true)"
+fi
 
 print -P "%F{green}[SUCCESS]%f Workflow completed."

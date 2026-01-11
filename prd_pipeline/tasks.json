@@ -1,0 +1,1480 @@
+{
+  "backlog": [
+    {
+      "type": "Phase",
+      "id": "P1",
+      "title": "Phase 1: Foundation (Session & Phantom Git)",
+      "status": "Planned",
+      "description": "Build core session management and phantom git infrastructure. This phase establishes the fundamental building blocks upon which all other Hawk Agent features depend.",
+      "milestones": [
+        {
+          "type": "Milestone",
+          "id": "P1.M1",
+          "title": "Session Management System",
+          "status": "Planned",
+          "description": "Implement session lifecycle management including UID generation, directory structure creation, and session state persistence.",
+          "tasks": [
+            {
+              "type": "Task",
+              "id": "P1.M1.T1",
+              "title": "Design Session Data Structures",
+              "status": "Planned",
+              "description": "Define TypeScript interfaces for Session, SessionState, and related types. Establish the schema for session metadata storage.",
+              "subtasks": [
+                {
+                  "type": "Subtask",
+                  "id": "P1.M1.T1.S1",
+                  "title": "Create Session interface with UID, project path, timestamps",
+                  "status": "Planned",
+                  "story_points": 1,
+                  "dependencies": [],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: From system_context.md section 3.1, sessions require: uid (UUID), projectPath (absolute path), sessionDir (~/.local/state/hawk_agent/<project_path>/<uid>/), startTime, status, ephemeralState, phantomGitDir.\n2. INPUT: None (base data structure definition).\n3. LOGIC: Implement Session interface per system_context.md. Use uuid package for UID type. Add JSDoc comments explaining each field's purpose. Export from src/core/types.ts.\n4. OUTPUT: Session interface, SessionStatus enum ('active' | 'paused' | 'completed' | 'failed'), SessionMetadata type for session.json serialization."
+                },
+                {
+                  "type": "Subtask",
+                  "id": "P1.M1.T1.S2",
+                  "title": "Create SessionState interface for ephemeral state",
+                  "status": "Planned",
+                  "story_points": 1,
+                  "dependencies": ["P1.M1.T1.S1"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: From system_context.md, ephemeralState stores agent props, context, callbacks, and workflow-specific data.\n2. INPUT: Session interface from S1.\n3. LOGIC: Define SessionState interface with fields: currentTask, workflowStack, agentProps, contextChannels, callbacks. Use Partial<> to allow optional fields. Add Zod schema for validation.\n4. OUTPUT: SessionState interface, SessionStateValidator (Zod schema)."
+                },
+                {
+                  "type": "Subtask",
+                  "id": "P1.M1.T1.S3",
+                  "title": "Create session directory structure types and utilities",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P1.M1.T1.S1", "P1.M1.T1.S2"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: From system_context.md, session directory structure is: ~/.local/state/hawk_agent/<absolute_project_path>/<session_uid>/.git, session.json, ephemeral-state.json, research/, logs/, temp/.\n2. INPUT: Session interface from S1.\n3. LOGIC: Create SessionPaths type containing resolved paths for all session subdirectories. Implement getSessionPaths(session: Session): SessionPaths utility. Use Node.js path module for safe path joining. Validate paths exist.\n4. OUTPUT: SessionPaths type, getSessionPaths() utility, ensureSessionDirectories() function that creates missing directories."
+                }
+              ]
+            },
+            {
+              "type": "Task",
+              "id": "P1.M1.T2",
+              "title": "Implement Session Manager",
+              "status": "Planned",
+              "description": "Build the SessionManager class responsible for session creation, loading, saving, and lifecycle management.",
+              "subtasks": [
+                {
+                  "type": "Subtask",
+                  "id": "P1.M1.T2.S1",
+                  "title": "Implement session creation with UID generation",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P1.M1.T1.S3"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: From system_context.md, sessions must have unique UIDs. Use uuid v4. Session directory path encodes absolute project path.\n2. INPUT: projectPath (string) from user.\n3. LOGIC: Implement SessionManager.create(projectPath: string): Promise<Session>. Generate UUID v4. Create session directory structure. Initialize session.json and ephemeral-state.json. Set status to 'active'. Mock fs operations for testing.\n4. OUTPUT: SessionManager class with create() method. Returns Session object. Throws SessionCreationError if directory creation fails."
+                },
+                {
+                  "type": "Subtask",
+                  "id": "P1.M1.T2.S2",
+                  "title": "Implement session loading from disk",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P1.M1.T2.S1"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: Sessions are persisted in session.json. Must validate loaded data against schema.\n2. INPUT: sessionUid (string) or projectPath (string).\n3. LOGIC: Implement SessionManager.load(identifier: string): Promise<Session>. Locate session directory. Read and parse session.json. Validate with Zod schema. Throw SessionNotFoundError if not found. Mock fs.readFileSync.\n4. OUTPUT: SessionManager.load() method. Returns Session object. Validates with SessionStateValidator."
+                },
+                {
+                  "type": "Subtask",
+                  "id": "P1.M1.T2.S3",
+                  "title": "Implement session state persistence (save/update)",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P1.M1.T2.S2"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: Session state must be atomically saved to prevent corruption. Use atomic file writes (write to temp, rename).\n2. INPUT: Session object from S2.\n3. LOGIC: Implement SessionManager.save(session: Session): Promise<void>. Serialize session to JSON. Write to temp file, then atomic rename. Update ephemeral-state.json if state changed. Mock fs operations.\n4. OUTPUT: SessionManager.save() method. Atomic file writes. Throws SessionSaveError on failure."
+                },
+                {
+                  "type": "Subtask",
+                  "id": "P1.M1.T2.S4",
+                  "title": "Implement session status transitions and cleanup",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P1.M1.T2.S3"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: From PRD, sessions can be 'active' | 'paused' | 'completed' | 'failed'. Cleanup temp/ directory on completion.\n2. INPUT: Session object from S3.\n3. LOGIC: Implement SessionManager.setStatus(session: Session, status: SessionStatus): Promise<Session>. Validate status transitions (no completed → active). If status is 'completed' or 'failed', cleanup temp/ directory. Update session.json. Mock cleanup operations.\n4. OUTPUT: setStatus() method with transition validation. cleanupTempDirectory() utility."
+                }
+              ]
+            },
+            {
+              "type": "Task",
+              "id": "P1.M1.T3",
+              "title": "Add Session CLI Commands",
+              "status": "Planned",
+              "description": "Create CLI interface for session management including list, show, and cleanup commands.",
+              "subtasks": [
+                {
+                  "type": "Subtask",
+                  "id": "P1.M1.T3.S1",
+                  "title": "Implement 'hawk session list' command",
+                  "status": "Planned",
+                  "story_points": 1,
+                  "dependencies": ["P1.M1.T2.S4"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: Use commander.js for CLI (existing dependency). Display sessions in table format.\n2. INPUT: SessionManager from T2.\n3. LOGIC: Create bin/commands/session-list.ts. Scan ~/.local/state/hawk_agent/ for all sessions. Load session metadata. Display in table: UID, Project Path, Status, Start Time. Use cli-table3 or chalk for formatting.\n4. OUTPUT: CLI command 'hawk session list'. Outputs formatted table."
+                },
+                {
+                  "type": "Subtask",
+                  "id": "P1.M1.T3.S2",
+                  "title": "Implement 'hawk session show <uid>' command",
+                  "status": "Planned",
+                  "story_points": 1,
+                  "dependencies": ["P1.M1.T3.S1"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: Show detailed session info including current task, workflow stack, status.\n2. INPUT: SessionManager from T2.\n3. LOGIC: Create bin/commands/session-show.ts. Accept session UID. Load full session. Display: UID, status, project path, start time, current task, workflow stack, ephemeral state summary. Use chalk for colors.\n4. OUTPUT: CLI command 'hawk session show <uid>'. Outputs detailed session info."
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "Milestone",
+          "id": "P1.M2",
+          "title": "Phantom Git System",
+          "status": "Planned",
+          "description": "Implement phantom git infrastructure using git worktree for isolated workspace management and rollback capability.",
+          "tasks": [
+            {
+              "type": "Task",
+              "id": "P1.M2.T1",
+              "title": "Design Phantom Git Architecture",
+              "status": "Planned",
+              "description": "Define the phantom git data structures and integration patterns with the session system.",
+              "subtasks": [
+                {
+                  "type": "Subtask",
+                  "id": "P1.M2.T1.S1",
+                  "title": "Define PhantomGit interface and commit metadata types",
+                  "status": "Planned",
+                  "story_points": 1,
+                  "dependencies": [],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: From external_deps.md section 4.1-4.2, phantom git uses git worktree for isolation. Every file write triggers phantom commit. Commit metadata includes operation type, rollback point.\n2. INPUT: Session interface from P1.M1.\n3. LOGIC: Define PhantomGit interface with methods: commit(message, files?), rollback(commitSha), diff(commitSha?), stageForRealGit(). Define PhantomCommit type with: sha, message, timestamp, operation, parentSha, filesChanged. Export from src/git/types.ts.\n4. OUTPUT: PhantomGit interface, PhantomCommit type, PhantomOperation enum ('pre-task' | 'post-test' | 'post-implementation' | 'rollback')."
+                },
+                {
+                  "type": "Subtask",
+                  "id": "P1.M2.T1.S2",
+                  "title": "Design git worktree lifecycle management",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P1.M2.T1.S1"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: From external_deps.md, use 'git worktree add' to create isolated workspace. Worktree path: ~/.local/state/hawk_agent/.../<session_uid>/workspace. Clean up worktree on session completion.\n2. INPUT: Session interface from P1.M1.\n3. LOGIC: Define WorktreeManager interface with methods: create(session, branchName), remove(session), listWorktrees(). Design worktree naming convention: hawk-session-<uid>. Define error types for worktree conflicts. Mock git operations.\n4. OUTPUT: WorktreeManager interface, WorktreeConfig type, WorktreeError class."
+                }
+              ]
+            },
+            {
+              "type": "Task",
+              "id": "P1.M2.T2",
+              "title": "Implement Phantom Git Operations",
+              "status": "Planned",
+              "description": "Build core phantom git functionality including commits, rollback, and diff operations.",
+              "subtasks": [
+                {
+                  "type": "Subtask",
+                  "id": "P1.M2.T2.S1",
+                  "title": "Implement git worktree creation and initialization",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P1.M2.T1.S2"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: Use 'git worktree add <path> <branch>'. Initialize .git in session directory. Use execa for process execution.\n2. INPUT: Session object from P1.M1.T2.\n3. LOGIC: Implement WorktreeManager.create(session: Session, branchName: string): Promise<string>. Execute 'git worktree add' using execa. Verify worktree created. Return worktree path. Handle errors: worktree already exists, invalid branch. Mock execa for testing.\n4. OUTPUT: WorktreeManager.create() method. Returns worktree path. Throws WorktreeError on failure."
+                },
+                {
+                  "type": "Subtask",
+                  "id": "P1.M2.T2.S2",
+                  "title": "Implement phantom commit with Claude hook integration",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P1.M2.T2.S1"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: From PRD section 8, every file write triggers phantom git commit. Commits integrate with Claude's pre-commit hooks. Use 'git commit' in worktree.\n2. INPUT: Worktree path from S1.\n3. LOGIC: Implement PhantomGit.commit(message: string, files?: string[]): Promise<string>. Stage files (or all if none specified). Run 'git commit' which triggers Claude hooks. Capture commit SHA. Store commit metadata in session. Mock git operations.\n4. OUTPUT: PhantomGit.commit() method. Returns commit SHA. Stores PhantomCommit in session state."
+                },
+                {
+                  "type": "Subtask",
+                  "id": "P1.M2.T2.S3",
+                  "title": "Implement phantom rollback functionality",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P1.M2.T2.S2"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: From external_deps.md, rollback uses 'git reset --hard <commit>'. This is the compensating transaction in saga pattern.\n2. INPUT: Commit SHA from S2.\n3. LOGIC: Implement PhantomGit.rollback(commitSha: string): Promise<void>. Execute 'git reset --hard' in worktree. Verify working directory clean. Update session state to indicate rollback. Handle errors: invalid SHA, uncommitted changes. Mock git operations.\n4. OUTPUT: PhantomGit.rollback() method. Throws RollbackError on failure."
+                },
+                {
+                  "type": "Subtask",
+                  "id": "P1.M2.T2.S4",
+                  "title": "Implement phantom diff and change tracking",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P1.M2.T2.S3"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: Track changes between phantom commits for validation. Use 'git diff'.\n2. INPUT: Commit SHAs from S2, S3.\n3. LOGIC: Implement PhantomGit.diff(fromSha?: string, toSha?: string): Promise<string>. Default to HEAD~1..HEAD if no SHAs provided. Execute 'git diff'. Parse diff for file list. Return diff string and changed files array. Mock git operations.\n4. OUTPUT: PhantomGit.diff() method. Returns DiffResult { diff: string, files: string[] }."
+                }
+              ]
+            },
+            {
+              "type": "Task",
+              "id": "P1.M2.T3",
+              "title": "Integrate Phantom Git with Session System",
+              "status": "Planned",
+              "description": "Connect phantom git operations with the session lifecycle and implement automatic commits on file operations.",
+              "subtasks": [
+                {
+                  "type": "Subtask",
+                  "id": "P1.M2.T3.S1",
+                  "title": "Add phantom git to session initialization",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P1.M2.T2.S4"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: From PRD section 4 (Init Subflow), phantom git workspace is created during session init. Stored in session.phantomGitDir.\n2. INPUT: SessionManager from P1.M1.T2, WorktreeManager from P1.M2.T2.\n3. LOGIC: Modify SessionManager.create() to initialize worktree. Call WorktreeManager.create() with branch name 'hawk-session-<uid>'. Store worktree path in session.phantomGitDir. Create initial phantom commit 'phantom: session initialized'. Mock worktree operations.\n4. OUTPUT: Updated SessionManager.create() that creates phantom git workspace."
+                },
+                {
+                  "type": "Subtask",
+                  "id": "P1.M2.T3.S2",
+                  "title": "Implement auto-commit on file write operations",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P1.M2.T3.S1"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: From PRD section 8, 'Every file write triggers phantom git commit'. Intercept file operations.\n2. INPUT: PhantomGit from P1.M2.T2.\n3. LOGIC: Create FileWriteTracker class that wraps fs operations. Override writeFile(), writeFileSync(). After successful write, call PhantomGit.commit() with message 'phantom: file write <filename>'. Track pending commits for batching. Mock fs operations.\n4. OUTPUT: FileWriteTracker class. Auto-commits on file writes. Configurable batch size."
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "Milestone",
+          "id": "P1.M3",
+          "title": "Basic Logging System",
+          "status": "Planned",
+          "description": "Implement centralized logging infrastructure for session audit trails and agent debugging.",
+          "tasks": [
+            {
+              "type": "Task",
+              "id": "P1.M3.T1",
+              "title": "Design Logging Architecture",
+              "status": "Planned",
+              "description": "Define log levels, log formats, and integration patterns with the session system.",
+              "subtasks": [
+                {
+                  "type": "Subtask",
+                  "id": "P1.M3.T1.S1",
+                  "title": "Define log levels and HawkAgent-specific level",
+                  "status": "Planned",
+                  "story_points": 1,
+                  "dependencies": [],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: From PRD section 7.2, add 'HawkAgent' log level. Levels: error, warn, info, debug, HawkAgent.\n2. INPUT: None.\n3. LOGIC: Define LogLevel enum extending Winston levels: error=0, warn=1, info=2, hawkagent=3, debug=4. Define LogEntry type with: timestamp, level, sessionUid, agentId, message, metadata. Export from src/logging/types.ts.\n4. OUTPUT: LogLevel enum, LogEntry interface. HawkAgent level between info and debug."
+                },
+                {
+                  "type": "Subtask",
+                  "id": "P1.M3.T1.S2",
+                  "title": "Design session-scoped log file management",
+                  "status": "Planned",
+                  "story_points": 1,
+                  "dependencies": ["P1.M3.T1.S1"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: From PRD section 12, logs persist in session directory under logs/. One file per agent or single session log?\n2. INPUT: Session interface from P1.M1.\n3. LOGIC: Define LogTransportConfig for Winston file transport. Log file path: <sessionDir>/logs/hawk-<date>.log. Implement rotation: daily or size-based (10MB). Define LogArchive config for compression. Mock fs operations.\n4. OUTPUT: LogTransportConfig type, SessionLogger interface with getSessionLogPath(session)."
+                }
+              ]
+            },
+            {
+              "type": "Task",
+              "id": "P1.M3.T2",
+              "title": "Implement Centralized Logger",
+              "status": "Planned",
+              "description": "Build Winston-based logger with session context and HawkAgent log level.",
+              "subtasks": [
+                {
+                  "type": "Subtask",
+                  "id": "P1.M3.T2.S1",
+                  "title": "Create Winston logger with custom HawkAgent level",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P1.M3.T1.S2"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: Use winston@3.17.0. Add custom log level 'hawkagent'. Use custom format for JSON output.\n2. INPUT: LogLevel from S1.\n3. LOGIC: Create createLogger(session?: Session) function. Configure Winston with: custom levels, JSON format, file transport to session logs/, console transport with colors. Add session metadata to all log entries. Mock Winston for testing.\n4. OUTPUT: createLogger() function. Returns Winston logger with HawkAgent level. Adds session context to logs."
+                },
+                {
+                  "type": "Subtask",
+                  "id": "P1.M3.T2.S2",
+                  "title": "Implement agent-scoped logging with context propagation",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P1.M3.T2.S1"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: From PRD section 10, context propagates to child agents. Logs should include agent hierarchy.\n2. INPUT: Logger from S1.\n3. LOGIC: Create AgentLogger class. Constructor takes: session, agentId, parentAgentId?. Methods: log(message, metadata), hawkagent(message, metadata). Include agent hierarchy in log metadata. Use child logger for context propagation. Mock logger.\n4. OUTPUT: AgentLogger class. Methods: debug(), info(), hawkagent(), warn(), error(). Includes agent context in all logs."
+                }
+              ]
+            },
+            {
+              "type": "Task",
+              "id": "P1.M3.T3",
+              "title": "Implement Audit Trail",
+              "status": "Planned",
+              "description": "Build audit trail system that tracks all agent actions for state recovery and debugging.",
+              "subtasks": [
+                {
+                  "type": "Subtask",
+                  "id": "P1.M3.T3.S1",
+                  "title": "Design audit event schema and storage",
+                  "status": "Planned",
+                  "story_points": 1,
+                  "dependencies": ["P1.M3.T2.S2"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: From PRD section 12, audit trail supports debugging, state recovery, audit. Store in session directory.\n2. INPUT: LogEntry from P1.M3.T1.\n3. LOGIC: Define AuditEvent type extending LogEntry with: eventType, operation, result, duration. Define AuditTrail interface with: append(event), query(filter), replay(session). Store in <sessionDir>/audit.jsonl (JSON Lines). Mock fs operations.\n4. OUTPUT: AuditEvent type, AuditTrail interface. Events stored in JSONL format."
+                },
+                {
+                  "type": "Subtask",
+                  "id": "P1.M3.T3.S2",
+                  "title": "Implement audit event recording and querying",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P1.M3.T3.S1"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: Audit trail must be append-only for immutability. Query by agent, time range, event type.\n2. INPUT: AuditEvent from S1.\n3. LOGIC: Implement AuditTrail class. append(event): Append to audit.jsonl with timestamp. query(filter): Read file, filter events, return array. replay(session): Replay all events in order for state recovery. Mock fs operations.\n4. OUTPUT: AuditTrail class. Methods: append(), query(), replay(). Stores in audit.jsonl."
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "Phase",
+      "id": "P2",
+      "title": "Phase 2: Three Pillars (Testing, Logging, Linting)",
+      "status": "Planned",
+      "description": "Implement the Three Pillars detection system that identifies testing frameworks, logging systems, and linting configurations. Scaffolding capabilities for missing pillars.",
+      "milestones": [
+        {
+          "type": "Milestone",
+          "id": "P2.M1",
+          "title": "Testing Pillar Detection",
+          "status": "Planned",
+          "description": "Detect and validate test frameworks in target projects. Support multiple languages and frameworks.",
+          "tasks": [
+            {
+              "type": "Task",
+              "id": "P2.M1.T1",
+              "title": "Design Test Framework Detection System",
+              "status": "Planned",
+              "description": "Define the framework detection interface and create extensible detection patterns for common test frameworks.",
+              "subtasks": [
+                {
+                  "type": "Subtask",
+                  "id": "P2.M1.T1.S1",
+                  "title": "Define TestFramework detection interface",
+                  "status": "Planned",
+                  "story_points": 1,
+                  "dependencies": [],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: From external_deps.md section 3.2, no universal standard exists. Build detection matrix per language/framework.\n2. INPUT: None.\n3. LOGIC: Define TestFramework type with: name, language, detection(projectPath): boolean, testCommand, watchCommand?. Define TestPillar interface with: detected (bool), framework, testCommand, confidence. Export from src/pillars/testing/types.ts.\n4. OUTPUT: TestFramework type, TestPillar interface. Extensible for adding frameworks."
+                },
+                {
+                  "type": "Subtask",
+                  "id": "P2.M1.T1.S2",
+                  "title": "Create detection database for common frameworks",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P2.M1.T1.S1"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: Support Jest, Vitest, Mocha (JS/TS); pytest, unittest (Python); go test (Go); JUnit, TestNG (Java).\n2. INPUT: TestFramework type from S1.\n3. LOGIC: Create TEST_FRAMEWORKS database: TestFramework[]. For each framework, define detection logic (config files, package.json scripts). Use fs.existsSync for detection. Prioritize by confidence (package.json > config file > dependency).\n4. OUTPUT: TEST_FRAMEWORKS constant array. Detection functions for 10+ frameworks."
+                }
+              ]
+            },
+            {
+              "type": "Task",
+              "id": "P2.M1.T2",
+              "title": "Implement Test Framework Detection",
+              "status": "Planned",
+              "description": "Build the detection engine that scans projects for test frameworks and validates test commands.",
+              "subtasks": [
+                {
+                  "type": "Subtask",
+                  "id": "P2.M1.T2.S1",
+                  "title": "Implement project scanning for test frameworks",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P2.M1.T1.S2"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: Scan project root and common subdirectories (tests/, test/, __tests__).\n2. INPUT: TEST_FRAMEWORKS from S2.\n3. LOGIC: Implement TestPillarDetector.detect(projectPath: string): Promise<TestPillar>. Iterate TEST_FRAMEWORKS, run detection functions. Return first match with highest confidence. If none found, return {detected: false}. Mock fs operations.\n4. OUTPUT: TestPillarDetector.detect() method. Returns TestPillar with detected framework or null."
+                },
+                {
+                  "type": "Subtask",
+                  "id": "P2.M1.T2.S2",
+                  "title": "Validate detected test commands",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P2.M1.T2.S1"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: From PRD section 7.1, 'Testing agent collaborates with multiple agents to validate command generation'. Dry-run test commands.\n2. INPUT: TestPillar from S1.\n3. LOGIC: Implement TestPillarDetector.validateCommand(pillar: TestPillar): Promise<boolean>. Dry-run test command with --help or --dry-run flag. Capture exit code. If command fails, mark as invalid. Use execa for command execution. Mock execa.\n4. OUTPUT: validateCommand() method. Returns true if command executable, false otherwise."
+                },
+                {
+                  "type": "Subtask",
+                  "id": "P2.M1.T2.S3",
+                  "title": "Create test scaffolding templates",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P2.M1.T2.S2"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: From PRD section 4 (Init Subflow), if testing pillar missing, prompt user to scaffold.\n2. INPUT: TestPillar from S1.\n3. LOGIC: Create test framework templates in templates/testing/. For Jest: jest.config.js, example.test.js, package.json scripts. For Vitest: vitest.config.ts, example.test.ts. Implement TestPillarDetector.scaffold(projectPath, framework): Promise<void>. Copy template files, run 'npm install' for dependencies. Mock fs operations.\n4. OUTPUT: Scaffolding templates for Jest, Vitest, pytest. scaffold() method."
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "Milestone",
+          "id": "P2.M2",
+          "title": "Logging Pillar Detection",
+          "status": "Planned",
+          "description": "Detect and analyze existing logging systems in projects. Optionally add HawkAgent log level.",
+          "tasks": [
+            {
+              "type": "Task",
+              "id": "P2.M2.T1",
+              "title": "Design Logging System Detection",
+              "status": "Planned",
+              "description": "Define patterns for detecting common logging libraries and configurations.",
+              "subtasks": [
+                {
+                  "type": "Subtask",
+                  "id": "P2.M2.T1.S1",
+                  "title": "Define LoggingFramework detection interface",
+                  "status": "Planned",
+                  "story_points": 1,
+                  "dependencies": [],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: From PRD section 7.2, analyze project logging system. Detect Winston, Pino, Bunyan (Node); logging module (Python); log4j (Java); zap (Go).\n2. INPUT: None.\n3. LOGIC: Define LoggingFramework type with: name, language, detection(projectPath): boolean, configPath, hasHawkAgentLevel. Define LoggingPillar interface. Export from src/pillars/logging/types.ts.\n4. OUTPUT: LoggingFramework type, LoggingPillar interface."
+                },
+                {
+                  "type": "Subtask",
+                  "id": "P2.M2.T1.S2",
+                  "title": "Create detection patterns for common logging libraries",
+                  "status": "Planned",
+                  "story_points": 1,
+                  "dependencies": ["P2.M2.T1.S1"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: Check package.json, requirements.txt, go.mod for logging dependencies. Check for config files.\n2. INPUT: LoggingFramework type from S1.\n3. LOGIC: Create LOGGING_FRAMEWORKS database. For each, define detection: check dependencies in package.json/pyproject.toml, check config file existence. Detect if custom log levels configured.\n4. OUTPUT: LOGGING_FRAMEWORKS constant. Detection for Winston, Pino, Python logging, log4j, zap."
+                }
+              ]
+            },
+            {
+              "type": "Task",
+              "id": "P2.M2.T2",
+              "title": "Implement Logging Pillar Detection",
+              "status": "Planned",
+              "description": "Build detection system for logging frameworks and add HawkAgent level when appropriate.",
+              "subtasks": [
+                {
+                  "type": "Subtask",
+                  "id": "P2.M2.T2.S1",
+                  "title": "Implement logging system scanning",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P2.M2.T1.S2"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: Scan project dependencies and config files. Return detected framework or null.\n2. INPUT: LOGGING_FRAMEWORKS from S2.\n3. LOGIC: Implement LoggingPillarDetector.detect(projectPath): Promise<LoggingPillar>. Check for logging dependencies. Detect config files. Analyze if project uses custom logging. If no framework found, return {detected: false}. Mock fs operations.\n4. OUTPUT: LoggingPillarDetector.detect() method. Returns LoggingPillar."
+                },
+                {
+                  "type": "Subtask",
+                  "id": "P2.M2.T2.S2",
+                  "title": "Implement HawkAgent log level injection",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P2.M2.T2.S1"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: From PRD section 7.2, 'Optionally add HawkAgent logging level'. Modify logging config if user approves.\n2. INPUT: LoggingPillar from S1.\n3. LOGIC: Implement LoggingPillarDetector.addHawkAgentLevel(projectPath, pillar): Promise<void>. For Winston: add custom level to config. For Python logging: add level to constants. Backup original config. Mock fs operations.\n4. OUTPUT: addHawkAgentLevel() method. Modifies logging config files."
+                },
+                {
+                  "type": "Subtask",
+                  "id": "P2.M2.T2.S3",
+                  "title": "Create logging scaffolding templates",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P2.M2.T2.S2"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: If no logging framework, offer to scaffold. Use Winston for Node projects.\n2. INPUT: LoggingPillar from S1.\n3. LOGIC: Create Winston template in templates/logging/winston/. logger.ts with HawkAgent level. Implement LoggingPillarDetector.scaffold(projectPath, language): Promise<void>. Install winston dependency. Copy template. Mock fs/npm operations.\n4. OUTPUT: Winston scaffolding template. scaffold() method."
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "Milestone",
+          "id": "P2.M3",
+          "title": "Linting Pillar Detection",
+          "status": "Planned",
+          "description": "Detect linting configurations and provide scaffolding for missing linting setups.",
+          "tasks": [
+            {
+              "type": "Task",
+              "id": "P2.M3.T1",
+              "title": "Design Linting System Detection",
+              "status": "Planned",
+              "description": "Define patterns for detecting ESLint, TSLint, Pylint, and other linters.",
+              "subtasks": [
+                {
+                  "type": "Subtask",
+                  "id": "P2.M3.T1.S1",
+                  "title": "Define LintingFramework detection interface",
+                  "status": "Planned",
+                  "story_points": 1,
+                  "dependencies": [],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: From PRD section 7.3, detect ESLint, TSLint (deprecated but present), Pylint, Flake8, GoLint.\n2. INPUT: None.\n3. LOGIC: Define LintingFramework type with: name, language, detection(projectPath): boolean, configPath, lintCommand, fixCommand. Define LintingPillar interface. Export from src/pillars/linting/types.ts.\n4. OUTPUT: LintingFramework type, LintingPillar interface."
+                },
+                {
+                  "type": "Subtask",
+                  "id": "P2.M3.T1.S2",
+                  "title": "Create detection patterns for common linters",
+                  "status": "Planned",
+                  "story_points": 1,
+                  "dependencies": ["P2.M3.T1.S1"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: Check for .eslintrc*, .pylintrc, .golangci.yml, package.json scripts.\n2. INPUT: LintingFramework type from S1.\n3. LOGIC: Create LINTING_FRAMEWORKS database. Detection: check config files, check package.json scripts, check dependencies.\n4. OUTPUT: LINTING_FRAMEWORKS constant. Detection for ESLint, Pylint, Flake8, golangci-lint."
+                }
+              ]
+            },
+            {
+              "type": "Task",
+              "id": "P2.M3.T2",
+              "title": "Implement Linting Pillar Detection",
+              "status": "Planned",
+              "description": "Build detection system for linters and provide scaffolding when missing.",
+              "subtasks": [
+                {
+                  "type": "Subtask",
+                  "id": "P2.M3.T2.S1",
+                  "title": "Implement linting system scanning",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P2.M3.T1.S2"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: Scan for config files and lint scripts. Return detected linter or null.\n2. INPUT: LINTING_FRAMEWORKS from S2.\n3. LOGIC: Implement LintingPillarDetector.detect(projectPath): Promise<LintingPillar>. Check for linter configs. Check package.json scripts. Detect if linting configured. Mock fs operations.\n4. OUTPUT: LintingPillarDetector.detect() method. Returns LintingPillar."
+                },
+                {
+                  "type": "Subtask",
+                  "id": "P2.M3.T2.S2",
+                  "title": "Implement dynamic linting rule updates",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P2.M3.T2.S1"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: From PRD section 7.3, 'update_linting_rules <prompt> custom tool allows human or automated review to inject rules'.\n2. INPUT: LintingPillar from S1.\n3. LOGIC: Implement updateLintingRules(projectPath, prompt): Promise<void>. Parse prompt for rule descriptions. Add rules to ESLint/.eslintrc.js or Pylint .pylintrc. Validate rules with linter dry-run. Mock fs operations.\n4. OUTPUT: updateLintingRules() function. Adds rules to linter config."
+                },
+                {
+                  "type": "Subtask",
+                  "id": "P2.M3.T2.S3",
+                  "title": "Create linting scaffolding templates",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P2.M3.T2.S2"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: If no linter, offer to scaffold. ESLint for JS/TS, Pylint for Python.\n2. INPUT: LintingPillar from S1.\n3. LOGIC: Create ESLint template in templates/linting/eslint/. .eslintrc.js with recommended rules. Implement LintingPillarDetector.scaffold(projectPath, language): Promise<void>. Install linter dependency. Copy template. Mock fs/npm operations.\n4. OUTPUT: ESLint and Pylint templates. scaffold() method."
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "Milestone",
+          "id": "P2.M4",
+          "title": "Unified Pillar Detection CLI",
+          "status": "Planned",
+          "description": "Create the 'hawk init' command that runs all three pillar detectors and handles scaffolding.",
+          "tasks": [
+            {
+              "type": "Task",
+              "id": "P2.M4.T1",
+              "title": "Implement Init Workflow",
+              "status": "Planned",
+              "description": "Create the init workflow that orchestrates pillar detection and user prompts.",
+              "subtasks": [
+                {
+                  "type": "Subtask",
+                  "id": "P2.M4.T1.S1",
+                  "title": "Implement pillar detection orchestration",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P2.M3.T2.S3"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: From PRD section 4 (Init Subflow), scan project for all three pillars. If partial, prompt user.\n2. INPUT: TestPillarDetector, LoggingPillarDetector, LintingPillarDetector from P2.M1-M3.\n3. LOGIC: Implement InitWorkflow.run(projectPath): Promise<InitResult>. Run all three detectors in parallel. Collect results. Determine if complete/partial/missing. Return InitResult with pillars and recommendations. Mock detectors.\n4. OUTPUT: InitWorkflow.run() method. Returns InitResult with pillar status."
+                },
+                {
+                  "type": "Subtask",
+                  "id": "P2.M4.T1.S2",
+                  "title": "Implement user prompts for scaffolding",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P2.M4.T1.S1"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: From PRD section 4, 'Prompt user: scaffold missing pillars?' Use inquirer for CLI prompts.\n2. INPUT: InitResult from S1.\n3. LOGIC: Implement InitWorkflow.promptForScaffolding(result: InitResult): Promise<ScaffoldingDecision>. Use inquirer.prompt to ask user about each missing pillar. Offer options: scaffold all, scaffold specific, skip. Record preference in .hawk/settings.json. Mock inquirer.\n4. OUTPUT: promptForScaffolding() method. Returns ScaffoldingDecision."
+                },
+                {
+                  "type": "Subtask",
+                  "id": "P2.M4.T1.S3",
+                  "title": "Implement scaffolding execution and validation",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P2.M4.T1.S2"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: From PRD section 4, 'Scaffold configs, validate scaffolds, commit snapshot'. Validate that scaffolds work.\n2. INPUT: ScaffoldingDecision from S2, pillar detectors.\n3. LOGIC: Implement InitWorkflow.scaffold(projectPath, decision): Promise<void>. For each approved pillar, call detector.scaffold(). Validate scaffold (run test command, linter dry-run). Create phantom git commit 'init: scaffolded <pillar>'. Save settings to .hawk/settings.json. Mock fs/git operations.\n4. OUTPUT: scaffold() method. Validates scaffolds. Updates .hawk/settings.json."
+                }
+              ]
+            },
+            {
+              "type": "Task",
+              "id": "P2.M4.T2",
+              "title": "Create 'hawk init' CLI Command",
+              "status": "Planned",
+              "description": "Expose the init workflow through the CLI and integrate with session system.",
+              "subtasks": [
+                {
+                  "type": "Subtask",
+                  "id": "P2.M4.T2.S1",
+                  "title": "Implement 'hawk init' command",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P2.M4.T1.S3"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: 'hawk init' creates session, runs detection, prompts user, scaffolds, commits snapshot.\n2. INPUT: InitWorkflow from P2.M4.T1, SessionManager from P1.M1.\n3. LOGIC: Create bin/commands/init.ts. Parse args: --project-path, --skip-prompts. Create session. Run InitWorkflow.run(). Prompt for scaffolding. Scaffold if approved. Commit phantom snapshot. Output results. Mock all dependencies.\n4. OUTPUT: 'hawk init' CLI command. Creates session, runs pillar detection, scaffolds."
+                },
+                {
+                  "type": "Subtask",
+                  "id": "P2.M4.T2.S2",
+                  "title": "Implement .hawk/settings.json management",
+                  "status": "Planned",
+                  "story_points": 1,
+                  "dependencies": ["P2.M4.T2.S1"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: .hawk/ in project root stores persistent project settings. User preferences for scaffolding.\n2. INPUT: InitWorkflow from S1.\n3. LOGIC: Implement SettingsManager.load(projectPath), save(projectPath, settings). Store: pillar preferences, scaffold choices, custom configs. Create .hawk/ directory if missing. Mock fs operations.\n4. OUTPUT: SettingsManager class. Loads/saves .hawk/settings.json."
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "Phase",
+      "id": "P3",
+      "title": "Phase 3: Workflow Engine",
+      "status": "Planned",
+      "description": "Implement the Workflow composition system with React-like rendering, context propagation, and async workflow spawning.",
+      "milestones": [
+        {
+          "type": "Milestone",
+          "id": "P3.M1",
+          "title": "Workflow Composition Core",
+          "status": "Planned",
+          "description": "Build the fundamental workflow composition engine with synchronous rendering and basic state management.",
+          "tasks": [
+            {
+              "type": "Task",
+              "id": "P3.M1.T1",
+              "title": "Design Workflow Architecture",
+              "status": "Planned",
+              "description": "Define the Workflow interface and result types following React-like composition patterns.",
+              "subtasks": [
+                {
+                  "type": "Subtask",
+                  "id": "P3.M1.T1.S1",
+                  "title": "Define Workflow interface and result types",
+                  "status": "Planned",
+                  "story_points": 1,
+                  "dependencies": [],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: From system_context.md section 3.3, workflows are like React components. Can return sync values, async processes, child agents, or human prompts.\n2. INPUT: None.\n3. LOGIC: Define Workflow interface with: id, render(props). Define WorkflowResult union type: {type: 'sync', value}, {type: 'async', process}, {type: 'agent', agent}, {type: 'human', prompt}, {type: 'done'}. Define WorkflowProps type. Export from src/core/workflow/types.ts.\n4. OUTPUT: Workflow interface, WorkflowResult union type, WorkflowProps type."
+                },
+                {
+                  "type": "Subtask",
+                  "id": "P3.M1.T1.S2",
+                  "title": "Design workflow context propagation",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P3.M1.T1.S1"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: From external_deps.md section 2.2, use Redux pattern for state. Props/callbacks flow parent→child like React.\n2. INPUT: Workflow from S1.\n3. LOGIC: Define WorkflowContext interface with: session, props, callbacks, state. Define ContextPropagation type with: parentContext, childOverrides. Define ContextConsumer type for workflows to access context.\n4. OUTPUT: WorkflowContext interface, context propagation utilities."
+                }
+              ]
+            },
+            {
+              "type": "Task",
+              "id": "P3.M1.T2",
+              "title": "Implement Workflow Renderer",
+              "status": "Planned",
+              "description": "Build the workflow execution engine that handles rendering, result processing, and error handling.",
+              "subtasks": [
+                {
+                  "type": "Subtask",
+                  "id": "P3.M1.T2.S1",
+                  "title": "Implement synchronous workflow rendering",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P3.M1.T1.S2"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: From system_context.md, workflows render by calling render(props). Sync results return immediately.\n2. INPUT: Workflow from S1, WorkflowContext from S2.\n3. LOGIC: Implement WorkflowRenderer.render(workflow, context): Promise<WorkflowResult>. Call workflow.render(context.props). Handle return value based on type. Wrap in try/catch for error handling. Log rendering events. Mock workflows.\n4. OUTPUT: WorkflowRenderer.render() method. Handles sync/async/agent/human/done results."
+                },
+                {
+                  "type": "Subtask",
+                  "id": "P3.M1.T2.S2",
+                  "title": "Implement async workflow spawning and monitoring",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P3.M1.T2.S1"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: Async workflows spawn long-running processes (agents, external tools). Must monitor and capture output.\n2. INPUT: WorkflowResult from S1.\n3. LOGIC: Implement WorkflowRenderer.spawnAsync(result): Promise<AsyncWorkflowHandle>. Spawn child process using execa. Capture stdout/stderr. Monitor exit code. Return handle with: pid, wait(), kill(). Mock execa processes.\n4. OUTPUT: spawnAsync() method. Returns AsyncWorkflowHandle with process management."
+                },
+                {
+                  "type": "Subtask",
+                  "id": "P3.M1.T2.S3",
+                  "title": "Implement recursive workflow composition",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P3.M1.T2.S2"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: From PRD section 11, 'Workflows can render other Workflows'. Recursive composition like React.\n2. INPUT: WorkflowRenderer from S1, S2.\n3. LOGIC: Implement WorkflowRenderer.renderRecursive(workflow, context, depth=0): Promise<WorkflowResult>. Render workflow. If result.type === 'agent', render child workflow. Increment depth. Max depth protection (default 10). Propagate context with overrides.\n4. OUTPUT: renderRecursive() method. Handles nested workflow rendering."
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "Milestone",
+          "id": "P3.M2",
+          "title": "Context & State Management",
+          "status": "Planned",
+          "description": "Implement Redux-pattern state management for workflows with actions, reducers, and selectors.",
+          "tasks": [
+            {
+              "type": "Task",
+              "id": "P3.M2.T1",
+              "title": "Design Redux-Style State Management",
+              "status": "Planned",
+              "description": "Define the action, reducer, and store patterns for workflow state.",
+              "subtasks": [
+                {
+                  "type": "Subtask",
+                  "id": "P3.M2.T1.S1",
+                  "title": "Define Action and Reducer types",
+                  "status": "Planned",
+                  "story_points": 1,
+                  "dependencies": [],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: From external_deps.md section 2.2, Redux pattern: Action {type, payload}, Reducer (state, action) => state.\n2. INPUT: None.\n3. LOGIC: Define Action interface with: type, payload. Define Reducer type. Define WorkflowState with: session, currentTask, testResults, lintResults, escalationLevel, workflowStack. Export from src/core/state/types.ts.\n4. OUTPUT: Action interface, Reducer type, WorkflowState interface."
+                },
+                {
+                  "type": "Subtask",
+                  "id": "P3.M2.T1.S2",
+                  "title": "Define Store interface and middleware pattern",
+                  "status": "Planned",
+                  "story_points": 1,
+                  "dependencies": ["P3.M2.T1.S1"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: Redux store has: getState(), dispatch(action), subscribe(listener). Middleware for logging, crash reporting.\n2. INPUT: Reducer from S1.\n3. LOGIC: Define Store interface with: getState, dispatch, subscribe. Define Middleware type: (store) => (next) => (action) => result. Define StoreConfig with: reducer, initialState, middleware.\n4. OUTPUT: Store interface, Middleware type, StoreConfig type."
+                }
+              ]
+            },
+            {
+              "type": "Task",
+              "id": "P3.M2.T2",
+              "title": "Implement Workflow Store",
+              "status": "Planned",
+              "description": "Build the Redux-style store with middleware support and immutable state updates.",
+              "subtasks": [
+                {
+                  "type": "Subtask",
+                  "id": "P3.M2.T2.S1",
+                  "title": "Implement store core with dispatch and subscribe",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P3.M2.T1.S2"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: Store maintains state, calls reducer on dispatch, notifies subscribers. Use immer for immutable updates.\n2. INPUT: StoreConfig from S2.\n3. LOGIC: Implement createStore(config): Store. Initialize state. dispatch(action): call reducer, apply immer produce, notify subscribers. subscribe(listener): return unsubscribe function. getState(): return current state. Mock immer.\n4. OUTPUT: createStore() function. Returns Store with dispatch, subscribe, getState."
+                },
+                {
+                  "type": "Subtask",
+                  "id": "P3.M2.T2.S2",
+                  "title": "Implement middleware pipeline",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P3.M2.T2.S1"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: Middleware wraps dispatch. Chain: logger → crashreporter → dispatch. Each middleware can modify/observe actions.\n2. INPUT: Store from S1, Middleware from S2.\n3. LOGIC: Modify createStore to apply middleware. Compose middleware chain: applyMiddleware(...middleware)(store).next. Call next(action) to pass down chain. Mock middleware functions.\n4. OUTPUT: applyMiddleware() function. Chains middleware. Passes actions to reducer."
+                },
+                {
+                  "type": "Subtask",
+                  "id": "P3.M2.T2.S3",
+                  "title": "Implement logging middleware",
+                  "status": "Planned",
+                  "story_points": 1,
+                  "dependencies": ["P3.M2.T2.S2"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: Log every action and state change. Use AgentLogger from P1.M3.\n2. INPUT: Store from S1, AgentLogger.\n3. LOGIC: Create loggingMiddleware(store: Store): Middleware. On each action: log 'DISPATCH <action.type>', log action payload. After reducer: log 'NEW STATE', log state diff. Use AgentLogger.hawkagent().\n4. OUTPUT: loggingMiddleware() function. Logs all actions and state changes."
+                }
+              ]
+            },
+            {
+              "type": "Task",
+              "id": "P3.M2.T3",
+              "title": "Connect Store to Workflows",
+              "status": "Planned",
+              "description": "Integrate the Redux-style store with the workflow renderer for stateful workflows.",
+              "subtasks": [
+                {
+                  "type": "Subtask",
+                  "id": "P3.M2.T3.S1",
+                  "title": "Integrate store with WorkflowContext",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P3.M2.T2.S3"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: Workflows access store via context. Can dispatch actions, subscribe to state changes.\n2. INPUT: Store from P3.M2.T2, WorkflowContext from P3.M1.T1.\n3. LOGIC: Modify WorkflowContext to include store. Add dispatch(action) helper. Add getState() helper. Workflows can now: context.dispatch({type: 'TASK_START', payload}). Update context propagation to pass store.\n4. OUTPUT: Updated WorkflowContext with store integration. Helper methods for dispatch/getState."
+                },
+                {
+                  "type": "Subtask",
+                  "id": "P3.M2.T3.S2",
+                  "title": "Implement workflow state lifecycle management",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P3.M2.T3.S1"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: Workflows dispatch actions on lifecycle events: start, progress, complete, error.\n2. INPUT: WorkflowRenderer from P3.M1.T2, Store from P3.M2.T2.\n3. LOGIC: Modify WorkflowRenderer to dispatch actions: WORKFLOW_START, WORKFLOW_PROGRESS, WORKFLOW_COMPLETE, WORKFLOW_ERROR. Include workflow ID, timestamp, metadata. Store state tracks workflow stack.\n4. OUTPUT: WorkflowRenderer dispatches lifecycle actions. Store maintains workflow stack."
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "Milestone",
+          "id": "P3.M3",
+          "title": "Workflow Templates",
+          "status": "Planned",
+          "description": "Create reusable workflow templates for common operations: init, PRD creation, PRD breakdown, implementation.",
+          "tasks": [
+            {
+              "type": "Task",
+              "id": "P3.M3.T1",
+              "title": "Implement Init Workflow Template",
+              "status": "Planned",
+              "description": "Convert the existing init logic into a composable workflow template.",
+              "subtasks": [
+                {
+                  "type": "Subtask",
+                  "id": "P3.M3.T1.S1",
+                  "title": "Create InitWorkflow as composable workflow",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P3.M2.T3.S2"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: From system_context.md section 3.3, InitWorkflow is a workflow that renders subworkflows: CreateSession, DetectPillars, PromptUser.\n2. INPUT: WorkflowRenderer from P3.M1, InitWorkflow logic from P2.M4.\n3. LOGIC: Convert InitWorkflow.run() to Workflow: {id: 'init', render: async (props) => {...}}. Render CreateSessionWorkflow, DetectPillarsWorkflow sequentially. Use context for passing data. Return {type: 'done'}.\n4. OUTPUT: InitWorkflow as Workflow interface. Composes subworkflows."
+                },
+                {
+                  "type": "Subtask",
+                  "id": "P3.M3.T1.S2",
+                  "title": "Create CreateSession and DetectPillars subworkflows",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P3.M3.T1.S1"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: Break init into smaller workflows for reusability. Each subworkflow is a Workflow.\n2. INPUT: SessionManager from P1.M1, PillarDetectors from P2.\n3. LOGIC: Create CreateSessionWorkflow: calls SessionManager.create(). Create DetectPillarsWorkflow: calls all detectors. Each returns {type: 'sync', value} with results. Can be composed into other workflows.\n4. OUTPUT: CreateSessionWorkflow, DetectPillarsWorkflow as Workflow interfaces."
+                }
+              ]
+            },
+            {
+              "type": "Task",
+              "id": "P3.M3.T2",
+              "title": "Implement PRD Creation Workflow",
+              "status": "Planned",
+              "description": "Build workflow template for PRD creation with user prompting and validation.",
+              "subtasks": [
+                {
+                  "type": "Subtask",
+                  "id": "P3.M3.T2.S1",
+                  "title": "Design PRD creation workflow structure",
+                  "status": "Planned",
+                  "story_points": 1,
+                  "dependencies": ["P3.M3.T1.S2"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: From PRD section 3.1, prompt user until confidence threshold, optional research, create PRD.\n2. INPUT: WorkflowRenderer, inquirer for prompts.\n3. LOGIC: Define PRDCreationWorkflow with stages: prompt, research, validate, create. Each stage is a subworkflow. Confidence threshold: user confirms PRD is complete.\n4. OUTPUT: PRDCreationWorkflow structure definition."
+                },
+                {
+                  "type": "Subtask",
+                  "id": "P3.M3.T2.S2",
+                  "title": "Implement user prompting for PRD",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P3.M3.T2.S1"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: Prompt user for PRD content. Iterate until confidence threshold reached.\n2. INPUT: inquirer, WorkflowContext.\n3. LOGIC: Create PromptUserWorkflow. Ask: project name, goals, requirements, constraints. Display draft PRD. Ask: 'Is this PRD complete?' If no, iterate. Return PRD content.\n4. OUTPUT: PromptUserWorkflow as Workflow. Returns PRD content."
+                },
+                {
+                  "type": "Subtask",
+                  "id": "P3.M3.T2.S3",
+                  "title": "Implement PRD research and validation",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P3.M3.T2.S2"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: From PRD section 3.1, 'optionally perform light research to validate assumptions'.\n2. INPUT: PRD content from S2.\n3. LOGIC: Create PRDResearchWorkflow. Spawn research agent (async). Validate assumptions against codebase. Return research findings. Merge into PRD.\n4. OUTPUT: PRDResearchWorkflow as Workflow. Returns validated PRD."
+                }
+              ]
+            },
+            {
+              "type": "Task",
+              "id": "P3.M3.T3",
+              "title": "Implement PRD Breakdown Workflow",
+              "status": "Planned",
+              "description": "Build workflow for hierarchical PRD breakdown into tasks.json format.",
+              "subtasks": [
+                {
+                  "type": "Subtask",
+                  "id": "P3.M3.T3.S1",
+                  "title": "Design PRD breakdown workflow structure",
+                  "status": "Planned",
+                  "story_points": 1,
+                  "dependencies": ["P3.M3.T2.S3"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: From PRD section 3.2, break PRD into chunks, recursively break into 1-2 SP tasks, store research.\n2. INPUT: PRD content, WorkflowRenderer.\n3. LOGIC: Define PRDBreakdownWorkflow with: detectIfHawkInit, breakdownIntoChunks, recursiveBreakdown, researchAllTasks. Use existing task breakdown logic from run-prd.sh.\n4. OUTPUT: PRDBreakdownWorkflow structure definition."
+                },
+                {
+                  "type": "Subtask",
+                  "id": "P3.M3.T3.S2",
+                  "title": "Implement recursive task breakdown",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P3.M3.T3.S1"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: Recursively break tasks until 1-2 story points. TBD algorithm from PRD.\n2. INPUT: PRD content.\n3. LOGIC: Create RecursiveBreakdownWorkflow. Estimate story points. If > 2, split into subtasks. Recurse on subtasks. Stop when all tasks 1-2 SP. Return task hierarchy.\n4. OUTPUT: RecursiveBreakdownWorkflow as Workflow. Returns task hierarchy."
+                },
+                {
+                  "type": "Subtask",
+                  "id": "P3.M3.T3.S3",
+                  "title": "Implement task prioritization",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P3.M3.T3.S2"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: From PRD section 3.3, 'err on side of consecutive execution'. Build tool for task list access.\n2. INPUT: Task hierarchy from S2.\n3. LOGIC: Create TaskPrioritizationWorkflow. Analyze dependencies. Build execution order. Default: sequential. Mark parallelizable tasks. Return prioritized task list.\n4. OUTPUT: TaskPrioritizationWorkflow as Workflow. Returns execution order."
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "Phase",
+      "id": "P4",
+      "title": "Phase 4: TDD Integration",
+      "status": "Planned",
+      "description": "Implement the TDD Testing Agent Overseer and the test-driven development loop with regression testing.",
+      "milestones": [
+        {
+          "type": "Milestone",
+          "id": "P4.M1",
+          "title": "TDD Orchestrator",
+          "status": "Planned",
+          "description": "Build the TDD overseer that manages test execution, regression, and test modification.",
+          "tasks": [
+            {
+              "type": "Task",
+              "id": "P4.M1.T1",
+              "title": "Design TDD Architecture",
+              "status": "Planned",
+              "description": "Define the TDD loop structure and interfaces for test command validation.",
+              "subtasks": [
+                {
+                  "type": "Subtask",
+                  "id": "P4.M1.T1.S1",
+                  "title": "Define TDD loop interfaces",
+                  "status": "Planned",
+                  "story_points": 1,
+                  "dependencies": [],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: From PRD section 6, TDD loop: TestTasker → PromptWriter → Implementer → RunNext → (pass/fail) → RegPass → Commit/RePrompt.\n2. INPUT: None.\n3. LOGIC: Define TDDLoop interface with: getNextTest, runTest, runRegression, modifyTest. Define TestConfig with: testPath, testName, expectedBehavior. Define TestResult with: passed, output, errors. Export from src/tdd/types.ts.\n4. OUTPUT: TDDLoop interface, TestConfig type, TestResult type."
+                },
+                {
+                  "type": "Subtask",
+                  "id": "P4.M1.T1.S2",
+                  "title": "Design test command validation system",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P4.M1.T1.S1"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: From PRD section 7.1, 'Testing agent collaborates with multiple agents to validate command generation'. 3+ agents validate.\n2. INPUT: TestPillar from P2.M1.\n3. LOGIC: Define TestCommandValidator interface with: validateCommands(commands): Promise<ValidationResult>. Validation uses 3 agents: Agent1 dry-runs, Agent2 checks syntax, Agent3 verifies framework compatibility. All must agree. Mock agents.\n4. OUTPUT: TestCommandValidator interface. Multi-agent validation pattern."
+                }
+              ]
+            },
+            {
+              "type": "Task",
+              "id": "P4.M1.T2",
+              "title": "Implement Test Command Validation",
+              "status": "Planned",
+              "description": "Build the multi-agent test command validation system.",
+              "subtasks": [
+                {
+                  "type": "Subtask",
+                  "id": "P4.M1.T2.S1",
+                  "title": "Implement test command dry-run validation",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P4.M1.T1.S2"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: Agent1 executes test command with --help or --dry-run to verify syntax.\n2. INPUT: TestPillar.testCommand from P2.M1.\n3. LOGIC: Implement TestCommandValidator.validateDryRun(command): Promise<boolean>. Execute 'npm test -- --help' or framework-specific dry-run. Check exit code, output for errors. Use execa. Mock execa.\n4. OUTPUT: validateDryRun() method. Returns true if command syntax valid."
+                },
+                {
+                  "type": "Subtask",
+                  "id": "P4.M1.T2.S2",
+                  "title": "Implement test command syntax validation",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P4.M1.T2.S1"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: Agent2 parses test command syntax. Checks for required flags, correct argument order.\n2. INPUT: Test command from S1.\n3. LOGIC: Implement TestCommandValidator.validateSyntax(command): Promise<boolean>. Parse command string. Check for required flags: --run, --watch, etc. Validate argument order. Flag-specific validation per framework.\n4. OUTPUT: validateSyntax() method. Returns true if syntax correct."
+                },
+                {
+                  "type": "Subtask",
+                  "id": "P4.M1.T2.S3",
+                  "title": "Implement test command framework compatibility check",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P4.M1.T2.S2"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: Agent3 verifies command matches detected framework. Jest commands for Jest, pytest for Python.\n2. INPUT: Test command from S2, TestPillar from P2.M1.\n3. LOGIC: Implement TestCommandValidator.validateCompatibility(command, framework): Promise<boolean>. Check if command matches framework. Jest commands must start with 'npm test' or 'npx jest'. pytest must be 'pytest'.\n4. OUTPUT: validateCompatibility() method. Returns true if command compatible."
+                },
+                {
+                  "type": "Subtask",
+                  "id": "P4.M1.T2.S4",
+                  "title": "Implement multi-agent consensus validation",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P4.M1.T2.S3"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: All 3 agents must agree. If any disagree, flag for human review.\n2. INPUT: Validation methods from S1-S3.\n3. LOGIC: Implement TestCommandValidator.validateCommands(commands): Promise<ValidationResult>. Run all 3 validations in parallel. If all pass, return valid. If any fail, return invalid with reasons. If partial pass, return needs-review.\n4. OUTPUT: validateCommands() method. Returns ValidationResult with consensus."
+                }
+              ]
+            },
+            {
+              "type": "Task",
+              "id": "P4.M1.T3",
+              "title": "Implement TDD Loop Execution",
+              "status": "Planned",
+              "description": "Build the TDD loop that drives implementation through test-pass cycles.",
+              "subtasks": [
+                {
+                  "type": "Subtask",
+                  "id": "P4.M1.T3.S1",
+                  "title": "Implement 'run next test' workflow",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P4.M1.T2.S4"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: From PRD section 6, 'Orchestrator runs run next test'. Execute specific test.\n2. INPUT: TestConfig from S1, TestPillar.testCommand.\n3. LOGIC: Implement TDDLoop.runNextTest(testConfig): Promise<TestResult>. Execute test command with specific test filter. Parse output. Determine pass/fail. Return TestResult with: passed, duration, output, errors. Use execa.\n4. OUTPUT: runNextTest() method. Returns TestResult."
+                },
+                {
+                  "type": "Subtask",
+                  "id": "P4.M1.T3.S2",
+                  "title": "Implement 'run regression tests' workflow",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P4.M1.T3.S1"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: From PRD section 6, 'Run regression tests using run regression tests'. Run full test suite.\n2. INPUT: TestPillar.testCommand.\n3. LOGIC: Implement TDDLoop.runRegressionTests(): Promise<RegressionResult>. Execute full test suite. Capture all test results. Check for failures. If failures, return array of failed tests. Return RegressionResult with: allPassed, failedTests, summary.\n4. OUTPUT: runRegressionTests() method. Returns RegressionResult."
+                },
+                {
+                  "type": "Subtask",
+                  "id": "P4.M1.T3.S3",
+                  "title": "Implement 'modify test' workflow",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P4.M1.T3.S2"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: From PRD section 6, feedback loop adds findings to feedback, re-prompts implementer.\n2. INPUT: TestResult from S1, feedback string.\n3. LOGIC: Implement TDDLoop.modifyTest(testPath, feedback): Promise<void>. Modify test file based on feedback. Add comments, adjust assertions. Create phantom git commit 'tdd: modified test <testPath>'.\n4. OUTPUT: modifyTest() method. Modifies test file, commits changes."
+                },
+                {
+                  "type": "Subtask",
+                  "id": "P4.M1.T3.S4",
+                  "title": "Implement full TDD loop orchestrator",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P4.M1.T3.S3"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: From PRD section 6 diagram: TestTasker → PromptWriter → Implementer → RunNext → (pass?) → RunReg → (regPass?) → Commit/RePrompt.\n2. INPUT: TDDLoop methods from S1-S3, Implementer agent.\n3. LOGIC: Implement TDDOrchestrator.run(task): Promise<TDDResult>. Loop: getNextTest → implementer.run → runNextTest. If pass → runRegressionTests. If regPass → commit. If fail → addFeedback → RePrompt implementer (max attempts). Return TDDResult with: success, attempts, finalCommit.\n4. OUTPUT: TDDOrchestrator.run() method. Implements full TDD loop."
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "Milestone",
+          "id": "P4.M2",
+          "title": "TDD Workflow Integration",
+          "status": "Planned",
+          "description": "Integrate TDD orchestrator with the workflow system and implementation workflows.",
+          "tasks": [
+            {
+              "type": "Task",
+              "id": "P4.M2.T1",
+              "title": "Create TDD Implementation Workflow",
+              "status": "Planned",
+              "description": "Build workflow that combines TDD loop with implementation agent for task execution.",
+              "subtasks": [
+                {
+                  "type": "Subtask",
+                  "id": "P4.M2.T1.S1",
+                  "title": "Design TDD implementation workflow structure",
+                  "status": "Planned",
+                  "story_points": 1,
+                  "dependencies": ["P4.M1.T3.S4"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: TDD workflow wraps implementation agent with TDD loop. From PRD section 5.\n2. INPUT: TDDOrchestrator from P4.M1, WorkflowRenderer from P3.\n3. LOGIC: Define TDDImplementationWorkflow. Stages: phantomCommit (pre-task) → TDDOrchestrator.run → phantomCommit (post-success) → realGitCommit. Each stage is subworkflow.\n4. OUTPUT: TDDImplementationWorkflow structure definition."
+                },
+                {
+                  "type": "Subtask",
+                  "id": "P4.M2.T1.S2",
+                  "title": "Implement TDD implementation workflow",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P4.M2.T1.S1"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: Workflow ensures phantom commits before/after, runs TDD loop, commits to real git on success.\n2. INPUT: Task from tasks.json, TDDOrchestrator, PhantomGit.\n3. LOGIC: Create TDDImplementationWorkflow as Workflow. Render: pre-task phantom commit → run TDDOrchestrator → post-task phantom commit → real git commit. Handle failures with rollback. Return {type: 'done'}.\n4. OUTPUT: TDDImplementationWorkflow as Workflow. Executes task with TDD."
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "Phase",
+      "id": "P5",
+      "title": "Phase 5: Escalation & HITL",
+      "status": "Planned",
+      "description": "Implement progressive escalation paths and human-in-the-loop intervention system.",
+      "milestones": [
+        {
+          "type": "Milestone",
+          "id": "P5.M1",
+          "title": "Escalation System",
+          "status": "Planned",
+          "description": "Build the 5-level escalation hierarchy from retry to human intervention.",
+          "tasks": [
+            {
+              "type": "Task",
+              "id": "P5.M1.T1",
+              "title": "Design Escalation Architecture",
+              "status": "Planned",
+              "description": "Define the escalation path interfaces and trigger conditions.",
+              "subtasks": [
+                {
+                  "type": "Subtask",
+                  "id": "P5.M1.T1.S1",
+                  "title": "Define escalation levels and trigger conditions",
+                  "status": "Planned",
+                  "story_points": 1,
+                  "dependencies": [],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: From external_deps.md section 5.1, 5 levels: Retry(1), RCA(2), Fagan(3), Independent Review(4), HITL(5). Trigger by failure count.\n2. INPUT: None.\n3. LOGIC: Define EscalationLevel enum (1-5). Define EscalationPath with: level, trigger(failure): boolean, agent?, action(context). Define Failure with: attempts, error, context. Export from src/escalation/types.ts.\n4. OUTPUT: EscalationLevel enum, EscalationPath interface, Failure type."
+                },
+                {
+                  "type": "Subtask",
+                  "id": "P5.M1.T1.S2",
+                  "title": "Design escalation agent interfaces",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P5.M1.T1.S1"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: From external_deps.md, RCA agent analyzes root cause, Fagan inspector reviews code, Independent reviewer provides external perspective.\n2. INPUT: EscalationPath from S1.\n3. LOGIC: Define RootCauseAnalysisAgent interface with: analyze(failure): Promise<Analysis>. Define FaganInspector with: inspect(context): Promise<Inspection>. Define IndependentReviewer with: review(context): Promise<Review>. Each returns findings for retry.\n4. OUTPUT: RootCauseAnalysisAgent, FaganInspector, IndependentReviewer interfaces."
+                }
+              ]
+            },
+            {
+              "type": "Task",
+              "id": "P5.M1.T2",
+              "title": "Implement Escalation Agents",
+              "status": "Planned",
+              "description": "Build the escalation agents: RCA, Fagan, and Independent Review.",
+              "subtasks": [
+                {
+                  "type": "Subtask",
+                  "id": "P5.M1.T2.S1",
+                  "title": "Implement Root Cause Analysis agent",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P5.M1.T1.S2"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: RCA agent analyzes failure: error messages, logs, code state. Identifies root cause.\n2. INPUT: Failure from S1, AgentLogger.\n3. LOGIC: Implement RootCauseAnalysisAgent.analyze(failure): Promise<Analysis>. Collect: error stack trace, session logs, phantom git diff. Spawn analysis agent (async). Agent generates analysis report with: root cause, suggested fix, confidence.\n4. OUTPUT: RootCauseAnalysisAgent.analyze() method. Returns Analysis with fix suggestions."
+                },
+                {
+                  "type": "Subtask",
+                  "id": "P5.M1.T2.S2",
+                  "title": "Implement Fagan Inspection agent",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P5.M1.T2.S1"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: Fagan inspection is formal code review process. Checklist-based, focused on defects.\n2. INPUT: Failure context, Analysis from S1.\n3. LOGIC: Implement FaganInspector.inspect(context): Promise<Inspection>. Spawn Fagan agent. Runs checklist: logic errors, interface violations, standards violations. Returns inspection findings with: defects found, severity, locations.\n4. OUTPUT: FaganInspector.inspect() method. Returns Inspection with defects."
+                },
+                {
+                  "type": "Subtask",
+                  "id": "P5.M1.T2.S3",
+                  "title": "Implement Independent Review agent",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P5.M1.T2.S2"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: Independent reviewer provides external perspective. Different from implementation agents.\n2. INPUT: Failure context, Analysis, Inspection.\n3. LOGIC: Implement IndependentReviewer.review(context): Promise<Review>. Spawn review agent. Reviewer has no context of previous attempts. Fresh perspective. Returns review with: assessment, recommendations, alternative approaches.\n4. OUTPUT: IndependentReviewer.review() method. Returns Review with recommendations."
+                }
+              ]
+            },
+            {
+              "type": "Task",
+              "id": "P5.M1.T3",
+              "title": "Implement Escalation Orchestrator",
+              "status": "Planned",
+              "description": "Build the escalation orchestrator that manages progressive escalation through the 5 levels.",
+              "subtasks": [
+                {
+                  "type": "Subtask",
+                  "id": "P5.M1.T3.S1",
+                  "title": "Implement escalation path evaluation",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P5.M1.T2.S3"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: On failure, determine escalation level based on attempts. Level 1: < 3 attempts. Level 5: >= 9 attempts.\n2. INPUT: Failure with attempt count, EscalationPath[] from S1.\n3. LOGIC: Implement EscalationOrchestrator.evaluate(failure): EscalationPath. Check failure.attempts. Match trigger conditions for each level. Return matching EscalationPath. Default to level 1 if no match.\n4. OUTPUT: evaluate() method. Returns appropriate EscalationPath."
+                },
+                {
+                  "type": "Subtask",
+                  "id": "P5.M1.T3.S2",
+                  "title": "Implement escalation action execution",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P5.M1.T3.S1"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: Execute escalation path action. Either retry with updated context, or spawn escalation agent.\n2. INPUT: EscalationPath from S1, Failure context.\n3. LOGIC: Implement EscalationOrchestrator.execute(path, context): Promise<EscalationResult>. If level 1 (retry): re-run implementer with updated context. If levels 2-4: spawn agent, await findings, return retry with findings. If level 5: request human intervention.\n4. OUTPUT: execute() method. Returns EscalationResult for retry or HITL."
+                },
+                {
+                  "type": "Subtask",
+                  "id": "P5.M1.T3.S3",
+                  "title": "Implement full escalation loop",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P5.M1.T3.S2"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: Loop: implement → fail → escalate → retry. Continue until success or level 5 (HITL).\n2. INPUT: TDDOrchestrator from P4, EscalationOrchestrator.\n3. LOGIC: Implement EscalationOrchestrator.runWithEscalation(task): Promise<Result>. Loop: run TDD → if fail, evaluate escalation → execute escalation → retry. Track attempts. Break on success or level 5. Return result with: success, finalLevel, totalAttempts.\n4. OUTPUT: runWithEscalation() method. Implements full escalation loop."
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "Milestone",
+          "id": "P5.M2",
+          "title": "Human-in-the-Loop Integration",
+          "status": "Planned",
+          "description": "Build the human intervention system with request prompts and response handling.",
+          "tasks": [
+            {
+              "type": "Task",
+              "id": "P5.M2.T1",
+              "title": "Design HITL Architecture",
+              "status": "Planned",
+              "description": "Define the human intervention request/response interfaces.",
+              "subtasks": [
+                {
+                  "type": "Subtask",
+                  "id": "P5.M2.T1.S1",
+                  "title": "Define human intervention request types",
+                  "status": "Planned",
+                  "story_points": 1,
+                  "dependencies": [],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: From PRD section 9 and external_deps.md section 1.3, HITL is last resort. Request types: approve, reject, modify.\n2. INPUT: None.\n3. LOGIC: Define HumanInterventionRequest with: priority, prompt, context, options?, timeout?. Define InterventionResponse with: type ('approve' | 'reject' | 'modify'), feedback?. Export from src/hitl/types.ts.\n4. OUTPUT: HumanInterventionRequest interface, InterventionResponse interface."
+                },
+                {
+                  "type": "Subtask",
+                  "id": "P5.M2.T1.S2",
+                  "title": "Design HITL protocol and context capture",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P5.M2.T1.S1"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: Human decisions logged for audit trail. Context includes: failure history, escalation path, suggested actions.\n2. INPUT: Request from S1, AgentLogger.\n3. LOGIC: Define InterventionProtocol with: request(req): Promise<Response>, captureDecision(req, res). Decision stored in audit trail. Context includes: failure count, agent logs, phantom git diff, suggested fixes from escalation agents.\n4. OUTPUT: InterventionProtocol interface. Decision captured in audit."
+                }
+              ]
+            },
+            {
+              "type": "Task",
+              "id": "P5.M2.T2",
+              "title": "Implement HITL System",
+              "status": "Planned",
+              "description": "Build the human intervention CLI interface and decision capture.",
+              "subtasks": [
+                {
+                  "type": "Subtask",
+                  "id": "P5.M2.T2.S1",
+                  "title": "Implement human intervention prompts",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P5.M2.T1.S2"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: Use inquirer for prompts. Show context: error, failure history, suggestions. Ask for decision.\n2. INPUT: HumanInterventionRequest from S1.\n3. LOGIC: Implement HumanInTheLoop.request(req): Promise<Response>. Display intervention context. Use inquirer.prompt with choices: Approve (continue), Reject (abort task), Modify (provide feedback). Capture free-text feedback if modify. Timeout with default to reject.\n4. OUTPUT: request() method. Returns InterventionResponse."
+                },
+                {
+                  "type": "Subtask",
+                  "id": "P5.M2.T2.S2",
+                  "title": "Implement decision capture and audit logging",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P5.M2.T2.S1"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: Decisions logged for audit. Include: timestamp, request context, response, user.\n2. INPUT: Request, Response from S1, AuditTrail from P1.M3.\n3. LOGIC: Implement HumanInTheLoop.captureDecision(req, res): void. Create audit event: type='human-intervention', request context, response, timestamp. Append to audit trail. Log decision.\n4. OUTPUT: captureDecision() method. Decision logged to audit trail."
+                },
+                {
+                  "type": "Subtask",
+                  "id": "P5.M2.T2.S3",
+                  "title": "Integrate HITL with escalation system",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P5.M2.T2.S2"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: HITL is escalation level 5. Escalation orchestrator calls HITL when level 5 triggered.\n2. INPUT: EscalationOrchestrator from P5.M1, HumanInTheLoop.\n3. LOGIC: Modify EscalationOrchestrator.execute() for level 5. Call HumanInTheLoop.request(). If approve: resume with context. If reject: mark task failed. If modify: update context with feedback and retry.\n4. OUTPUT: EscalationOrchestrator integrated with HITL. Level 5 triggers human prompt."
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "Phase",
+      "id": "P6",
+      "title": "Phase 6: Integration & Polish",
+      "status": "Planned",
+      "description": "Integrate all components with the existing PRD pipeline, add end-to-end workflows, and polish the system.",
+      "milestones": [
+        {
+          "type": "Milestone",
+          "id": "P6.M1",
+          "title": "PRD Pipeline Integration",
+          "status": "Planned",
+          "description": "Connect Hawk Agent with the existing PRD pipeline (run-prd.sh, PRP system).",
+          "tasks": [
+            {
+              "type": "Task",
+              "id": "P6.M1.T1",
+              "title": "Integrate with Existing Task System",
+              "status": "Planned",
+              "description": "Connect Hawk sessions with the existing tasks.json format and tsk CLI.",
+              "subtasks": [
+                {
+                  "type": "Subtask",
+                  "id": "P6.M1.T1.S1",
+                  "title": "Create tasks.json adapter for Hawk sessions",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": [],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: From system_context.md, existing task system uses tasks.json with Phase→Milestone→Task→Subtask. Hawk must read/write this format.\n2. INPUT: Session from P1, tasks.json from existing system.\n3. LOGIC: Implement TaskJsonAdapter.load(path): Promise<TaskHierarchy>. Parse existing tasks.json. Convert to internal Hawk task format. Implement save(path, hierarchy) to write back. Maintain compatibility with tsk CLI.\n4. OUTPUT: TaskJsonAdapter class. Loads/saves tasks.json in existing format."
+                },
+                {
+                  "type": "Subtask",
+                  "id": "P6.M1.T1.S2",
+                  "title": "Integrate with tsk CLI commands",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P6.M1.T1.S1"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: Existing tsk CLI has: next, status, update commands. Hawk should wrap these.\n2. INPUT: tsk CLI, TaskJsonAdapter.\n3. LOGIC: Implement TskWrapper with: next(), status(), update(). Execute tsk commands via execa. Parse output. Integrate with Hawk workflows. Mock execa.\n4. OUTPUT: TskWrapper class. Wraps tsk CLI for Hawk workflows."
+                }
+              ]
+            },
+            {
+              "type": "Task",
+              "id": "P6.M1.T2",
+              "title": "Integrate with PRP System",
+              "status": "Planned",
+              "description": "Connect Hawk workflows with the existing PRP creation and execution system.",
+              "subtasks": [
+                {
+                  "type": "Subtask",
+                  "id": "P6.M1.T2.S1",
+                  "title": "Create PRP workflow integration",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P6.M1.T1.S2"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: Existing PRP system in commands/subtask-planning/. Hawk workflows should trigger PRP creation.\n2. INPUT: PRP templates from existing system, WorkflowRenderer.\n3. LOGIC: Implement PRPWorkflow that wraps existing PRP creation. Reads PRP prompts, executes PRP creation agent, stores results in session/research/. Returns PRP for implementation.\n4. OUTPUT: PRPWorkflow as Workflow. Integrates with existing PRP system."
+                },
+                {
+                  "type": "Subtask",
+                  "id": "P6.M1.T2.S2",
+                  "title": "Connect Hawk TDD with PRP execution",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P6.M1.T2.S1"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: PRP execution should use Hawk TDD loop instead of manual implementation.\n2. INPUT: TDDOrchestrator from P4, PRP workflow.\n3. LOGIC: Modify PRP execution to use TDDImplementationWorkflow from P4.M2. Instead of direct implementation, run TDD loop. Pass PRP as context to implementer agent.\n4. OUTPUT: PRP execution uses Hawk TDD loop."
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "Milestone",
+          "id": "P6.M2",
+          "title": "End-to-End Workflows",
+          "status": "Planned",
+          "description": "Create complete workflows that span PRD creation through implementation and commit.",
+          "tasks": [
+            {
+              "type": "Task",
+              "id": "P6.M2.T1",
+              "title": "Create Full PRD-to-Commit Workflow",
+              "status": "Planned",
+              "description": "Build master workflow that takes a PRD and produces committed implementation.",
+              "subtasks": [
+                {
+                  "type": "Subtask",
+                  "id": "P6.M2.T1.S1",
+                  "title": "Design master workflow structure",
+                  "status": "Planned",
+                  "story_points": 1,
+                  "dependencies": ["P6.M1.T2.S2"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: Master workflow: Init → PRD Creation (if needed) → PRD Breakdown → Task Implementation (with TDD/Escalation) → Commit.\n2. INPUT: All workflows from previous phases.\n3. LOGIC: Define MasterWorkflow that composes: InitWorkflow, PRDCreationWorkflow, PRDBreakdownWorkflow, TDDImplementationWorkflow (per task). Sequential execution. Error handling with escalation.\n4. OUTPUT: MasterWorkflow structure definition."
+                },
+                {
+                  "type": "Subtask",
+                  "id": "P6.M2.T1.S2",
+                  "title": "Implement master workflow orchestration",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P6.M2.T1.S1"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: Orchestrate all phases. Handle state between workflows. Commit to real git on success.\n2. INPUT: All workflows, WorkflowRenderer.\n3. LOGIC: Implement MasterWorkflow as Workflow. Render: Init → PRD creation (optional) → PRD breakdown → For each task: TDD implementation → phantom commit → real git commit. Handle failures with escalation. Return {type: 'done'}.\n4. OUTPUT: MasterWorkflow as Workflow. Complete PRD-to-commit pipeline."
+                }
+              ]
+            },
+            {
+              "type": "Task",
+              "id": "P6.M2.T2",
+              "title": "Create CLI Entry Points",
+              "status": "Planned",
+              "description": "Expose main workflows through CLI commands.",
+              "subtasks": [
+                {
+                  "type": "Subtask",
+                  "id": "P6.M2.T2.S1",
+                  "title": "Implement 'hawk implement' command",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P6.M2.T1.S2"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: 'hawk implement' runs master workflow. Accepts PRD file or uses existing tasks.json.\n2. INPUT: MasterWorkflow, SessionManager.\n3. LOGIC: Create bin/commands/implement.ts. Parse args: --prd, --scope. Create session. Run InitWorkflow. Run PRD breakdown (if PRD provided). Run MasterWorkflow. Handle interrupts.\n4. OUTPUT: 'hawk implement' CLI command. Runs full implementation."
+                },
+                {
+                  "type": "Subtask",
+                  "id": "P6.M2.T2.S2",
+                  "title": "Implement 'hawk resume' command",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P6.M2.T2.S1"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: Resume from last incomplete task. Use existing auto-resume from run-prd.sh.\n2. INPUT: SessionManager, tsk next.\n3. LOGIC: Create bin/commands/resume.ts. Load session by UID or latest. Get next task from tsk. Resume MasterWorkflow from that task. Continue implementation.\n4. OUTPUT: 'hawk resume' CLI command. Resumes interrupted session."
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "Milestone",
+          "id": "P6.M3",
+          "title": "Testing & Documentation",
+          "status": "Planned",
+          "description": "Add comprehensive testing, documentation, and polish.",
+          "tasks": [
+            {
+              "type": "Task",
+              "id": "P6.M3.T1",
+              "title": "Add Comprehensive Tests",
+              "status": "Planned",
+              "description": "Test all Hawk Agent components with unit and integration tests.",
+              "subtasks": [
+                {
+                  "type": "Subtask",
+                  "id": "P6.M3.T1.S1",
+                  "title": "Test session management and phantom git",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": [],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: Unit tests for SessionManager, PhantomGit, FileWriteTracker. Mock all dependencies.\n2. INPUT: Code from P1.\n3. LOGIC: Write Jest tests for: session creation, loading, saving. Phantom git commit, rollback, diff. File write tracker auto-commit. Use mocked fs, git operations.\n4. OUTPUT: Test suites for P1 components. 80%+ coverage."
+                },
+                {
+                  "type": "Subtask",
+                  "id": "P6.M3.T1.S2",
+                  "title": "Test pillars detection and scaffolding",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P6.M3.T1.S1"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: Test framework detection for various projects. Scaffolding validation.\n2. INPUT: Code from P2.\n3. LOGIC: Write tests for: test framework detection (Jest, Vitest, pytest), logging detection (Winston, Pino), linting detection (ESLint, Pylint). Scaffolding creates valid configs. Mock fs.\n4. OUTPUT: Test suites for P2 components."
+                },
+                {
+                  "type": "Subtask",
+                  "id": "P6.M3.T1.S3",
+                  "title": "Test workflow engine and TDD loop",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P6.M3.T1.S2"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: Test workflow composition, context propagation, TDD loop execution.\n2. INPUT: Code from P3, P4.\n3. LOGIC: Write tests for: workflow rendering, recursive composition, context propagation. TDD loop: test execution, regression, modification. Escalation paths. Mock all agents.\n4. OUTPUT: Test suites for P3, P4, P5 components."
+                }
+              ]
+            },
+            {
+              "type": "Task",
+              "id": "P6.M3.T2",
+              "title": "Write Documentation",
+              "status": "Planned",
+              "description": "Create user and developer documentation for Hawk Agent.",
+              "subtasks": [
+                {
+                  "type": "Subtask",
+                  "id": "P6.M3.T2.S1",
+                  "title": "Write user documentation",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": [],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: User docs: installation, quickstart, CLI commands, workflows, troubleshooting.\n2. INPUT: All Hawk features.\n3. LOGIC: Create README.md with: overview, installation, quickstart tutorial, CLI reference (hawk init, implement, resume, session), workflow examples, FAQ.\n4. OUTPUT: Comprehensive user README.md."
+                },
+                {
+                  "type": "Subtask",
+                  "id": "P6.M3.T2.S2",
+                  "title": "Write developer documentation",
+                  "status": "Planned",
+                  "story_points": 2,
+                  "dependencies": ["P6.M3.T2.S1"],
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: Developer docs: architecture, contributing, adding workflows, testing, debug guide.\n2. INPUT: Architecture docs from research.\n3. LOGIC: Create docs/ARCHITECTURE.md with: system overview, component diagrams, data flow. docs/CONTRIBUTING.md with: dev setup, coding standards, adding workflows. docs/DEBUG.md with: common issues, debug techniques.\n4. OUTPUT: Developer documentation in docs/."
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
