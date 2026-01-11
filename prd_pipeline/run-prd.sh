@@ -73,6 +73,18 @@ BUGFIX_TASKS_FILE="${BUGFIX_TASKS_FILE:-bug_fix_tasks.json}"
 BUGFIX_SCOPE="${BUGFIX_SCOPE:-subtask}"
 SKIP_BUG_FINDING="${SKIP_BUG_FINDING:-false}"
 
+# Load file contents only if they exist (avoids errors during --bug-hunt mode)
+PRD_CONTENT=""
+[[ -f "$PRD_FILE" ]] && PRD_CONTENT=$(cat "$PRD_FILE")
+TASKS_CONTENT=""
+[[ -f "$TASKS_FILE" ]] && TASKS_CONTENT=$(cat "$TASKS_FILE")
+
+# Wrapper for tsk command to always use the correct tasks file
+# Defined early so auto-resume can use it
+tsk_cmd() {
+    tsk -f "$TASKS_FILE" "$@"
+}
+
 # Auto-resume logic
 if [[ "$MANUAL_START" == "false" && -f "$TASKS_FILE" ]]; then
     NEXT_ITEM=$(tsk_cmd next -s "$SCOPE" 2>/dev/null)
@@ -295,7 +307,7 @@ read -r -d '' TASK_BREAKDOWN_PROMPT <<EOF
 # PROJECT INITIATION
 
 **INPUT DOCUMENTATION (PRD):**
-$(cat "$PRD_FILE")
+$PRD_CONTENT
 
 **INSTRUCTIONS:**
 1.  **Analyze** the PRD above.
@@ -1083,19 +1095,14 @@ EOF
 
 # --- 4. Helpers ---
 
-# Wrapper for tsk command to always use the correct tasks file
-# Usage: tsk_cmd <args...>
-tsk_cmd() {
-    tsk -f "$TASKS_FILE" "$@"
-}
-
 # Get the current status of an item from tsk
 # Usage: get_item_status <id>
 # Returns: The status string (Planned, Researching, Implementing, Complete, Failed) or empty if not found
 get_item_status() {
     local id=$1
     # Get status as JSON and extract the status for this specific item
-    tsk_cmd status -s "$SCOPE" 2>/dev/null | jq -r --arg iid "$id" '.[] | select(.id == $iid) | .status // empty'
+    # Suppress jq errors in case tsk returns non-JSON output
+    tsk_cmd status -s "$SCOPE" 2>/dev/null | jq -r --arg iid "$id" '.[] | select(.id == $iid) | .status // empty' 2>/dev/null
 }
 
 # Generate ID based on scope
@@ -1568,13 +1575,15 @@ if [[ "$ONLY_BUG_HUNT" == "true" ]]; then
         print -P "%F{cyan}[BUG HUNT]%f Skipping to bug fix pipeline..."
         # Skip to bug finding stage which will detect the file and run fix pipeline
     else
-        # Only require PRD and tasks if we need to run bug finding
+        # No resume files found - need PRD and tasks to run fresh bug discovery
+        print -P "%F{yellow}[BUG HUNT]%f No existing bug report ($BUG_RESULTS_FILE) or bugfix tasks ($BUGFIX_TASKS_FILE) found."
+        print -P "%F{cyan}[BUG HUNT]%f Will run fresh bug discovery..."
         if [[ ! -f "$PRD_FILE" ]]; then
-            print -P "%F{red}[ERROR]%f $PRD_FILE not found. Cannot bug hunt without PRD."
+            print -P "%F{red}[ERROR]%f $PRD_FILE not found. Need PRD to run bug discovery."
             exit 1
         fi
         if [[ ! -f "$TASKS_FILE" ]]; then
-            print -P "%F{red}[ERROR]%f $TASKS_FILE not found. Cannot bug hunt without completed tasks."
+            print -P "%F{red}[ERROR]%f $TASKS_FILE not found. Need completed tasks to run bug discovery."
             exit 1
         fi
     fi
@@ -1621,6 +1630,17 @@ print -P "%F{cyan}[CONFIG]%f Starting positions: Phase=$START_PHASE"
 [[ $SCOPE != "phase" ]] && print -P "%F{cyan}[CONFIG]%f Starting positions: Milestone=$START_MS"
 [[ $SCOPE == "task" || $SCOPE == "subtask" ]] && print -P "%F{cyan}[CONFIG]%f Starting positions: Task=$START_TASK"
 [[ $SCOPE == "subtask" ]] && print -P "%F{cyan}[CONFIG]%f Starting positions: Subtask=$START_SUBTASK"
+
+# Validate tasks file before proceeding
+if [[ ! -f "$TASKS_FILE" ]]; then
+    print -P "%F{red}[ERROR]%f Tasks file not found: $TASKS_FILE"
+    exit 1
+fi
+if ! jq empty "$TASKS_FILE" 2>/dev/null; then
+    print -P "%F{red}[ERROR]%f Tasks file is not valid JSON: $TASKS_FILE"
+    print -P "%F{yellow}[DEBUG]%f First 100 chars: $(head -c 100 "$TASKS_FILE")"
+    exit 1
+fi
 
 total_phases=$(jq '.backlog | length' "$TASKS_FILE")
 
