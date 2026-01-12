@@ -361,20 +361,30 @@ if [[ "$ONLY_BUG_HUNT" == "false" && "$SKIP_BUG_FINDING" == "false" && -n "$SESS
 
             print -P "%F{yellow}[QUESTION]%f How would you like to proceed?"
             print "  1) Resume incomplete bug fix cycle (Default)"
-            print "  2) Discard artifacts and start new bug hunt"
+            print "  2) Archive artifacts and start new bug hunt"
             print "  3) Exit"
             read -q "choice?Select [1/2/3]: "
             print ""
 
             case "$choice" in
                 2)
-                    print -P "%F{cyan}[CLEANUP]%f Removing old bug fix artifacts..."
-                    rm -f "$BUG_RESULTS_FILE" 2>/dev/null
-                    rm -f "$BUGFIX_TASKS_FILE" 2>/dev/null
-                    rm -rf "${SESSION_DIR}/bugfix" 2>/dev/null
-                    print -P "%F{cyan}[INFO]%f Artifacts removed. Starting fresh..."
-                    # If we cleaned up, we are NOT in ONLY_BUG_HUNT mode yet.
-                    # We continue execution. If session is complete, it will hit CURRENT_MATCH_COMPLETE -> Prompt -> Start bug hunt.
+                    print -P "%F{cyan}[ARCHIVE]%f Archiving incomplete bug fix artifacts..."
+                    # Try to find the latest bugfix session to store artifacts in
+                    LATEST_BUG_SESSION=$(find "${SESSION_DIR}/bugfix" -maxdepth 1 -type d -name '[0-9]*_*' 2>/dev/null | sort -n | tail -1)
+
+                    if [[ -n "$LATEST_BUG_SESSION" ]]; then
+                        mv "$BUG_RESULTS_FILE" "$LATEST_BUG_SESSION/bug_report_interrupted.md" 2>/dev/null
+                        mv "$BUGFIX_TASKS_FILE" "$LATEST_BUG_SESSION/tasks_interrupted.json" 2>/dev/null
+                        print -P "%F{cyan}[INFO]%f Archived to $(basename "$LATEST_BUG_SESSION")"
+                    else
+                        # No session found, create an archive dir
+                        ARCHIVE_DIR="${SESSION_DIR}/bugfix/archive_$(date +%s)"
+                        mkdir -p "$ARCHIVE_DIR"
+                        mv "$BUG_RESULTS_FILE" "$ARCHIVE_DIR/" 2>/dev/null
+                        mv "$BUGFIX_TASKS_FILE" "$ARCHIVE_DIR/" 2>/dev/null
+                        print -P "%F{cyan}[INFO]%f Archived to $(basename "$ARCHIVE_DIR")"
+                    fi
+                    print -P "%F{cyan}[INFO]%f Starting fresh bug hunt..."
                     ;;
                 3)
                     print -P "%F{green}[DONE]%f Exiting."
@@ -396,18 +406,30 @@ if [[ "$ONLY_BUG_HUNT" == "false" && "$SKIP_BUG_FINDING" == "false" && -n "$SESS
 
             print -P "%F{yellow}[QUESTION]%f How would you like to proceed?"
             print "  1) Resume incomplete bug fix cycle (Default)"
-            print "  2) Discard artifacts and start new bug hunt"
+            print "  2) Archive artifacts and start new bug hunt"
             print "  3) Exit"
             read -q "choice?Select [1/2/3]: "
             print ""
 
             case "$choice" in
                 2)
-                    print -P "%F{cyan}[CLEANUP]%f Removing old bug fix artifacts..."
-                    rm -f "$BUG_RESULTS_FILE" 2>/dev/null
-                    rm -f "$BUGFIX_TASKS_FILE" 2>/dev/null
-                    rm -rf "${SESSION_DIR}/bugfix" 2>/dev/null
-                    print -P "%F{cyan}[INFO]%f Artifacts removed. Starting fresh..."
+                    print -P "%F{cyan}[ARCHIVE]%f Archiving incomplete bug fix artifacts..."
+                    # Try to find the latest bugfix session to store artifacts in
+                    LATEST_BUG_SESSION=$(find "${SESSION_DIR}/bugfix" -maxdepth 1 -type d -name '[0-9]*_*' 2>/dev/null | sort -n | tail -1)
+
+                    if [[ -n "$LATEST_BUG_SESSION" ]]; then
+                        mv "$BUG_RESULTS_FILE" "$LATEST_BUG_SESSION/bug_report_interrupted.md" 2>/dev/null
+                        mv "$BUGFIX_TASKS_FILE" "$LATEST_BUG_SESSION/tasks_interrupted.json" 2>/dev/null
+                        print -P "%F{cyan}[INFO]%f Archived to $(basename "$LATEST_BUG_SESSION")"
+                    else
+                        # No session found, create an archive dir
+                        ARCHIVE_DIR="${SESSION_DIR}/bugfix/archive_$(date +%s)"
+                        mkdir -p "$ARCHIVE_DIR"
+                        mv "$BUG_RESULTS_FILE" "$ARCHIVE_DIR/" 2>/dev/null
+                        mv "$BUGFIX_TASKS_FILE" "$ARCHIVE_DIR/" 2>/dev/null
+                        print -P "%F{cyan}[INFO]%f Archived to $(basename "$ARCHIVE_DIR")"
+                    fi
+                    print -P "%F{cyan}[INFO]%f Starting fresh bug hunt..."
                     ;;
                 3)
                     print -P "%F{green}[DONE]%f Exiting."
@@ -2436,11 +2458,23 @@ if [[ "$SKIP_BUG_FINDING" == "false" ]]; then
             break
         fi
 
-        # Cleanup after successful bugfix - delete all bugfix artifacts for next iteration
-        print -P "%F{green}[CLEANUP]%f Bug fix pipeline completed. Cleaning up for next iteration..."
-        rm -f "$BUG_RESULTS_FILE" 2>/dev/null
-        rm -f "$BUGFIX_TASKS_FILE" 2>/dev/null
-        rm -rf "${SESSION_DIR}/bugfix" 2>/dev/null
+        # Cleanup after successful bugfix - archive artifacts and clean parent for next iteration
+        print -P "%F{green}[CLEANUP]%f Bug fix pipeline completed. Archiving artifacts..."
+
+        # Archive artifacts to the bugfix session
+        LATEST_BUG_SESSION=$(find "${SESSION_DIR}/bugfix" -maxdepth 1 -type d -name '[0-9]*_*' 2>/dev/null | sort -n | tail -1)
+        if [[ -n "$LATEST_BUG_SESSION" ]]; then
+             mv "$BUG_RESULTS_FILE" "$LATEST_BUG_SESSION/bug_report.md" 2>/dev/null
+             mv "$BUGFIX_TASKS_FILE" "$LATEST_BUG_SESSION/tasks.json" 2>/dev/null
+             print -P "%F{cyan}[INFO]%f Artifacts archived to $(basename "$LATEST_BUG_SESSION")"
+        else
+             # Should not happen if bugfix pipeline ran, but fallback
+             rm -f "$BUG_RESULTS_FILE" 2>/dev/null
+             rm -f "$BUGFIX_TASKS_FILE" 2>/dev/null
+        fi
+
+        # Do NOT remove bugfix/ directory
+        # rm -rf "${SESSION_DIR}/bugfix" 2>/dev/null
 
         ((BUG_HUNT_ITERATION++))
         print -P "%F{cyan}[BUG HUNT]%f Re-running bug discovery to verify fixes..."
