@@ -203,6 +203,7 @@ PREV_SESSION_DIR=""
 INTEGRATE_CHANGES=false
 QUEUE_DELTA=false
 CREATE_DELTA=false
+SKIP_EXECUTION_LOOP=false
 
 # Only resolve sessions if PRD exists (skip for --bug-hunt without PRD)
 if [[ -f "$PRD_FILE" ]]; then
@@ -245,8 +246,13 @@ if [[ -f "$PRD_FILE" ]]; then
         CURRENT_MATCH_COMPLETE)
             print -P "%F{green}[SESSION]%f Session $(basename "$CURRENT_SESSION_DIR") is complete."
             if [[ "$SINGLE_SESSION" == "true" ]]; then
-                print -P "%F{green}[DONE]%f Single-session mode. Exiting."
-                exit 0
+                if [[ "$SKIP_BUG_FINDING" == "false" || "$ONLY_BUG_HUNT" == "true" || "$ONLY_VALIDATE" == "true" ]]; then
+                     print -P "%F{cyan}[SESSION]%f Session complete. Proceeding to validation/bug hunt..."
+                     SKIP_EXECUTION_LOOP=true
+                else
+                    print -P "%F{green}[DONE]%f Single-session mode. Exiting."
+                    exit 0
+                fi
             fi
             # Check for queued delta from previous run
             if [[ -f "$CURRENT_SESSION_DIR/.pending_delta_hash" ]]; then
@@ -264,9 +270,14 @@ if [[ -f "$PRD_FILE" ]]; then
                     CREATE_DELTA=true
                 fi
             else
-                print -P "%F{yellow}[SESSION]%f Nothing to do. PRD unchanged and session complete."
-                print -P "%F{cyan}[INFO]%f Modify PRD.md to create a new delta session, or use --session=N to revisit."
-                exit 0
+                if [[ "$SKIP_BUG_FINDING" == "false" || "$ONLY_BUG_HUNT" == "true" || "$ONLY_VALIDATE" == "true" ]]; then
+                     print -P "%F{cyan}[SESSION]%f Session complete. Proceeding to validation/bug hunt..."
+                     SKIP_EXECUTION_LOOP=true
+                else
+                    print -P "%F{yellow}[SESSION]%f Nothing to do. PRD unchanged and session complete."
+                    print -P "%F{cyan}[INFO]%f Modify PRD.md to create a new delta session, or use --session=N to revisit."
+                    exit 0
+                fi
             fi
             ;;
 
