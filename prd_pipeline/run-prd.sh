@@ -19,6 +19,8 @@ START_SUBTASK=1
 PARALLEL_RESEARCH="${PARALLEL_RESEARCH:-false}"  # Optional parallel research for next item
 ONLY_VALIDATE="${ONLY_VALIDATE:-false}" # Run only the validation step
 ONLY_BUG_HUNT="${ONLY_BUG_HUNT:-false}" # Run only the bug finding step
+SINGLE_SESSION="${SINGLE_SESSION:-false}" # Disable auto-flow between sessions
+TARGET_SESSION="${TARGET_SESSION:-}"       # Manual session selection
 MANUAL_START=false
 
 while getopts "s:p:m:t:u:rv-:" opt; do
@@ -46,10 +48,14 @@ while getopts "s:p:m:t:u:rv-:" opt; do
         validate)    ONLY_VALIDATE=true ;;
         bug-hunt)    ONLY_BUG_HUNT=true ;;
         skip-bug-finding) SKIP_BUG_FINDING=true ;;
-        *) print "Usage: $0 [--scope=...] [--phase=N] [--milestone=N] [--task=N] [--subtask=N] [--parallel-research] [--validate] [--bug-hunt] [--skip-bug-finding]"; exit 1 ;;
+        single-session) SINGLE_SESSION=true ;;
+        no-auto-flow)   SINGLE_SESSION=true ;;
+        session)        TARGET_SESSION="${!OPTIND}"; OPTIND=$(( OPTIND + 1 )) ;;
+        session=*)      TARGET_SESSION="${OPTARG#*=}" ;;
+        *) print "Usage: $0 [--scope=...] [--phase=N] [--milestone=N] [--task=N] [--subtask=N] [--parallel-research] [--validate] [--bug-hunt] [--skip-bug-finding] [--single-session] [--session=N]"; exit 1 ;;
       esac ;;
     *) print "Usage: $0 [-s phase|milestone|task|subtask] [-p N] [-m N] [-t N] [-u N] [-r] [-v]
-   Or: $0 [--scope=...] [--phase=N] [--milestone=N] [--task=N] [--subtask=N] [--parallel-research] [--validate] [--bug-hunt] [--skip-bug-finding]"; exit 1 ;;
+   Or: $0 [--scope=...] [--phase=N] [--milestone=N] [--task=N] [--subtask=N] [--parallel-research] [--validate] [--bug-hunt] [--skip-bug-finding] [--single-session] [--session=N]"; exit 1 ;;
   esac
 done
 
@@ -66,12 +72,272 @@ TASKS_FILE="${TASKS_FILE:-tasks.json}"
 PRD_FILE="${PRD_FILE:-PRD.md}"
 PLAN_DIR="${PLAN_DIR:-plan}"
 
+# --- Session Management Functions ---
+
+# Generate deterministic hash of PRD content
+# Usage: hash_prd_content <file_path>
+# Returns: First 12 chars of SHA256 hash
+hash_prd_content() {
+    local file_path=$1
+    sha256sum "$file_path" | cut -c1-12
+}
+
+# Find all existing sessions
+# Returns: Space-separated list of session directory names, sorted
+get_all_sessions() {
+    find "$PLAN_DIR" -maxdepth 1 -type d -name '[0-9]*_*' 2>/dev/null | \
+        xargs -n1 basename 2>/dev/null | sort -n
+}
+
+# Get the latest session number
+# Returns: Integer (0 if no sessions)
+get_latest_session_number() {
+    local latest=$(get_all_sessions | tail -1)
+    if [[ -z "$latest" ]]; then
+        echo 0
+    else
+        echo "${latest%%_*}"
+    fi
+}
+
+# Get session directory by number
+# Usage: get_session_dir <number>
+get_session_dir() {
+    local num=$1
+    local padded=$(printf "%03d" $num)
+    find "$PLAN_DIR" -maxdepth 1 -type d -name "${padded}_*" 2>/dev/null | head -1
+}
+
+# Check if a session is complete
+# Usage: is_session_complete <session_dir>
+# Returns false (1) if:
+#   - tasks.json doesn't exist
+#   - tasks.json has incomplete items
+#   - bug hunt artifacts exist (bug_fix_tasks.json, bug_hunt_tasks.json, TEST_RESULTS.md)
+is_session_complete() {
+    local session_dir=$1
+    local tasks_file="$session_dir/tasks.json"
+    [[ ! -f "$tasks_file" ]] && return 1
+
+    # Check if any items in main tasks are not Complete
+    local incomplete=$(jq '[.. | objects | select(.status? and .status != "Complete" and .status != "Completed")] | length' "$tasks_file" 2>/dev/null)
+    [[ "$incomplete" != "0" ]] && return 1
+
+    # Check for active bug hunt cycle - if any bug artifacts exist, session is not complete
+    [[ -f "$session_dir/TEST_RESULTS.md" ]] && return 1
+    [[ -f "$session_dir/bug_hunt_tasks.json" ]] && return 1
+    [[ -f "$session_dir/bug_fix_tasks.json" ]] && return 1
+
+    return 0
+}
+
+# Get hash from session directory name
+# Usage: get_session_hash <session_dir>
+get_session_hash() {
+    local session_dir=$1
+    local dir_basename=$(basename "$session_dir")
+    echo "${dir_basename#*_}"
+}
+
+# Create new session directory
+# Usage: create_session <number> <hash>
+# Returns: Path to new session directory
+create_session() {
+    local num=$1
+    local hash=$2
+    local padded=$(printf "%03d" $num)
+    local session_dir="$PLAN_DIR/${padded}_${hash}"
+    mkdir -p "$session_dir/architecture"
+    echo "$session_dir"
+}
+
+# Determine current session state
+# Sets: SESSION_STATE, CURRENT_SESSION_DIR, CURRENT_SESSION_NUM
+determine_session_state() {
+    local current_hash=$(hash_prd_content "$PRD_FILE")
+    local latest_num=$(get_latest_session_number)
+
+    if [[ $latest_num -eq 0 ]]; then
+        SESSION_STATE="NO_SESSIONS"
+        CURRENT_SESSION_DIR=""
+        CURRENT_SESSION_NUM=0
+        return
+    fi
+
+    local latest_dir=$(get_session_dir $latest_num)
+    local latest_hash=$(get_session_hash "$latest_dir")
+
+    CURRENT_SESSION_DIR="$latest_dir"
+    CURRENT_SESSION_NUM=$latest_num
+
+    if [[ "$current_hash" == "$latest_hash" ]]; then
+        if is_session_complete "$latest_dir"; then
+            SESSION_STATE="CURRENT_MATCH_COMPLETE"
+        else
+            SESSION_STATE="CURRENT_MATCH_INCOMPLETE"
+        fi
+    else
+        if is_session_complete "$latest_dir"; then
+            SESSION_STATE="PRD_CHANGED_SESSION_COMPLETE"
+        else
+            SESSION_STATE="PRD_CHANGED_SESSION_INCOMPLETE"
+        fi
+    fi
+}
+
 # Bug finding configuration
 BUG_FINDER_AGENT="${BUG_FINDER_AGENT:-glp}"
 BUG_RESULTS_FILE="${BUG_RESULTS_FILE:-TEST_RESULTS.md}"
-BUGFIX_TASKS_FILE="${BUGFIX_TASKS_FILE:-bug_fix_tasks.json}"
+BUGFIX_TASKS_FILE="${BUGFIX_TASKS_FILE:-bug_hunt_tasks.json}"
 BUGFIX_SCOPE="${BUGFIX_SCOPE:-subtask}"
 SKIP_BUG_FINDING="${SKIP_BUG_FINDING:-false}"
+
+# --- Session State Resolution ---
+# Must happen before bug hunt auto-detect so paths are correct
+
+# Initialize session variables
+SESSION_STATE=""
+CURRENT_SESSION_DIR=""
+CURRENT_SESSION_NUM=0
+PREV_SESSION_DIR=""
+INTEGRATE_CHANGES=false
+QUEUE_DELTA=false
+CREATE_DELTA=false
+
+# Only resolve sessions if PRD exists (skip for --bug-hunt without PRD)
+if [[ -f "$PRD_FILE" ]]; then
+    # Handle manual session selection first
+    if [[ -n "$TARGET_SESSION" ]]; then
+        TARGET_DIR=$(get_session_dir "$TARGET_SESSION")
+        if [[ -z "$TARGET_DIR" || ! -d "$TARGET_DIR" ]]; then
+            print -P "%F{red}[ERROR]%f Session $TARGET_SESSION not found."
+            print -P "%F{cyan}[INFO]%f Available sessions:"
+            get_all_sessions | while read -r sess; do
+                [[ -n "$sess" ]] && print "  - $sess"
+            done
+            exit 1
+        fi
+        CURRENT_SESSION_DIR="$TARGET_DIR"
+        CURRENT_SESSION_NUM="$TARGET_SESSION"
+        SESSION_STATE="MANUAL_SELECTION"
+        print -P "%F{cyan}[SESSION]%f Manually selected session: $(basename "$CURRENT_SESSION_DIR")"
+    else
+        determine_session_state
+    fi
+
+    case "$SESSION_STATE" in
+        MANUAL_SELECTION)
+            # Already handled above, just continue with selected session
+            ;;
+
+        NO_SESSIONS)
+            print -P "%F{cyan}[SESSION]%f No existing sessions found. Creating first session..."
+            CURRENT_SESSION_NUM=1
+            CURRENT_SESSION_DIR=$(create_session 1 "$(hash_prd_content "$PRD_FILE")")
+            cp "$PRD_FILE" "$CURRENT_SESSION_DIR/prd_snapshot.md"
+            print -P "%F{green}[SESSION]%f Created: $(basename "$CURRENT_SESSION_DIR")"
+            ;;
+
+        CURRENT_MATCH_INCOMPLETE)
+            print -P "%F{cyan}[SESSION]%f Resuming session: $(basename "$CURRENT_SESSION_DIR")"
+            ;;
+
+        CURRENT_MATCH_COMPLETE)
+            print -P "%F{green}[SESSION]%f Session $(basename "$CURRENT_SESSION_DIR") is complete."
+            if [[ "$SINGLE_SESSION" == "true" ]]; then
+                print -P "%F{green}[DONE]%f Single-session mode. Exiting."
+                exit 0
+            fi
+            # Check for queued delta from previous run
+            if [[ -f "$CURRENT_SESSION_DIR/.pending_delta_hash" ]]; then
+                PENDING_HASH=$(cat "$CURRENT_SESSION_DIR/.pending_delta_hash")
+                CURRENT_HASH=$(hash_prd_content "$PRD_FILE")
+                if [[ "$PENDING_HASH" == "$CURRENT_HASH" ]]; then
+                    print -P "%F{cyan}[SESSION]%f Processing queued delta..."
+                    rm "$CURRENT_SESSION_DIR/.pending_delta_hash"
+                    PREV_SESSION_DIR="$CURRENT_SESSION_DIR"
+                    CURRENT_SESSION_NUM=$((CURRENT_SESSION_NUM + 1))
+                    CURRENT_SESSION_DIR=$(create_session $CURRENT_SESSION_NUM "$CURRENT_HASH")
+                    echo "$((CURRENT_SESSION_NUM - 1))" > "$CURRENT_SESSION_DIR/delta_from.txt"
+                    cp "$PRD_FILE" "$CURRENT_SESSION_DIR/prd_snapshot.md"
+                    print -P "%F{green}[SESSION]%f Created delta session: $(basename "$CURRENT_SESSION_DIR")"
+                    CREATE_DELTA=true
+                fi
+            else
+                print -P "%F{yellow}[SESSION]%f Nothing to do. PRD unchanged and session complete."
+                print -P "%F{cyan}[INFO]%f Modify PRD.md to create a new delta session, or use --session=N to revisit."
+                exit 0
+            fi
+            ;;
+
+        PRD_CHANGED_SESSION_INCOMPLETE)
+            print -P "%F{yellow}[SESSION]%f PRD has changed but session $(basename "$CURRENT_SESSION_DIR") is incomplete."
+            print -P "%F{yellow}[QUESTION]%f How would you like to proceed?"
+            print "  1) Integrate changes into current session (update tasks)"
+            print "  2) Finish current session first, then start delta session"
+            read -r "choice?Select [1/2]: "
+
+            case "$choice" in
+                1)
+                    INTEGRATE_CHANGES=true
+                    print -P "%F{cyan}[SESSION]%f Will integrate changes into current session..."
+                    # Update snapshot to reflect new PRD
+                    cp "$PRD_FILE" "$CURRENT_SESSION_DIR/prd_snapshot.md"
+                    print -P "%F{cyan}[SESSION]%f Updated prd_snapshot.md with current PRD"
+                    ;;
+                2)
+                    QUEUE_DELTA=true
+                    print -P "%F{cyan}[SESSION]%f Will queue delta for after current session completes..."
+                    # Store the new PRD hash for later
+                    echo "$(hash_prd_content "$PRD_FILE")" > "$CURRENT_SESSION_DIR/.pending_delta_hash"
+                    ;;
+                *)
+                    print -P "%F{red}[ERROR]%f Invalid choice. Exiting."
+                    exit 1
+                    ;;
+            esac
+            ;;
+
+        PRD_CHANGED_SESSION_COMPLETE)
+            print -P "%F{cyan}[SESSION]%f Previous session complete. PRD has changed."
+            print -P "%F{cyan}[SESSION]%f Creating delta session for changes..."
+
+            PREV_SESSION_DIR="$CURRENT_SESSION_DIR"
+            CURRENT_SESSION_NUM=$((CURRENT_SESSION_NUM + 1))
+            CURRENT_SESSION_DIR=$(create_session $CURRENT_SESSION_NUM "$(hash_prd_content "$PRD_FILE")")
+            echo "$((CURRENT_SESSION_NUM - 1))" > "$CURRENT_SESSION_DIR/delta_from.txt"
+            cp "$PRD_FILE" "$CURRENT_SESSION_DIR/prd_snapshot.md"
+
+            print -P "%F{green}[SESSION]%f Created delta session: $(basename "$CURRENT_SESSION_DIR")"
+            CREATE_DELTA=true
+            ;;
+    esac
+
+    # Update path variables to use session directory
+    SESSION_DIR="$CURRENT_SESSION_DIR"
+    TASKS_FILE="$SESSION_DIR/tasks.json"
+    BUGFIX_TASKS_FILE="$SESSION_DIR/bug_hunt_tasks.json"
+    BUG_RESULTS_FILE="$SESSION_DIR/TEST_RESULTS.md"
+fi
+
+# Auto-detect bug hunt cycle: if bug hunt artifacts exist, we're mid-cycle and should resume
+if [[ "$ONLY_BUG_HUNT" == "false" && "$SKIP_BUG_FINDING" == "false" && -n "$SESSION_DIR" ]]; then
+    # Check for bug_hunt_tasks.json (new name)
+    if [[ -f "$SESSION_DIR/bug_hunt_tasks.json" ]]; then
+        BUGFIX_TASKS_FILE="$SESSION_DIR/bug_hunt_tasks.json"
+        print -P "%F{yellow}[AUTO-DETECT]%f Found $BUGFIX_TASKS_FILE - resuming bug hunt cycle"
+        ONLY_BUG_HUNT=true
+    # Check for bug_fix_tasks.json (old name, for backwards compatibility)
+    elif [[ -f "$SESSION_DIR/bug_fix_tasks.json" ]]; then
+        BUGFIX_TASKS_FILE="$SESSION_DIR/bug_fix_tasks.json"
+        print -P "%F{yellow}[AUTO-DETECT]%f Found $BUGFIX_TASKS_FILE - resuming bug hunt cycle"
+        ONLY_BUG_HUNT=true
+    # Check for TEST_RESULTS.md (bug report exists but tasks not yet created)
+    elif [[ -f "$BUG_RESULTS_FILE" ]]; then
+        print -P "%F{yellow}[AUTO-DETECT]%f Found $BUG_RESULTS_FILE - resuming bug hunt cycle"
+        ONLY_BUG_HUNT=true
+    fi
+fi
 
 # Load file contents only if they exist (avoids errors during --bug-hunt mode)
 PRD_CONTENT=""
@@ -218,7 +484,7 @@ read -r -d '' TASK_BREAKDOWN_SYSTEM_PROMPT <<EOF || true
 *   **VALIDATE BEFORE BREAKING DOWN:** You cannot plan what you do not understand.
 *   **SPAWN SUBAGENTS:** Use your tools to spawn agents to research the codebase and external documentation *before* defining the hierarchy.
 *   **REALITY CHECK:** Verify that the PRD's requests match the current codebase state (e.g., don't plan a React hook if the project is vanilla JS).
-*   **PERSISTENCE:** You must store architectural findings in \`$PLAN_DIR/architecture/\` so the downstream PRP (Product Requirement Prompt) agents have access to them.
+*   **PERSISTENCE:** You must store architectural findings in \`$SESSION_DIR/architecture/\` so the downstream PRP (Product Requirement Prompt) agents have access to them.
 
 ### 2. COHERENCE & CONTINUITY
 *   **NO VACUUMS:** You must ensure architectural flow. Subtasks must not exist in isolation.
@@ -246,7 +512,7 @@ ULTRATHINK & PLAN
 2.  **RESEARCH (SPAWN & VALIDATE):**
     *   **Spawn** subagents to map the codebase and verify PRD feasibility.
     *   **Spawn** subagents to find external documentation for new tech.
-    *   **Store** findings in \`$PLAN_DIR/architecture/\` (e.g., \`system_context.md\`, \`external_deps.md\`).
+    *   **Store** findings in \`$SESSION_DIR/architecture/\` (e.g., \`system_context.md\`, \`external_deps.md\`).
 3.  **DETERMINE** the highest level of scope (Phase, Milestone, or Task).
 4.  **DECOMPOSE** strictly downwards to the Subtask level, using your research to populate the \`context_scope\`.
 
@@ -291,7 +557,7 @@ Use your file writing tools to create \`./$TASKS_FILE\` with this structure:
                   "status": "Planned",
                   "story_points": 1,
                   "dependencies": ["ID of prerequisite subtask"],
-                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: [Finding from $PLAN_DIR/architecture/ regarding this feature].\n2. INPUT: [Specific data structure/variable] from [Dependency ID].\n3. LOGIC: Implement [PRD Section X] logic. Mock [Service Y] for isolation.\n4. OUTPUT: Return [Result Object/Interface] for consumption by [Next Subtask ID]."
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: [Finding from $SESSION_DIR/architecture/ regarding this feature].\n2. INPUT: [Specific data structure/variable] from [Dependency ID].\n3. LOGIC: Implement [PRD Section X] logic. Mock [Service Y] for isolation.\n4. OUTPUT: Return [Result Object/Interface] for consumption by [Next Subtask ID]."
                 }
               ]
             }
@@ -313,7 +579,7 @@ $PRD_CONTENT
 **INSTRUCTIONS:**
 1.  **Analyze** the PRD above.
 2.  **Spawn** subagents immediately to research the current codebase state and external documentation. validate that the PRD is feasible and identify architectural patterns to follow.
-3.  **Store** your high-level research findings in the \`$PLAN_DIR/architecture/\` directory. This is critical: the downstream PRP agents will rely on this documentation to generate implementation plans.
+3.  **Store** your high-level research findings in the \`$SESSION_DIR/architecture/\` directory. This is critical: the downstream PRP agents will rely on this documentation to generate implementation plans.
 4.  **Decompose** the project into the JSON Backlog format defined in the System Prompt. Ensure your breakdown is grounded in the reality of the research you just performed.
 5.  **CRITICAL: Write the JSON to \`./$TASKS_FILE\` (current working directory) using your file writing tools.** Do NOT output the JSON to the conversation. Do NOT search for or modify any existing tasks.json files in other directories. Create a NEW file at \`./$TASKS_FILE\`. The file MUST exist when you are done.
 EOF
@@ -504,7 +770,7 @@ _Before writing this PRP, validate: "If someone knew nothing about this codebase
   pattern: [Brief description of what pattern to extract]
   gotcha: [Known constraints or limitations to avoid]
 
-- docfile: [$PLAN_DIR/ai_docs/domain_specific.md]
+- docfile: [$SESSION_DIR/ai_docs/domain_specific.md]
   why: [Custom documentation for complex library/integration patterns]
   section: [Specific section if document is large]
 \`\`\`
@@ -844,25 +1110,35 @@ EOF
 read -r -d '' CLEANUP_PROMPT <<EOF
 Clean up, organize files, and PREPARE FOR COMMIT. Check \`git diff\` for reference.
 
+## SESSION-SPECIFIC PATHS (CURRENT SESSION):
+- Session directory: $SESSION_DIR
+- Tasks file: $SESSION_DIR/tasks.json
+- Bug hunt tasks: $SESSION_DIR/bug_hunt_tasks.json
+- Bug report: $SESSION_DIR/TEST_RESULTS.md
+- Architecture docs: $SESSION_DIR/architecture/
+- Documentation: $SESSION_DIR/docs/
+
 ## CRITICAL - NEVER DELETE THESE FILES:
 **IMPORTANT**: The following files are CRITICAL to the pipeline and must NEVER be deleted, moved, or modified:
-- **tasks.json** - Pipeline state tracking (NEVER DELETE)
-- **bug_fix_tasks.json** - Bug fix pipeline state (NEVER DELETE)
-- **PRD.md** - Product requirements document (NEVER DELETE)
-- **TEST_RESULTS.md** - Bug report file (NEVER DELETE)
+- **$SESSION_DIR/tasks.json** - Pipeline state tracking (NEVER DELETE)
+- **$SESSION_DIR/bug_hunt_tasks.json** - Bug fix pipeline state (NEVER DELETE)
+- **$SESSION_DIR/prd_snapshot.md** - PRD snapshot for this session (NEVER DELETE)
+- **$SESSION_DIR/delta_from.txt** - Delta session linkage (NEVER DELETE if exists)
+- **PRD.md** - Product requirements document in project root (NEVER DELETE)
+- **$SESSION_DIR/TEST_RESULTS.md** - Bug report file (NEVER DELETE)
 - Any file matching \`*tasks*.json\` pattern (NEVER DELETE)
 
 If you delete any of the above files, the entire pipeline will break. Do NOT delete them under any circumstances.
 
 ## DO NOT DELETE OR MODIFY:
-1. The 'plan' directory structure (except for organizing docs as specified below)
+1. The session directory structure: $SESSION_DIR/
 2. The '$TASKS_FILE' file (CRITICAL - this is the pipeline state)
 3. README.md and any readme-adjacent files (CONTRIBUTING.md, LICENSE, etc.)
 
 ## DOCUMENTATION ORGANIZATION:
-First, ensure \`plan/docs\` exists: \`mkdir -p plan/docs\`
+First, ensure session docs directory exists: \`mkdir -p $SESSION_DIR/docs\`
 
-Then, MOVE (not delete) any markdown documentation files you created during implementation to \`plan/docs/\`:
+Then, MOVE (not delete) any markdown documentation files you created during implementation to \`$SESSION_DIR/docs/\`:
 - Research notes, design docs, architecture documentation
 - Implementation notes or technical writeups
 - Reference documentation or guides
@@ -871,9 +1147,13 @@ Then, MOVE (not delete) any markdown documentation files you created during impl
 ## KEEP IN ROOT:
 Only these types of files should remain in the project root:
 - README.md and readme-adjacent files (CONTRIBUTING.md, LICENSE, etc.)
-- PRD.md and any other files that are already committed into the repository.
+- PRD.md (the human-edited source document)
 - Core config files (package.json, tsconfig.json, etc.)
 - Build and script files
+
+**IMPORTANT**: Any files that are ALREADY COMMITTED into the repository must NOT be deleted.
+Run \`git ls-files\` to see what's tracked. If a file is tracked by git, DO NOT DELETE IT.
+Only delete files that are untracked AND clearly temporary/scratch files.
 
 ## DELETE OR GITIGNORE:
 We are preparing to commit. Ensure the repo is clean.
@@ -891,6 +1171,127 @@ We are preparing to commit. Ensure the repo is clean.
    - Any other generated files that should NOT be committed
 
 Be selective - keep the root clean and organized.
+EOF
+
+# --- Delta Operation Prompts ---
+
+read -r -d '' DELTA_PRD_GENERATION_PROMPT <<EOF
+# Generate Delta PRD from Changes
+
+You are analyzing changes between two versions of a PRD to create a focused delta PRD.
+
+## Previous PRD (Completed Session):
+\$(cat "$PREV_SESSION_DIR/prd_snapshot.md")
+
+## Current PRD:
+\$(cat "$PRD_FILE")
+
+## Previous Session's Completed Tasks:
+\$(cat "$PREV_SESSION_DIR/tasks.json")
+
+## Previous Session's Architecture Research:
+Check $PREV_SESSION_DIR/architecture/ for existing research that may still apply.
+
+## Instructions:
+1. **DIFF ANALYSIS**: Identify what changed between the two PRD versions
+2. **SCOPE DELTA**: Create a new PRD focusing ONLY on:
+   - New features/requirements added
+   - Modified requirements (note what changed from original)
+   - Removed requirements (note for awareness, but don't create tasks to implement)
+3. **REFERENCE COMPLETED WORK**: The previous session implemented the original PRD.
+   - Reference existing implementations rather than re-implementing
+   - If a modification affects completed work, note which files/functions need updates
+4. **LEVERAGE PRIOR RESEARCH**: Check $PREV_SESSION_DIR/architecture/ for research that applies
+   - Don't duplicate research that's already been done
+   - Reference it directly in your delta PRD
+5. **OUTPUT**: Write the delta PRD to \`$SESSION_DIR/delta_prd.md\`
+
+The delta PRD should be self-contained but reference the previous session's work.
+It will be used as input to the task breakdown process for this delta session.
+EOF
+
+read -r -d '' TASK_UPDATE_PROMPT <<EOF
+# Update Tasks for PRD Changes (Mid-Session Integration)
+
+The PRD has changed while implementation is in progress. You need to update the task breakdown
+to incorporate these changes without losing progress on work already completed.
+
+## Original PRD Snapshot (from session start):
+\$(cat "$SESSION_DIR/prd_snapshot.md")
+
+## Updated PRD (current):
+\$(cat "$PRD_FILE")
+
+## Current Tasks State:
+\$(cat "$TASKS_FILE")
+
+## Instructions:
+
+### 1. IDENTIFY CHANGES
+Analyze the diff between the original and updated PRD:
+- What's new? (entirely new requirements)
+- What's modified? (changed requirements)
+- What's removed? (deleted requirements)
+
+### 2. IMPACT ANALYSIS
+For each change, determine which existing tasks are affected:
+- Tasks for removed requirements → Mark as "Obsolete"
+- Tasks for modified requirements → Update description, potentially add subtasks
+- New requirements → Add new tasks
+
+### 3. PRIORITIZE UPDATES TO COMPLETED ITEMS
+**CRITICAL**: If changes affect already-COMPLETED tasks:
+- These get HIGHEST priority for re-implementation
+- Add new subtasks under the completed task with status "Planned"
+- Add a note in the task description: "UPDATE REQUIRED: [brief description]"
+- The completed parent task keeps its status, but new subtasks are created
+
+### 4. UPDATE TASK HIERARCHY
+Modify \`$TASKS_FILE\` following these rules:
+- **Preserve status** of unaffected tasks (do NOT reset completed work)
+- **Add new phases/milestones/tasks/subtasks** for new requirements
+- **Update descriptions** for modified requirements
+- **Mark obsolete** tasks for removed requirements (status: "Obsolete")
+
+### 5. MAINTAIN COHERENCE
+Ensure the updated task hierarchy still makes sense:
+- Dependencies should still be valid
+- Context_scope should reference correct prior subtasks
+- New tasks should integrate logically with existing structure
+
+## Output
+
+Update \`$TASKS_FILE\` in place. Use the same JSON structure as the existing file.
+
+## JSON Schema Reference
+The file must maintain this structure:
+\`\`\`json
+{
+  "backlog": [
+    {
+      "type": "Phase",
+      "id": "P[#]",
+      "title": "...",
+      "status": "Planned | Researching | Ready | Implementing | Complete | Failed | Obsolete",
+      ...
+    }
+  ]
+}
+\`\`\`
+EOF
+
+read -r -d '' PREVIOUS_SESSION_CONTEXT_PROMPT <<EOF
+### PREVIOUS SESSION AWARENESS
+**CRITICAL**: Documentation from previous sessions exists and takes PRIORITY over web searches.
+
+Previous session directory: $PREV_SESSION_DIR
+
+When researching for this delta session:
+1. **FIRST** check \`$PREV_SESSION_DIR/architecture/\` for existing research
+2. **FIRST** check \`$PREV_SESSION_DIR/docs/\` for implementation notes
+3. Reference completed work from previous sessions instead of re-researching
+4. Build upon existing patterns and decisions
+5. Only do web searches for genuinely NEW topics not covered in prior sessions
 EOF
 
 read -r -d '' VALIDATION_PROMPT <<EOF
@@ -1457,7 +1858,7 @@ execute_item() {
     if [[ "$PARALLEL_RESEARCH" == "true" ]]; then
         if get_next_item $phase_num $ms_num $task_num $subtask_num; then
             local next_id=$(generate_id $NEXT_PHASE $NEXT_MS $NEXT_TASK $NEXT_SUBTASK)
-            local next_dirname="$PLAN_DIR/$(generate_dirname $NEXT_PHASE $NEXT_MS $NEXT_TASK $NEXT_SUBTASK)"
+            local next_dirname="$SESSION_DIR/$(generate_dirname $NEXT_PHASE $NEXT_MS $NEXT_TASK $NEXT_SUBTASK)"
             # Pass current item as previous context so next item's research can reference it as a contract
             start_background_research "$next_id" "$next_dirname" $NEXT_PHASE $NEXT_MS $NEXT_TASK $NEXT_SUBTASK "$id" "$dirname"
         fi
@@ -1606,10 +2007,51 @@ if [[ "$ONLY_BUG_HUNT" == "true" ]]; then
 
 elif [[ "$ONLY_VALIDATE" == "false" ]]; then
 
+# Handle delta session: generate delta PRD first
+if [[ "$CREATE_DELTA" == "true" && -n "$PREV_SESSION_DIR" ]]; then
+    print -P "%F{magenta}[DELTA]%f Generating delta PRD from changes..."
+    print -P "%F{cyan}[DELTA]%f Previous session: $(basename "$PREV_SESSION_DIR")"
+
+    # Inject previous session context into the breakdown prompts
+    DELTA_CONTEXT="
+## PREVIOUS SESSION CONTEXT
+Previous session directory: $PREV_SESSION_DIR
+- Check $PREV_SESSION_DIR/architecture/ for existing research (PRIORITY over web searches)
+- Check $PREV_SESSION_DIR/docs/ for implementation notes
+- Reference completed work rather than re-researching
+"
+
+    # Run delta PRD generation
+    run_with_retry $BREAKDOWN_AGENT -p "$DELTA_PRD_GENERATION_PROMPT
+
+$PREVIOUS_SESSION_CONTEXT_PROMPT"
+
+    if [[ -f "$SESSION_DIR/delta_prd.md" ]]; then
+        print -P "%F{green}[DELTA]%f Delta PRD generated: $SESSION_DIR/delta_prd.md"
+        # Use delta PRD as input for task breakdown
+        PRD_CONTENT=$(cat "$SESSION_DIR/delta_prd.md")
+    else
+        print -P "%F{yellow}[DELTA]%f Delta PRD not generated. Using full PRD for breakdown."
+    fi
+fi
+
+# Handle mid-session integration: update existing tasks
+if [[ "$INTEGRATE_CHANGES" == "true" && -f "$TASKS_FILE" ]]; then
+    print -P "%F{magenta}[UPDATE]%f Integrating PRD changes into existing tasks..."
+
+    run_with_retry $AGENT -p "$TASK_UPDATE_PROMPT"
+
+    print -P "%F{green}[UPDATE]%f Task hierarchy updated with PRD changes."
+
+    # Commit the updated tasks
+    git add "$TASKS_FILE"
+    git commit -m "Update tasks for PRD changes (mid-session integration)" 2>/dev/null || true
+fi
+
 # A. Task Breakdown (Only run if tasks.json is missing)
 if [[ ! -f "$TASKS_FILE" ]]; then
     print -P "%F{magenta}[PHASE 0]%f Generating breakdown..."
-    mkdir -p "$PLAN_DIR/architecture"
+    mkdir -p "$SESSION_DIR/architecture"
     run_with_retry $BREAKDOWN_AGENT --system-prompt="$TASK_BREAKDOWN_SYSTEM_PROMPT" -p "$TASK_BREAKDOWN_PROMPT"
 
     # If file still doesn't exist, demand the agent write it
@@ -1627,7 +2069,7 @@ if [[ ! -f "$TASKS_FILE" ]]; then
 
         # Commit the task breakdown
         print -P "%F{blue}[GIT]%f Committing task breakdown..."
-        git add "$TASKS_FILE" "$PLAN_DIR"
+        git add "$TASKS_FILE" "$SESSION_DIR"
         git commit -m "Add task breakdown and architecture research" 2>/dev/null || true
     fi
 fi
@@ -1675,7 +2117,7 @@ for (( phase_idx=0; phase_idx<$total_phases; phase_idx++ )); do
     # For phase scope, process and continue
     if [[ $SCOPE == "phase" ]]; then
         ID=$(generate_id $PHASE_NUM 1 1 1)
-        DIRNAME="$PLAN_DIR/$(generate_dirname $PHASE_NUM 1 1 1)"
+        DIRNAME="$SESSION_DIR/$(generate_dirname $PHASE_NUM 1 1 1)"
         execute_item "$ID" "$DIRNAME" $PHASE_NUM 1 1 1
         continue
     fi
@@ -1700,7 +2142,7 @@ for (( phase_idx=0; phase_idx<$total_phases; phase_idx++ )); do
         # For milestone scope, process and continue
         if [[ $SCOPE == "milestone" ]]; then
             ID=$(generate_id $PHASE_NUM $MS_NUM 1 1)
-            DIRNAME="$PLAN_DIR/$(generate_dirname $PHASE_NUM $MS_NUM 1 1)"
+            DIRNAME="$SESSION_DIR/$(generate_dirname $PHASE_NUM $MS_NUM 1 1)"
             execute_item "$ID" "$DIRNAME" $PHASE_NUM $MS_NUM 1 1
             continue
         fi
@@ -1726,7 +2168,7 @@ for (( phase_idx=0; phase_idx<$total_phases; phase_idx++ )); do
             # For task scope, process and continue
             if [[ $SCOPE == "task" ]]; then
                 ID=$(generate_id $PHASE_NUM $MS_NUM $TASK_NUM 1)
-                DIRNAME="$PLAN_DIR/$(generate_dirname $PHASE_NUM $MS_NUM $TASK_NUM 1)"
+                DIRNAME="$SESSION_DIR/$(generate_dirname $PHASE_NUM $MS_NUM $TASK_NUM 1)"
                 execute_item "$ID" "$DIRNAME" $PHASE_NUM $MS_NUM $TASK_NUM 1
                 continue
             fi
@@ -1750,7 +2192,7 @@ for (( phase_idx=0; phase_idx<$total_phases; phase_idx++ )); do
                 fi
 
 ID=$(generate_id $PHASE_NUM $MS_NUM $TASK_NUM $SUBTASK_NUM)
-                DIRNAME="$PLAN_DIR/$(generate_dirname $PHASE_NUM $MS_NUM $TASK_NUM $SUBTASK_NUM)"
+                DIRNAME="$SESSION_DIR/$(generate_dirname $PHASE_NUM $MS_NUM $TASK_NUM $SUBTASK_NUM)"
                 execute_item "$ID" "$DIRNAME" $PHASE_NUM $MS_NUM $TASK_NUM $SUBTASK_NUM
             done
         done
@@ -1889,7 +2331,7 @@ if [[ "$SKIP_BUG_FINDING" == "false" ]]; then
         TASKS_FILE="$BUGFIX_TASKS_FILE" \
         SCOPE="$BUGFIX_SCOPE" \
         AGENT="$AGENT" \
-        PLAN_DIR="${PLAN_DIR}/bugfix" \
+        PLAN_DIR="${SESSION_DIR}/bugfix" \
         "$0"
 
         # Check if bugfix pipeline succeeded
@@ -1902,7 +2344,7 @@ if [[ "$SKIP_BUG_FINDING" == "false" ]]; then
         print -P "%F{green}[CLEANUP]%f Bug fix pipeline completed. Cleaning up for next iteration..."
         rm -f "$BUG_RESULTS_FILE" 2>/dev/null
         rm -f "$BUGFIX_TASKS_FILE" 2>/dev/null
-        rm -rf "${PLAN_DIR}/bugfix" 2>/dev/null
+        rm -rf "${SESSION_DIR}/bugfix" 2>/dev/null
 
         ((BUG_HUNT_ITERATION++))
         print -P "%F{cyan}[BUG HUNT]%f Re-running bug discovery to verify fixes..."
@@ -1911,4 +2353,42 @@ else
     print -P "%F{cyan}[CONFIG]%f Bug finding skipped (SKIP_BUG_FINDING=true)"
 fi
 
-print -P "%F{green}[SUCCESS]%f Workflow completed."
+# --- Session Flow Logic ---
+# Check if we should continue to next session or process queued delta
+
+if [[ "$SINGLE_SESSION" == "false" && -n "$SESSION_DIR" ]]; then
+    # Check for queued delta from earlier in this run
+    if [[ -f "$SESSION_DIR/.pending_delta_hash" ]]; then
+        PENDING_HASH=$(cat "$SESSION_DIR/.pending_delta_hash")
+        CURRENT_HASH=$(hash_prd_content "$PRD_FILE")
+
+        if [[ "$PENDING_HASH" == "$CURRENT_HASH" ]]; then
+            print -P "%F{cyan}[SESSION]%f Processing queued delta session..."
+            rm "$SESSION_DIR/.pending_delta_hash"
+
+            # Create new delta session
+            PREV_SESSION_DIR="$SESSION_DIR"
+            NEW_SESSION_NUM=$((CURRENT_SESSION_NUM + 1))
+            NEW_SESSION_DIR=$(create_session $NEW_SESSION_NUM "$CURRENT_HASH")
+            echo "$CURRENT_SESSION_NUM" > "$NEW_SESSION_DIR/delta_from.txt"
+            cp "$PRD_FILE" "$NEW_SESSION_DIR/prd_snapshot.md"
+
+            print -P "%F{green}[SESSION]%f Created delta session: $(basename "$NEW_SESSION_DIR")"
+            print -P "%F{cyan}[SESSION]%f Re-running pipeline for delta session..."
+
+            # Re-exec to process the new session
+            exec "$0" "$@"
+        fi
+    fi
+
+    # Check if PRD changed during execution
+    FINAL_HASH=$(hash_prd_content "$PRD_FILE")
+    SESSION_HASH=$(get_session_hash "$SESSION_DIR")
+
+    if [[ "$FINAL_HASH" != "$SESSION_HASH" ]]; then
+        print -P "%F{yellow}[SESSION]%f PRD changed during execution."
+        print -P "%F{cyan}[SESSION]%f Run again to process changes as a new delta session."
+    fi
+fi
+
+print -P "%F{green}[SUCCESS]%f Workflow completed for session: $(basename "$SESSION_DIR")"
