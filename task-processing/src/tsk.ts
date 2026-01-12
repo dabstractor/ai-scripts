@@ -575,7 +575,7 @@ function main(): void {
     .argument('<task-id>', 'Task ID (e.g., P1.M1.T1.S1 or p1m1t1s1)')
     .argument('<status>', 'New status (fuzzy matched, e.g., "comp" -> Complete)')
     .argument('[json-file]', 'JSON file containing tasks (default: tasks.json)')
-    .action((taskId, statusInput, jsonFile, cmd) => {
+    .action((taskId, statusInput, jsonFile, options, cmd) => {
       try {
         const globalOptions = cmd.parent ? cmd.parent.opts() : {};
         const targetFile = resolveTargetFile(jsonFile, globalOptions);

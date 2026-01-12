@@ -87,7 +87,8 @@ tsk_cmd() {
 
 # Auto-resume logic
 if [[ "$MANUAL_START" == "false" && -f "$TASKS_FILE" ]]; then
-    NEXT_ITEM=$(tsk_cmd next -s "$SCOPE" 2>/dev/null)
+    # Note: -s must come BEFORE the subcommand for commander.js to parse it as a global option
+    NEXT_ITEM=$(tsk -f "$TASKS_FILE" -s "$SCOPE" next 2>/dev/null)
     if [[ -n "$NEXT_ITEM" ]]; then
         print -P "%F{cyan}[RESUME]%f Auto-resuming from: %F{yellow}$NEXT_ITEM%f"
 
@@ -1829,7 +1830,7 @@ rm -f "./validate.sh" "./validation_report.md" 2>/dev/null
 
 # Mark final task as complete before committing
 print -P "%F{blue}[STATUS]%f Marking final task as complete..."
-FINAL_TASK=$(tsk_cmd next -s "$SCOPE" 2>/dev/null)
+FINAL_TASK=$(tsk -f "$TASKS_FILE" -s "$SCOPE" next 2>/dev/null)
 if [[ -n "$FINAL_TASK" ]]; then
     run_with_retry tsk_cmd update "$FINAL_TASK" Complete
 fi
