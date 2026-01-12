@@ -368,21 +368,18 @@ if [[ "$ONLY_BUG_HUNT" == "false" && "$SKIP_BUG_FINDING" == "false" && -n "$SESS
 
             case "$choice" in
                 2)
-                    print -P "%F{cyan}[ARCHIVE]%f Archiving incomplete bug fix artifacts..."
+                    print -P "%F{cyan}[CLEANUP]%f Moving artifacts to session directory..."
                     # Try to find the latest bugfix session to store artifacts in
                     LATEST_BUG_SESSION=$(find "${SESSION_DIR}/bugfix" -maxdepth 1 -type d -name '[0-9]*_*' 2>/dev/null | sort -n | tail -1)
 
                     if [[ -n "$LATEST_BUG_SESSION" ]]; then
-                        mv "$BUG_RESULTS_FILE" "$LATEST_BUG_SESSION/bug_report_interrupted.md" 2>/dev/null
-                        mv "$BUGFIX_TASKS_FILE" "$LATEST_BUG_SESSION/tasks_interrupted.json" 2>/dev/null
-                        print -P "%F{cyan}[INFO]%f Archived to $(basename "$LATEST_BUG_SESSION")"
+                        mv "$BUG_RESULTS_FILE" "$LATEST_BUG_SESSION/" 2>/dev/null
+                        mv "$BUGFIX_TASKS_FILE" "$LATEST_BUG_SESSION/" 2>/dev/null
+                        print -P "%F{cyan}[INFO]%f Artifacts moved to $(basename "$LATEST_BUG_SESSION")"
                     else
-                        # No session found, create an archive dir
-                        ARCHIVE_DIR="${SESSION_DIR}/bugfix/archive_$(date +%s)"
-                        mkdir -p "$ARCHIVE_DIR"
-                        mv "$BUG_RESULTS_FILE" "$ARCHIVE_DIR/" 2>/dev/null
-                        mv "$BUGFIX_TASKS_FILE" "$ARCHIVE_DIR/" 2>/dev/null
-                        print -P "%F{cyan}[INFO]%f Archived to $(basename "$ARCHIVE_DIR")"
+                        # If no session dir exists (weird), just delete the triggers so we can start fresh
+                        rm -f "$BUG_RESULTS_FILE" 2>/dev/null
+                        rm -f "$BUGFIX_TASKS_FILE" 2>/dev/null
                     fi
                     print -P "%F{cyan}[INFO]%f Starting fresh bug hunt..."
                     ;;
@@ -413,21 +410,18 @@ if [[ "$ONLY_BUG_HUNT" == "false" && "$SKIP_BUG_FINDING" == "false" && -n "$SESS
 
             case "$choice" in
                 2)
-                    print -P "%F{cyan}[ARCHIVE]%f Archiving incomplete bug fix artifacts..."
+                    print -P "%F{cyan}[CLEANUP]%f Moving artifacts to session directory..."
                     # Try to find the latest bugfix session to store artifacts in
                     LATEST_BUG_SESSION=$(find "${SESSION_DIR}/bugfix" -maxdepth 1 -type d -name '[0-9]*_*' 2>/dev/null | sort -n | tail -1)
 
                     if [[ -n "$LATEST_BUG_SESSION" ]]; then
-                        mv "$BUG_RESULTS_FILE" "$LATEST_BUG_SESSION/bug_report_interrupted.md" 2>/dev/null
-                        mv "$BUGFIX_TASKS_FILE" "$LATEST_BUG_SESSION/tasks_interrupted.json" 2>/dev/null
-                        print -P "%F{cyan}[INFO]%f Archived to $(basename "$LATEST_BUG_SESSION")"
+                        mv "$BUG_RESULTS_FILE" "$LATEST_BUG_SESSION/" 2>/dev/null
+                        mv "$BUGFIX_TASKS_FILE" "$LATEST_BUG_SESSION/" 2>/dev/null
+                        print -P "%F{cyan}[INFO]%f Artifacts moved to $(basename "$LATEST_BUG_SESSION")"
                     else
-                        # No session found, create an archive dir
-                        ARCHIVE_DIR="${SESSION_DIR}/bugfix/archive_$(date +%s)"
-                        mkdir -p "$ARCHIVE_DIR"
-                        mv "$BUG_RESULTS_FILE" "$ARCHIVE_DIR/" 2>/dev/null
-                        mv "$BUGFIX_TASKS_FILE" "$ARCHIVE_DIR/" 2>/dev/null
-                        print -P "%F{cyan}[INFO]%f Archived to $(basename "$ARCHIVE_DIR")"
+                        # If no session dir exists (weird), just delete the triggers so we can start fresh
+                        rm -f "$BUG_RESULTS_FILE" 2>/dev/null
+                        rm -f "$BUGFIX_TASKS_FILE" 2>/dev/null
                     fi
                     print -P "%F{cyan}[INFO]%f Starting fresh bug hunt..."
                     ;;
@@ -2458,15 +2452,15 @@ if [[ "$SKIP_BUG_FINDING" == "false" ]]; then
             break
         fi
 
-        # Cleanup after successful bugfix - archive artifacts and clean parent for next iteration
-        print -P "%F{green}[CLEANUP]%f Bug fix pipeline completed. Archiving artifacts..."
+        # Cleanup after successful bugfix - move artifacts to session directory
+        print -P "%F{green}[CLEANUP]%f Bug fix pipeline completed. Moving artifacts..."
 
         # Archive artifacts to the bugfix session
         LATEST_BUG_SESSION=$(find "${SESSION_DIR}/bugfix" -maxdepth 1 -type d -name '[0-9]*_*' 2>/dev/null | sort -n | tail -1)
         if [[ -n "$LATEST_BUG_SESSION" ]]; then
-             mv "$BUG_RESULTS_FILE" "$LATEST_BUG_SESSION/bug_report.md" 2>/dev/null
-             mv "$BUGFIX_TASKS_FILE" "$LATEST_BUG_SESSION/tasks.json" 2>/dev/null
-             print -P "%F{cyan}[INFO]%f Artifacts archived to $(basename "$LATEST_BUG_SESSION")"
+             mv "$BUG_RESULTS_FILE" "$LATEST_BUG_SESSION/" 2>/dev/null
+             mv "$BUGFIX_TASKS_FILE" "$LATEST_BUG_SESSION/" 2>/dev/null
+             print -P "%F{cyan}[INFO]%f Artifacts moved to $(basename "$LATEST_BUG_SESSION")"
         else
              # Should not happen if bugfix pipeline ran, but fallback
              rm -f "$BUG_RESULTS_FILE" 2>/dev/null
