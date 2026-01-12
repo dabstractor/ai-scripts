@@ -324,14 +324,22 @@ fi
 if [[ "$ONLY_BUG_HUNT" == "false" && "$SKIP_BUG_FINDING" == "false" && -n "$SESSION_DIR" ]]; then
     # Check for bug_hunt_tasks.json (new name)
     if [[ -f "$SESSION_DIR/bug_hunt_tasks.json" ]]; then
-        BUGFIX_TASKS_FILE="$SESSION_DIR/bug_hunt_tasks.json"
-        print -P "%F{yellow}[AUTO-DETECT]%f Found $BUGFIX_TASKS_FILE - resuming bug hunt cycle"
-        ONLY_BUG_HUNT=true
+        if [[ -f "$BUG_RESULTS_FILE" ]]; then
+            BUGFIX_TASKS_FILE="$SESSION_DIR/bug_hunt_tasks.json"
+            print -P "%F{yellow}[AUTO-DETECT]%f Found $BUGFIX_TASKS_FILE - resuming bug hunt cycle"
+            ONLY_BUG_HUNT=true
+        else
+            print -P "%F{yellow}[WARN]%f Found bug hunt tasks but no bug report ($BUG_RESULTS_FILE). Skipping bug hunt resume."
+        fi
     # Check for bug_fix_tasks.json (old name, for backwards compatibility)
     elif [[ -f "$SESSION_DIR/bug_fix_tasks.json" ]]; then
-        BUGFIX_TASKS_FILE="$SESSION_DIR/bug_fix_tasks.json"
-        print -P "%F{yellow}[AUTO-DETECT]%f Found $BUGFIX_TASKS_FILE - resuming bug hunt cycle"
-        ONLY_BUG_HUNT=true
+        if [[ -f "$BUG_RESULTS_FILE" ]]; then
+            BUGFIX_TASKS_FILE="$SESSION_DIR/bug_fix_tasks.json"
+            print -P "%F{yellow}[AUTO-DETECT]%f Found $BUGFIX_TASKS_FILE - resuming bug hunt cycle"
+            ONLY_BUG_HUNT=true
+        else
+            print -P "%F{yellow}[WARN]%f Found bug hunt tasks but no bug report ($BUG_RESULTS_FILE). Skipping bug hunt resume."
+        fi
     # Check for TEST_RESULTS.md (bug report exists but tasks not yet created)
     elif [[ -f "$BUG_RESULTS_FILE" ]]; then
         print -P "%F{yellow}[AUTO-DETECT]%f Found $BUG_RESULTS_FILE - resuming bug hunt cycle"
@@ -2093,6 +2101,13 @@ if [[ ! -f "$TASKS_FILE" ]]; then
     print -P "%F{red}[ERROR]%f Tasks file not found: $TASKS_FILE"
     exit 1
 fi
+
+# Validate SESSION_DIR is set to prevent root directory writes
+if [[ -z "$SESSION_DIR" ]]; then
+    print -P "%F{red}[ERROR]%f SESSION_DIR is not set. PRD file or Session directory missing?"
+    exit 1
+fi
+
 if ! jq empty "$TASKS_FILE" 2>/dev/null; then
     print -P "%F{red}[ERROR]%f Tasks file is not valid JSON: $TASKS_FILE"
     print -P "%F{yellow}[DEBUG]%f First 100 chars: $(head -c 100 "$TASKS_FILE")"
