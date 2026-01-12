@@ -1,155 +1,192 @@
-# Product Requirements Document: Autonomous PRP Development Pipeline
+# Detailed Technical Specification: Autonomous PRP Pipeline
 
-## 1. Executive Summary
-The **PRP (Product Requirement Prompt) Pipeline** is an agentic software development system designed to convert a high-level Product Requirements Document (PRD) into a fully implemented, tested, and polished codebase with minimal human intervention.
+## 1. Introduction
 
-Unlike standard "coding agents" that drift and lose context, this pipeline uses a **structured, phase-based architecture**. It breaks large projects into atomic units, generates highly context-aware "Product Requirement Prompts" (PRPs) for every single task, and enforces rigorous validation loops. It features self-healing capabilities through iterative bug hunting and handles changing requirements via "Delta Sessions."
+This document provides a comprehensive technical specification for reimplementing the Autonomous PRP Development Pipeline. It is derived from a rigorous analysis of the original `run-prd.sh` bash script and its dependencies. This specification captures every logical branch, state transition, and file operation required to replicate the system's behavior in a robust framework (e.g., Python, Rust, Go).
 
-## 2. Core Philosophy & Concepts
+**Reference Materials:**
+*   `PROMPTS.md`: Contains the exact text of all HEREDOC prompts referenced in this spec.
+*   `run-prd.sh`: The reference implementation.
 
-### 2.1 The "PRP" Concept
-The central thesis is that AI fails at complex coding tasks due to context dilution. A **PRP** is a focused, information-dense "micro-PRD" for a single task that includes:
-*   The specific goal.
-*   Curated context (file paths, specific code snippets).
-*   Implementation strategy.
-*   Validation gates (syntax, unit test, integration, manual).
-*   "No Prior Knowledge" guarantee: An agent should need *only* the PRP to succeed.
+## 2. System Architecture & Components
 
-### 2.2 The Session Model
-The system creates an immutable audit trail of development.
-*   **Session:** A directory containing the state of a specific run (tasks, architecture notes, code).
-*   **Delta Logic:** If the master PRD changes, the system does not overwrite the current session. It creates a linked **Delta Session** that focuses only on the differences (new/modified features) while preserving completed work.
+The system is an orchestrated loop that manages project state through immutable "Session" directories.
 
-## 3. System Architecture
+### 2.1 Core Components
+1.  **Session Manager:** Manages the `plan/{sequence}_{hash}/` directory structure, state persistence, and PRD diffing.
+2.  **Task Orchestrator:** Manages the `tasks.json` backlog, state transitions, and dependency resolution.
+3.  **Agent Runtime:** Interfaces with the LLM using specific personas (Architect, Researcher, Coder, QA).
+4.  **Pipeline Controller:** The main execution loop handling arguments, signals, and parallel research.
 
-The new system must implement four distinct processing engines:
+## 3. Detailed Logic Specification
 
-1.  **Session Manager:** Handles state, directory structures (`plan/001_hash`), and PRD diffing.
-2.  **Task Orchestrator:** Manages the JSON backlog, dependency resolution, and status updates (replacing the `tsk` CLI).
-3.  **Agent Runtime:** Interfaces with the LLM to run specific personas (Architect, Researcher, Coder, QA).
-4.  **Pipeline Controller:** The main loop handling the sequence of operations, parallelization, and error recovery.
+### 3.1 Argument Parsing & Configuration
+**Source:** `run-prd.sh` (Lines 26-60)
 
-## 4. User Workflows
+The system must accept the following CLI arguments, with the following precedence and defaults:
 
-### 4.1 Initialization & Breakdown
-1.  **Input:** User provides a `PRD.md`.
-2.  **State Check:** System hashes the PRD. Checks for existing sessions.
-3.  **Architecture Research:** Before planning, an agent explores the codebase to validate feasibility and store findings in `architecture/`.
-4.  **Decomposition:** The **Architect Agent** breaks the PRD down into a strict hierarchy (Phase > Milestone > Task > Subtask) stored in a structured format (e.g., JSON).
+| Flag | Variable | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `-s`, `--scope` | `SCOPE` | `subtask` | Execution scope: `phase` \| `milestone` \| `task` \| `subtask` |
+| `-p`, `--phase` | `START_PHASE` | `1` | Start execution at Phase # |
+| `-m`, `--milestone` | `START_MS` | `1` | Start execution at Milestone # |
+| `-t`, `--task` | `START_TASK` | `1` | Start execution at Task # |
+| `-u`, `--subtask` | `START_SUBTASK` | `1` | Start execution at Subtask # |
+| `-r`, `--parallel-research` | `PARALLEL_RESEARCH` | `false` | Enable background research for Task N+1 |
+| `-v`, `--validate` | `ONLY_VALIDATE` | `false` | Run *only* the validation phase |
+| `--bug-hunt` | `ONLY_BUG_HUNT` | `false` | Run *only* the creative bug hunt loop |
+| `--skip-bug-finding` | `SKIP_BUG_FINDING` | `false` | Skip bug finding after implementation |
+| `--single-session` | `SINGLE_SESSION` | `false` | Disable auto-flow to new Delta Sessions |
+| `--session` | `TARGET_SESSION` | `null` | Manually target a specific session ID (integer) |
 
-### 4.2 The Execution Loop (The "Inner Loop")
-For every item in the backlog (iterating Phase -> Milestone -> Task -> Subtask):
-1.  **Parallel Research (Optional):** While Task $N$ is implementing, the system spins up a background thread to research Task $N+1$.
-2.  **PRP Generation:**
-    *   The **Researcher Agent** analyzes the task, the codebase, and external docs.
-    *   Produces a `PRP.md` file containing the "contract" for the implementation.
-3.  **Implementation:**
-    *   The **Coder Agent** reads the `PRP.md`.
-    *   Executes the plan.
-    *   Must pass 4 levels of "Progressive Validation" defined in the PRP.
-4.  **Cleanup & Commit:**
-    *   Temporary artifacts are removed.
-    *   Documentation is moved to `docs/`.
-    *   State is saved (`tasks.json` updated).
-    *   Git commit is triggered (aliased as `commit-claude`).
+**Logic:**
+*   If any start position flag (`-p`, `-m`, `-t`, `-u`) is provided, `MANUAL_START` must be set to `true`.
+*   Validation: `SCOPE` must be one of `phase`, `milestone`, `task`, `subtask`. Error otherwise.
 
-### 4.3 The "Delta" Workflow (Change Management)
-If the user modifies `PRD.md` mid-project:
-1.  **Detection:** System detects hash mismatch.
-2.  **Delta Session:** Creates a new session directory linked to the previous one.
-3.  **Delta Analysis:** An agent compares Old PRD vs. New PRD.
-4.  **Task Patching:**
-    *   Identifies new requirements -> Adds new tasks.
-    *   Identifies modified requirements -> Marks affected existing tasks for "Update/Re-implementation".
-    *   Identifies removed requirements -> Marks tasks as "Obsolete".
-5.  **Resume:** The pipeline continues execution using the updated backlog.
+### 3.2 Session Management Logic
+**Source:** `run-prd.sh` (Lines 75-321)
 
-### 4.4 The QA & Bug Hunt Loop
-Once all tasks are complete, or if run in `bug-hunt` mode:
-1.  **Validation Scripting:** An agent generates a custom `validate.sh` based on the PRD requirements and codebase tools.
-2.  **Creative Bug Hunt:** The **QA Agent** (Adversarial Persona) creates a `TEST_RESULTS.md` report. It looks for logic gaps, not just failing tests.
-3.  **The Fix Cycle:**
-    *   If critical/major bugs are found, a "Bug Fix" sub-pipeline starts.
-    *   It treats the `TEST_RESULTS.md` as a mini-PRD.
-    *   It loops (Fix -> Re-test) until the QA Agent reports no issues.
+The system operates on **Sessions**. A Session is a directory containing the immutable state of a run.
 
-## 5. Functional Requirements
+**Directory Structure:**
+```
+project_root/
+├── PRD.md                 # The master PRD (user editable)
+└── plan/                  # The Session Container
+    ├── 001_abc123.../     # Session 1 (Sequence + PRD Hash)
+    │   ├── tasks.json     # The Backlog (Pipeline State)
+    │   ├── prd_snapshot.md # Immutable copy of PRD for this session
+    │   ├── architecture/  # Research findings
+    │   ├── docs/          # Documentation produced by agents
+    │   └── ... (Task dirs)
+    ├── 002_def456.../     # Session 2 (Delta Session)
+    │   └── delta_from.txt # Contains "1" (pointer to parent session)
+    └── ...
+```
 
-### 5.1 State & File Management
-*   **Must** maintain a `tasks.json` file as the single source of truth.
-*   **Must** create a `plan/` directory structure: `plan/{sequence}_{hash}/`.
-*   **Must** never delete `tasks.json`, `PRD.md`, or test results during cleanup.
-*   **Must** support "Smart Commit": Automatically staging changes while protecting pipeline state files.
-*   **Must** handle graceful shutdown (finish current task before exiting on SIGINT).
+**Session State Resolution Algorithm:**
+1.  **Calculate Current Hash:** `SHA256(PRD.md)[0:12]`
+2.  **Find Latest Session:** `ls plan/ | sort | tail -1`
+3.  **Determine State:**
+    *   **NO_SESSIONS:** If `plan/` is empty -> Create Session 001.
+    *   **CURRENT_MATCH:** If `LatestHash == CurrentHash`:
+        *   Resume execution in Latest Session.
+    *   **PRD_CHANGED:** If `LatestHash != CurrentHash`:
+        *   If Latest Session is **Complete** (all tasks done):
+            *   Create **Delta Session** (Sequence + 1, New Hash).
+            *   Write `delta_from.txt` pointing to previous sequence.
+        *   If Latest Session is **Incomplete**:
+            *   **Prompt User:** "Integrate changes into current session OR Queue delta?"
+            *   **Integrate:** Update `prd_snapshot.md`, trigger `TASK_UPDATE_PROMPT`.
+            *   **Queue:** Create `.pending_delta_hash` file, finish current session, then auto-create delta.
 
-### 5.2 Agent Capabilities
-*   **Tooling:** Agents must have access to:
-    *   File I/O (Read/Write).
-    *   Shell execution (for running tests/linters).
-    *   Search (Grep/Glob).
-    *   Web Research (for fetching docs).
-*   **Context Management:** The system must inject specific context (Previous session notes, Architecture docs) into agent prompts.
+**Session Completion Logic (`is_session_complete`):**
+Returns `true` ONLY if:
+1.  `tasks.json` exists.
+2.  ALL tasks in `tasks.json` have status "Complete" or "Completed".
+3.  NO bug hunt artifacts exist (`TEST_RESULTS.md`, `bug_hunt_tasks.json`, `bug_fix_tasks.json`).
 
-### 5.3 Task Management
-*   Support status: `Planned`, `Researching`, `Implementing`, `Complete`, `Failed`, `Obsolete`.
-*   Support scopes: User can execute specific scopes (`--scope=milestone`, `--task=3`).
+### 3.3 Task Breakdown Phase (Phase 0)
+**Source:** `run-prd.sh` (Lines 2051-2075)
 
-## 6. Critical Prompts & Personas
+If `tasks.json` does not exist in the Session Directory:
+1.  **Agent Persona:** `TASK_BREAKDOWN_SYSTEM_PROMPT`.
+2.  **Input:** `PRD.md` content.
+3.  **Action:**
+    *   Spawn subagents to research codebase/docs.
+    *   Store findings in `architecture/`.
+    *   Generate JSON backlog.
+4.  **Output:** Write `tasks.json`.
+5.  **Validation:** Verify file existence and valid JSON structure.
+6.  **Commit:** `git add tasks.json && git commit -m "Add task breakdown..."`
 
-The system relies on specific, highly-engineered prompts. These must be preserved in the rewrite.
+### 3.4 The Execution Loop (The "Inner Loop")
+**Source:** `run-prd.sh` (Lines 2104-2200)
 
-### 6.1 Task Breakdown System Prompt
-*   **Role:** Lead Technical Architect.
-*   **Goal:** Decompose PRD into strict JSON.
-*   **Constraint:** "Validate before breaking down." Spawn sub-agents to research before defining tasks.
-*   **Logic:** Implicit TDD (tests are part of the subtask, not separate).
+Iterate through the backlog based on the configured `SCOPE`.
+hierarchy: `Phase` -> `Milestone` -> `Task` -> `Subtask`.
 
-### 6.2 PRP Creation Prompt ("The Blueprint")
-*   **Role:** Product Owner / Researcher.
-*   **Goal:** Create a `PRP.md` that ensures "One-pass implementation success."
-*   **Process:**
-    1.  Codebase Analysis (Find similar patterns).
-    2.  Internal/External Research.
-    3.  Template Filling (Context, Implementation Steps, Validation Gates).
-*   **Output:** A markdown file adhering to a strict template.
+**For each Item:**
+1.  **Check Status:** If `Complete` -> Skip.
+2.  **Parallel Research Check:**
+    *   If `PARALLEL_RESEARCH=true`, identify `NextItem`.
+    *   Spawn background process (thread/async task) to research `NextItem`.
+    *   Pass `CurrentItem` context to `NextItem` researcher (Pre-computation).
+3.  **Wait for Research:** If background research was running for `CurrentItem`, wait for it to finish.
+4.  **PRP Generation (If not exists):**
+    *   **Prompt:** `PRP_CREATE_PROMPT`.
+    *   **Context:** Item Title, Description, Architecture notes.
+    *   **Output:** Write `PRP.md` in item directory (e.g., `P1M1T1/PRP.md`).
+    *   **Status Update:** Set status to `Researching`.
+5.  **Implementation:**
+    *   **Status Update:** Set status to `Implementing`.
+    *   **Prompt:** `PRP_EXECUTE_PROMPT`.
+    *   **Action:** Agent reads `PRP.md`, implements code, runs validation.
+    *   **Loop:** Fix/Retry until validation passes.
+6.  **Completion:**
+    *   **Status Update:** Set status to `Complete`.
+    *   **Cleanup:** Run `CLEANUP_PROMPT` (Move docs to `docs/`, remove temps).
+    *   **Smart Commit:** `git add -A`, protect `tasks.json`, `git commit`.
 
-### 6.3 PRP Execution Prompt ("The Builder")
-*   **Role:** Senior Engineer.
-*   **Goal:** Execute the PRP contract.
-*   **Logic:**
-    *   **CRITICAL:** Read PRP first.
-    *   **Progressive Validation:** Level 1 (Lint/Type), Level 2 (Unit Test), Level 3 (Integration), Level 4 (Manual/Creative).
-    *   Failure Protocol: Fix and retry until validation passes.
+### 3.5 Parallel Research Logic
+**Source:** `run-prd.sh` (Lines 1630-1713)
 
-### 6.4 Delta PRD Generation Prompt
-*   **Role:** Change Manager.
-*   **Input:** Old PRD, New PRD, Completed Tasks.
-*   **Goal:** Generate a "Delta PRD" focusing *only* on the diffs, referencing existing implementations to avoid work duplication.
+*   **Trigger:** Before starting implementation of Item N.
+*   **Target:** Item N+1.
+*   **Context Passing:** The researcher for N+1 receives a warning: "Item N is currently being implemented. Treat its PRP as a CONTRACT."
+*   **Locking:** Use PIDs or Lockfiles to ensure the main loop waits for research to finish before starting implementation of N+1.
 
-### 6.5 Creative Bug Finding Prompt
-*   **Role:** Adversarial QA Engineer.
-*   **Input:** PRD, Completed Tasks.
-*   **Phases:**
-    1.  Scope Analysis.
-    2.  Creative E2E Testing (Happy path + Edge cases).
-    3.  Adversarial Testing (Unexpected inputs).
-*   **Output:** `TEST_RESULTS.md` (only if bugs exist).
+### 3.6 Signal Handling (Graceful Shutdown)
+**Source:** `run-prd.sh` (Lines 383-415)
 
-## 7. Improvements for the Rewrite
+*   **First SIGINT (Ctrl+C):**
+    *   Set `SHUTDOWN_REQUESTED=true`.
+    *   Log "Graceful shutdown requested. Will exit after current item completes."
+    *   Do NOT kill current agent.
+*   **Second SIGINT:**
+    *   Force Kill immediately (`exit 130`).
+*   **Check Loop:** After every item completion, check `SHUTDOWN_REQUESTED`. If true, exit 0.
 
-While the Bash script is functional, the rewrite in a higher-level language (Python/Go/Rust) must address these limitations:
+### 3.7 The "Smart Commit" Protocol
+**Source:** `run-prd.sh` (Lines 1935-1954)
 
-1.  **Concurrency Control:** The bash script uses background subshells (`&`) which are hard to monitor. The rewrite should use proper async/await patterns or thread pools for "Parallel Research."
-2.  **Structured State:** Replace `jq` parsing with native JSON serialization/deserialization to prevent corruption of `tasks.json`.
-3.  **Observability:** structured logging instead of `print -P`.
-4.  **Tool Abstraction:** Instead of relying on `tsk` CLI, integrate the task management logic directly into the codebase.
-5.  **Error Handling:** Stronger retry logic and exception handling for API calls and tool failures.
+When committing changes, the system must **Protect Critical State**:
+1.  `git add -A` (Stage everything).
+2.  **Safety Check:** If `tasks.json` was deleted/modified destructively, RESTORE it from HEAD before committing.
+3.  **Unstage Future Work:** If Parallel Research created directories for NextItem (`plan/P1M1T2/`), unstage them (`git reset HEAD -- plan/P1M1T2`).
+4.  Commit with AI-generated message (via `commit-claude` alias).
 
-## 8. Development Roadmap (Bootstrap)
+### 3.8 The Bug Hunt Loop
+**Source:** `run-prd.sh` (Lines 2296-2354)
 
-To implement this PRD, the following self-bootstrapping sequence is recommended:
-1.  **Core:** Implement the `Task` and `Session` data structures.
-2.  **Orchestrator:** Implement the logic to iterate through the JSON hierarchy.
-3.  **Prompts:** Port the HEREDOC prompts into a template engine (e.g., Jinja2).
-4.  **Agent Interface:** Build the wrapper to send these prompts to the LLM.
-5.  **CLI:** Build the entry point to trigger the pipeline.
+After all tasks are complete (or if `--bug-hunt` flag used):
+1.  **Validation:** Run `VALIDATION_PROMPT` to generate `validate.sh` and `validation_report.md`.
+2.  **Fix Check:** If report is "DIRTY", spawn Fixer Agent.
+3.  **Creative Hunt Loop:**
+    *   **Prompt:** `BUG_FINDING_PROMPT`.
+    *   **Condition:** Agent writes `TEST_RESULTS.md` ONLY if bugs found.
+    *   **If File Exists:**
+        *   Enter **Bug Fix Mode**:
+        *   Treat `TEST_RESULTS.md` as PRD.
+        *   Create `bug_hunt_tasks.json`.
+        *   Recursively run the pipeline on this new "mini-project".
+        *   On success, delete artifacts and repeat Hunt Loop.
+    *   **If File Missing:** Success. Exit.
+
+## 4. Migration Logic
+**Source:** `migrate-to-sessions.sh`
+
+When starting, if legacy structure is detected (tasks.json in root), the system must:
+1.  Create `plan/001_hash/`.
+2.  Move `tasks.json`, `bug_hunt_tasks.json`, `TEST_RESULTS.md` to session dir.
+3.  Move all folders in `plan/` (architecture, docs, P*) to session dir.
+4.  Update global variables to point to new paths.
+
+## 5. Implementation Roadmap
+
+1.  **Data Models:** Define `Session`, `Task`, `Backlog` structs/classes.
+2.  **State Manager:** Implement `load_session()`, `create_session()`, `save_session()`.
+3.  **Prompt Engine:** Port `PROMPTS.md` to Jinja2 templates.
+4.  **Agent Interface:** Create `Agent` class wrapping the LLM API (supports `run(prompt, context)`).
+5.  **Orchestrator:** Implement the `execute_item()` loop with async research support.
+6.  **CLI:** Implement `argparse`/`clap` logic matching the spec.
