@@ -247,8 +247,15 @@ if [[ -f "$PRD_FILE" ]]; then
             print -P "%F{green}[SESSION]%f Session $(basename "$CURRENT_SESSION_DIR") is complete."
             if [[ "$SINGLE_SESSION" == "true" ]]; then
                 if [[ "$SKIP_BUG_FINDING" == "false" || "$ONLY_BUG_HUNT" == "true" || "$ONLY_VALIDATE" == "true" ]]; then
-                     print -P "%F{cyan}[SESSION]%f Session complete. Proceeding to validation/bug hunt..."
-                     SKIP_EXECUTION_LOOP=true
+                     print -P "%F{cyan}[SESSION]%f Session complete. Ready for validation/bug hunt."
+                     read -q "choice?Start bug hunt / validation? [Y/n] "
+                     print ""
+                     if [[ "$choice" != "n" && "$choice" != "N" ]]; then
+                         SKIP_EXECUTION_LOOP=true
+                     else
+                         print -P "%F{green}[DONE]%f Single-session mode. Exiting."
+                         exit 0
+                     fi
                 else
                     print -P "%F{green}[DONE]%f Single-session mode. Exiting."
                     exit 0
@@ -271,8 +278,16 @@ if [[ -f "$PRD_FILE" ]]; then
                 fi
             else
                 if [[ "$SKIP_BUG_FINDING" == "false" || "$ONLY_BUG_HUNT" == "true" || "$ONLY_VALIDATE" == "true" ]]; then
-                     print -P "%F{cyan}[SESSION]%f Session complete. Proceeding to validation/bug hunt..."
-                     SKIP_EXECUTION_LOOP=true
+                     print -P "%F{cyan}[SESSION]%f Session complete. Ready for validation/bug hunt."
+                     read -q "choice?Start bug hunt / validation? [Y/n] "
+                     print ""
+                     if [[ "$choice" != "n" && "$choice" != "N" ]]; then
+                         SKIP_EXECUTION_LOOP=true
+                     else
+                         print -P "%F{yellow}[SESSION]%f Nothing to do. PRD unchanged and session complete."
+                         print -P "%F{cyan}[INFO]%f Modify PRD.md to create a new delta session, or use --session=N to revisit."
+                         exit 0
+                     fi
                 else
                     print -P "%F{yellow}[SESSION]%f Nothing to do. PRD unchanged and session complete."
                     print -P "%F{cyan}[INFO]%f Modify PRD.md to create a new delta session, or use --session=N to revisit."
@@ -342,8 +357,34 @@ if [[ "$ONLY_BUG_HUNT" == "false" && "$SKIP_BUG_FINDING" == "false" && -n "$SESS
     if [[ -f "$SESSION_DIR/bug_hunt_tasks.json" ]]; then
         if [[ -f "$BUG_RESULTS_FILE" ]]; then
             BUGFIX_TASKS_FILE="$SESSION_DIR/bug_hunt_tasks.json"
-            print -P "%F{yellow}[AUTO-DETECT]%f Found $BUGFIX_TASKS_FILE - resuming bug hunt cycle"
-            ONLY_BUG_HUNT=true
+            print -P "%F{yellow}[AUTO-DETECT]%f Found existing bug fix cycle: $BUGFIX_TASKS_FILE"
+
+            print -P "%F{yellow}[QUESTION]%f How would you like to proceed?"
+            print "  1) Resume incomplete bug fix cycle (Default)"
+            print "  2) Discard artifacts and start new bug hunt"
+            print "  3) Exit"
+            read -q "choice?Select [1/2/3]: "
+            print ""
+
+            case "$choice" in
+                2)
+                    print -P "%F{cyan}[CLEANUP]%f Removing old bug fix artifacts..."
+                    rm -f "$BUG_RESULTS_FILE" 2>/dev/null
+                    rm -f "$BUGFIX_TASKS_FILE" 2>/dev/null
+                    rm -rf "${SESSION_DIR}/bugfix" 2>/dev/null
+                    print -P "%F{cyan}[INFO]%f Artifacts removed. Starting fresh..."
+                    # If we cleaned up, we are NOT in ONLY_BUG_HUNT mode yet.
+                    # We continue execution. If session is complete, it will hit CURRENT_MATCH_COMPLETE -> Prompt -> Start bug hunt.
+                    ;;
+                3)
+                    print -P "%F{green}[DONE]%f Exiting."
+                    exit 0
+                    ;;
+                *)
+                    print -P "%F{cyan}[BUG HUNT]%f Resuming bug fix implementation..."
+                    ONLY_BUG_HUNT=true
+                    ;;
+            esac
         else
             print -P "%F{yellow}[WARN]%f Found bug hunt tasks but no bug report ($BUG_RESULTS_FILE). Skipping bug hunt resume."
         fi
@@ -351,8 +392,32 @@ if [[ "$ONLY_BUG_HUNT" == "false" && "$SKIP_BUG_FINDING" == "false" && -n "$SESS
     elif [[ -f "$SESSION_DIR/bug_fix_tasks.json" ]]; then
         if [[ -f "$BUG_RESULTS_FILE" ]]; then
             BUGFIX_TASKS_FILE="$SESSION_DIR/bug_fix_tasks.json"
-            print -P "%F{yellow}[AUTO-DETECT]%f Found $BUGFIX_TASKS_FILE - resuming bug hunt cycle"
-            ONLY_BUG_HUNT=true
+            print -P "%F{yellow}[AUTO-DETECT]%f Found existing bug fix cycle: $BUGFIX_TASKS_FILE"
+
+            print -P "%F{yellow}[QUESTION]%f How would you like to proceed?"
+            print "  1) Resume incomplete bug fix cycle (Default)"
+            print "  2) Discard artifacts and start new bug hunt"
+            print "  3) Exit"
+            read -q "choice?Select [1/2/3]: "
+            print ""
+
+            case "$choice" in
+                2)
+                    print -P "%F{cyan}[CLEANUP]%f Removing old bug fix artifacts..."
+                    rm -f "$BUG_RESULTS_FILE" 2>/dev/null
+                    rm -f "$BUGFIX_TASKS_FILE" 2>/dev/null
+                    rm -rf "${SESSION_DIR}/bugfix" 2>/dev/null
+                    print -P "%F{cyan}[INFO]%f Artifacts removed. Starting fresh..."
+                    ;;
+                3)
+                    print -P "%F{green}[DONE]%f Exiting."
+                    exit 0
+                    ;;
+                *)
+                    print -P "%F{cyan}[BUG HUNT]%f Resuming bug fix implementation..."
+                    ONLY_BUG_HUNT=true
+                    ;;
+            esac
         else
             print -P "%F{yellow}[WARN]%f Found bug hunt tasks but no bug report ($BUG_RESULTS_FILE). Skipping bug hunt resume."
         fi
