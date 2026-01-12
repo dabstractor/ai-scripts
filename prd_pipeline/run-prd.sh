@@ -1978,7 +1978,7 @@ if [[ "$ONLY_BUG_HUNT" == "true" ]]; then
         TASKS_FILE="$BUGFIX_TASKS_FILE" \
         SCOPE="$BUGFIX_SCOPE" \
         AGENT="$AGENT" \
-        PLAN_DIR="${PLAN_DIR}/bugfix" \
+        PLAN_DIR="${SESSION_DIR}/bugfix" \
         "$0"
 
         # Handle bugfix subprocess result
@@ -1987,7 +1987,7 @@ if [[ "$ONLY_BUG_HUNT" == "true" ]]; then
             print -P "%F{green}[CLEANUP]%f Bug fix implementation completed. Cleaning up..."
             rm -f "$BUG_RESULTS_FILE" 2>/dev/null
             rm -f "$BUGFIX_TASKS_FILE" 2>/dev/null
-            rm -rf "${PLAN_DIR}/bugfix" 2>/dev/null
+            rm -rf "${SESSION_DIR}/bugfix" 2>/dev/null
             # Don't exit - fall through to bug finding loop to verify fixes
         else
             print -P "%F{red}[ERROR]%f Bug fix implementation failed."
