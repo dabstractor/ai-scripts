@@ -188,7 +188,6 @@ determine_session_state() {
 # Bug finding configuration
 BUG_FINDER_AGENT="${BUG_FINDER_AGENT:-glp}"
 BUG_RESULTS_FILE="${BUG_RESULTS_FILE:-TEST_RESULTS.md}"
-BUGFIX_TASKS_FILE="${BUGFIX_TASKS_FILE:-bug_hunt_tasks.json}"
 BUGFIX_SCOPE="${BUGFIX_SCOPE:-subtask}"
 SKIP_BUG_FINDING="${SKIP_BUG_FINDING:-false}"
 
@@ -347,98 +346,13 @@ if [[ -f "$PRD_FILE" ]]; then
         TASKS_FILE="$SESSION_DIR/tasks.json"
     fi
 
-    BUGFIX_TASKS_FILE="$SESSION_DIR/bug_hunt_tasks.json"
     BUG_RESULTS_FILE="$SESSION_DIR/TEST_RESULTS.md"
 fi
 
 # Auto-detect bug hunt cycle: if bug hunt artifacts exist, we're mid-cycle and should resume
 if [[ "$ONLY_BUG_HUNT" == "false" && "$SKIP_BUG_FINDING" == "false" && -n "$SESSION_DIR" ]]; then
-    # Check for bug_hunt_tasks.json (new name)
-    if [[ -f "$SESSION_DIR/bug_hunt_tasks.json" ]]; then
-        if [[ -f "$BUG_RESULTS_FILE" ]]; then
-            BUGFIX_TASKS_FILE="$SESSION_DIR/bug_hunt_tasks.json"
-            print -P "%F{yellow}[AUTO-DETECT]%f Found existing bug fix cycle: $BUGFIX_TASKS_FILE"
-
-            print -P "%F{yellow}[QUESTION]%f How would you like to proceed?"
-            print "  1) Resume incomplete bug fix cycle (Default)"
-            print "  2) Archive artifacts and start new bug hunt"
-            print "  3) Exit"
-            read -q "choice?Select [1/2/3]: "
-            print ""
-
-            case "$choice" in
-                2)
-                    print -P "%F{cyan}[CLEANUP]%f Moving artifacts to session directory..."
-                    # Try to find the latest bugfix session to store artifacts in
-                    LATEST_BUG_SESSION=$(find "${SESSION_DIR}/bugfix" -maxdepth 1 -type d -name '[0-9]*_*' 2>/dev/null | sort -n | tail -1)
-
-                    if [[ -n "$LATEST_BUG_SESSION" ]]; then
-                        mv "$BUG_RESULTS_FILE" "$LATEST_BUG_SESSION/" 2>/dev/null
-                        mv "$BUGFIX_TASKS_FILE" "$LATEST_BUG_SESSION/" 2>/dev/null
-                        print -P "%F{cyan}[INFO]%f Artifacts moved to $(basename "$LATEST_BUG_SESSION")"
-                    else
-                        # If no session dir exists (weird), just delete the triggers so we can start fresh
-                        rm -f "$BUG_RESULTS_FILE" 2>/dev/null
-                        rm -f "$BUGFIX_TASKS_FILE" 2>/dev/null
-                    fi
-                    print -P "%F{cyan}[INFO]%f Starting fresh bug hunt..."
-                    ;;
-                3)
-                    print -P "%F{green}[DONE]%f Exiting."
-                    exit 0
-                    ;;
-                *)
-                    print -P "%F{cyan}[BUG HUNT]%f Resuming bug fix implementation..."
-                    ONLY_BUG_HUNT=true
-                    ;;
-            esac
-        else
-            print -P "%F{yellow}[WARN]%f Found bug hunt tasks but no bug report ($BUG_RESULTS_FILE). Skipping bug hunt resume."
-        fi
-    # Check for bug_fix_tasks.json (old name, for backwards compatibility)
-    elif [[ -f "$SESSION_DIR/bug_fix_tasks.json" ]]; then
-        if [[ -f "$BUG_RESULTS_FILE" ]]; then
-            BUGFIX_TASKS_FILE="$SESSION_DIR/bug_fix_tasks.json"
-            print -P "%F{yellow}[AUTO-DETECT]%f Found existing bug fix cycle: $BUGFIX_TASKS_FILE"
-
-            print -P "%F{yellow}[QUESTION]%f How would you like to proceed?"
-            print "  1) Resume incomplete bug fix cycle (Default)"
-            print "  2) Archive artifacts and start new bug hunt"
-            print "  3) Exit"
-            read -q "choice?Select [1/2/3]: "
-            print ""
-
-            case "$choice" in
-                2)
-                    print -P "%F{cyan}[CLEANUP]%f Moving artifacts to session directory..."
-                    # Try to find the latest bugfix session to store artifacts in
-                    LATEST_BUG_SESSION=$(find "${SESSION_DIR}/bugfix" -maxdepth 1 -type d -name '[0-9]*_*' 2>/dev/null | sort -n | tail -1)
-
-                    if [[ -n "$LATEST_BUG_SESSION" ]]; then
-                        mv "$BUG_RESULTS_FILE" "$LATEST_BUG_SESSION/" 2>/dev/null
-                        mv "$BUGFIX_TASKS_FILE" "$LATEST_BUG_SESSION/" 2>/dev/null
-                        print -P "%F{cyan}[INFO]%f Artifacts moved to $(basename "$LATEST_BUG_SESSION")"
-                    else
-                        # If no session dir exists (weird), just delete the triggers so we can start fresh
-                        rm -f "$BUG_RESULTS_FILE" 2>/dev/null
-                        rm -f "$BUGFIX_TASKS_FILE" 2>/dev/null
-                    fi
-                    print -P "%F{cyan}[INFO]%f Starting fresh bug hunt..."
-                    ;;
-                3)
-                    print -P "%F{green}[DONE]%f Exiting."
-                    exit 0
-                    ;;
-                *)
-                    print -P "%F{cyan}[BUG HUNT]%f Resuming bug fix implementation..."
-                    ONLY_BUG_HUNT=true
-                    ;;
-            esac
-        else
-            print -P "%F{yellow}[WARN]%f Found bug hunt tasks but no bug report ($BUG_RESULTS_FILE). Skipping bug hunt resume."
-        fi
-    # Check for TEST_RESULTS.md (bug report exists but tasks not yet created)
-    elif [[ -f "$BUG_RESULTS_FILE" ]]; then
+    # Check for TEST_RESULTS.md (bug report exists)
+    if [[ -f "$BUG_RESULTS_FILE" ]]; then
         print -P "%F{yellow}[AUTO-DETECT]%f Found $BUG_RESULTS_FILE - resuming bug hunt cycle"
         ONLY_BUG_HUNT=true
     fi
@@ -2065,39 +1979,23 @@ if [[ "$ONLY_BUG_HUNT" == "true" ]]; then
     print -P "%F{cyan}[CONFIG]%f Running in %F{magenta}BUG HUNT ONLY%f mode"
     print -P "%F{cyan}[CONFIG]%f Bug finder agent: %F{yellow}$BUG_FINDER_AGENT%f"
 
-    # Check if we're resuming a bug fix cycle (bugfix tasks file exists)
-    if [[ -f "$BUGFIX_TASKS_FILE" ]]; then
-        print -P "%F{yellow}[BUG HUNT]%f Existing bug fix tasks found: $BUGFIX_TASKS_FILE"
-        print -P "%F{cyan}[BUG HUNT]%f Resuming bug fix implementation..."
+    # If bug report already exists, skip bug finding and go straight to fix pipeline
+    elif [[ -f "$BUG_RESULTS_FILE" ]]; then
+        print -P "%F{yellow}[BUG HUNT]%f Existing bug report found: $BUG_RESULTS_FILE"
+        print -P "%F{cyan}[BUG HUNT]%f Skipping to bug fix pipeline..."
         # Re-run with bugfix parameters to resume
         SKIP_BUG_FINDING=true \
         PRD_FILE="$BUG_RESULTS_FILE" \
-        TASKS_FILE="$BUGFIX_TASKS_FILE" \
         SCOPE="$BUGFIX_SCOPE" \
         AGENT="$AGENT" \
-        PLAN_DIR="${SESSION_DIR}/bugfix" \
+        PLAN_DIR="${PLAN_DIR}/bugfix" \
         "$0"
 
         # Handle bugfix subprocess result
         BUGFIX_EXIT_CODE=$?
         if [[ $BUGFIX_EXIT_CODE -eq 0 ]]; then
-            print -P "%F{green}[CLEANUP]%f Bug fix implementation completed. Cleaning up..."
-            rm -f "$BUG_RESULTS_FILE" 2>/dev/null
-            rm -f "$BUGFIX_TASKS_FILE" 2>/dev/null
-            rm -rf "${SESSION_DIR}/bugfix" 2>/dev/null
-            # Don't exit - fall through to bug finding loop to verify fixes
-        else
-            print -P "%F{red}[ERROR]%f Bug fix implementation failed."
-            exit $BUGFIX_EXIT_CODE
-        fi
-    # If bug report already exists, skip bug finding and go straight to fix pipeline
-    elif [[ -f "$BUG_RESULTS_FILE" ]]; then
-        print -P "%F{yellow}[BUG HUNT]%f Existing bug report found: $BUG_RESULTS_FILE"
-        print -P "%F{cyan}[BUG HUNT]%f Skipping to bug fix pipeline..."
-        # Skip to bug finding stage which will detect the file and run fix pipeline
-    else
         # No resume files found - need PRD and tasks to run fresh bug discovery
-        print -P "%F{yellow}[BUG HUNT]%f No existing bug report ($BUG_RESULTS_FILE) or bugfix tasks ($BUGFIX_TASKS_FILE) found."
+        print -P "%F{yellow}[BUG HUNT]%f No existing bug report ($BUG_RESULTS_FILE) found."
         print -P "%F{cyan}[BUG HUNT]%f Will run fresh bug discovery..."
         if [[ ! -f "$PRD_FILE" ]]; then
             print -P "%F{red}[ERROR]%f $PRD_FILE not found. Need PRD to run bug discovery."
@@ -2440,7 +2338,6 @@ if [[ "$SKIP_BUG_FINDING" == "false" ]]; then
         # Re-run the pipeline with bug fixes
         SKIP_BUG_FINDING=true \
         PRD_FILE="$BUG_RESULTS_FILE" \
-        TASKS_FILE="$BUGFIX_TASKS_FILE" \
         SCOPE="$BUGFIX_SCOPE" \
         AGENT="$AGENT" \
         PLAN_DIR="${SESSION_DIR}/bugfix" \
