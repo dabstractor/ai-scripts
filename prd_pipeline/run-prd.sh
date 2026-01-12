@@ -315,7 +315,12 @@ if [[ -f "$PRD_FILE" ]]; then
 
     # Update path variables to use session directory
     SESSION_DIR="$CURRENT_SESSION_DIR"
-    TASKS_FILE="$SESSION_DIR/tasks.json"
+
+    # Only update TASKS_FILE if it's the default "tasks.json", otherwise respect the passed file (e.g. for bugfixes)
+    if [[ "$TASKS_FILE" == "tasks.json" ]]; then
+        TASKS_FILE="$SESSION_DIR/tasks.json"
+    fi
+
     BUGFIX_TASKS_FILE="$SESSION_DIR/bug_hunt_tasks.json"
     BUG_RESULTS_FILE="$SESSION_DIR/TEST_RESULTS.md"
 fi
