@@ -10,7 +10,70 @@ unalias() { builtin unalias "$@" 2>/dev/null || true }
 # Ensure aliases are expanded in the script
 setopt aliases
 
-# --- 2. Parameter Parsing ---
+# --- 2. Subcommands ---
+
+# Handle 'task' subcommand: prd task [args...] -> tsk -f <current_tasks_file> [args...]
+if [[ "$1" == "task" ]]; then
+    shift  # Remove 'task' from arguments
+
+    # Check for -f override - if provided, pass through directly to tsk
+    if [[ "$1" == "-f" ]]; then
+        exec tsk "$@"
+    fi
+
+    # Configuration
+    PLAN_DIR="${PLAN_DIR:-plan}"
+
+    # Find the latest session
+    get_latest_session() {
+        find "$PLAN_DIR" -maxdepth 1 -type d -name '[0-9]*_*' 2>/dev/null | sort -n | tail -1
+    }
+
+    is_tasks_incomplete() {
+        local file=$1
+        [[ ! -f "$file" ]] && return 1
+        local incomplete=$(jq '[.. | objects | select(.status? and .status != "Complete" and .status != "Completed")] | length' "$file" 2>/dev/null)
+        [[ "$incomplete" != "0" ]]
+    }
+
+    SESSION_DIR=$(get_latest_session)
+    if [[ -z "$SESSION_DIR" ]]; then
+        print -P "%F{red}[ERROR]%f No session found in $PLAN_DIR"
+        exit 1
+    fi
+
+    TASKS_FILE=""
+
+    # Priority 1: Check for incomplete bugfix session (new format - preferred)
+    if [[ -d "$SESSION_DIR/bugfix" ]]; then
+        LATEST_BUGFIX=$(find "$SESSION_DIR/bugfix" -maxdepth 1 -type d -name '[0-9]*_*' 2>/dev/null | sort -n | tail -1)
+        if [[ -n "$LATEST_BUGFIX" && -f "$LATEST_BUGFIX/tasks.json" ]] && is_tasks_incomplete "$LATEST_BUGFIX/tasks.json"; then
+            TASKS_FILE="$LATEST_BUGFIX/tasks.json"
+            print -P "%F{cyan}[prd task]%f Using bugfix tasks: bugfix/$(basename "$LATEST_BUGFIX")/tasks.json" >&2
+        fi
+    fi
+
+    # Priority 2: Check for bug_hunt_tasks.json at session level (old format - backwards compat)
+    if [[ -z "$TASKS_FILE" && -f "$SESSION_DIR/bug_hunt_tasks.json" ]] && is_tasks_incomplete "$SESSION_DIR/bug_hunt_tasks.json"; then
+        TASKS_FILE="$SESSION_DIR/bug_hunt_tasks.json"
+        print -P "%F{cyan}[prd task]%f Using bug hunt tasks: $(basename "$SESSION_DIR")/bug_hunt_tasks.json" >&2
+    fi
+
+    # Priority 3: Fall back to main session tasks
+    if [[ -z "$TASKS_FILE" ]]; then
+        TASKS_FILE="$SESSION_DIR/tasks.json"
+        if [[ ! -f "$TASKS_FILE" ]]; then
+            print -P "%F{red}[ERROR]%f No tasks.json found in $(basename "$SESSION_DIR")"
+            exit 1
+        fi
+        print -P "%F{cyan}[prd task]%f Using main tasks: $(basename "$SESSION_DIR")/tasks.json" >&2
+    fi
+
+    # Run tsk with the correct tasks file
+    exec tsk -f "$TASKS_FILE" "$@"
+fi
+
+# --- 3. Parameter Parsing ---
 SCOPE="${SCOPE:-subtask}"  # Default to task-level
 START_PHASE=1
 START_MS=1
@@ -72,6 +135,14 @@ TASKS_FILE="${TASKS_FILE:-tasks.json}"
 PRD_FILE="${PRD_FILE:-PRD.md}"
 PLAN_DIR="${PLAN_DIR:-plan}"
 
+# MCP server configuration for PRP creation (web search for research)
+# Only add MCP servers when using glp agent
+if [[ "$AGENT" == "glp" ]]; then
+    PRP_AGENT_MCP_ARGS="--mcp-config=$(mcpp z-ai-web-search-prime)"
+else
+    PRP_AGENT_MCP_ARGS=""
+fi
+
 # --- Session Management Functions ---
 
 # Generate deterministic hash of PRD content
@@ -111,9 +182,9 @@ get_session_dir() {
 # Check if a session is complete
 # Usage: is_session_complete <session_dir>
 # Returns false (1) if:
-#   - tasks.json doesn't exist
-#   - tasks.json has incomplete items
-#   - bug hunt artifacts exist (bug_fix_tasks.json, bug_hunt_tasks.json, TEST_RESULTS.md)
+#   - tasks.json doesn't exist or has incomplete items
+#   - bug_hunt_tasks.json exists with incomplete items
+#   - bugfix sessions exist with incomplete items
 is_session_complete() {
     local session_dir=$1
     local tasks_file="$session_dir/tasks.json"
@@ -123,20 +194,47 @@ is_session_complete() {
     local incomplete=$(jq '[.. | objects | select(.status? and .status != "Complete" and .status != "Completed")] | length' "$tasks_file" 2>/dev/null)
     [[ "$incomplete" != "0" ]] && return 1
 
-    # Check for active bug hunt cycle - if any bug artifacts exist, session is not complete
-    [[ -f "$session_dir/TEST_RESULTS.md" ]] && return 1
-    [[ -f "$session_dir/bug_hunt_tasks.json" ]] && return 1
-    [[ -f "$session_dir/bug_fix_tasks.json" ]] && return 1
+    # Check for incomplete bug_hunt_tasks.json at session level
+    local bug_tasks="$session_dir/bug_hunt_tasks.json"
+    if [[ -f "$bug_tasks" ]]; then
+        incomplete=$(jq '[.. | objects | select(.status? and .status != "Complete" and .status != "Completed")] | length' "$bug_tasks" 2>/dev/null)
+        [[ "$incomplete" != "0" ]] && return 1
+    fi
+
+    # Check for incomplete bugfix sessions (inside session dir)
+    if [[ -d "$session_dir/bugfix" ]]; then
+        local bugfix_session
+        for bugfix_session in "$session_dir/bugfix"/[0-9]*_*(N); do
+            [[ ! -d "$bugfix_session" ]] && continue
+            # Check tasks.json in bugfix session
+            if [[ -f "$bugfix_session/tasks.json" ]]; then
+                incomplete=$(jq '[.. | objects | select(.status? and .status != "Complete" and .status != "Completed")] | length' "$bugfix_session/tasks.json" 2>/dev/null)
+                [[ "$incomplete" != "0" ]] && return 1
+            fi
+            # Check bug_hunt_tasks.json in bugfix session
+            if [[ -f "$bugfix_session/bug_hunt_tasks.json" ]]; then
+                incomplete=$(jq '[.. | objects | select(.status? and .status != "Complete" and .status != "Completed")] | length' "$bugfix_session/bug_hunt_tasks.json" 2>/dev/null)
+                [[ "$incomplete" != "0" ]] && return 1
+            fi
+        done
+    fi
 
     return 0
 }
 
-# Get hash from session directory name
+# Get hash from session's PRD snapshot
 # Usage: get_session_hash <session_dir>
+# Hashes the prd_snapshot.md file directly - the authoritative source of truth
 get_session_hash() {
     local session_dir=$1
-    local dir_basename=$(basename "$session_dir")
-    echo "${dir_basename#*_}"
+    local snapshot="$session_dir/prd_snapshot.md"
+
+    if [[ -f "$snapshot" ]]; then
+        hash_prd_content "$snapshot"
+    else
+        # No snapshot = no hash to compare
+        echo ""
+    fi
 }
 
 # Create new session directory
@@ -204,8 +302,19 @@ QUEUE_DELTA=false
 CREATE_DELTA=false
 SKIP_EXECUTION_LOOP=false
 
+# Bug fix mode: PLAN_DIR is already the session, use it directly
+# This happens during recursive calls for bug fixes
+if [[ "$SKIP_BUG_FINDING" == "true" && -d "$PLAN_DIR" ]]; then
+    SESSION_DIR="$PLAN_DIR"
+    TASKS_FILE="$SESSION_DIR/tasks.json"
+    # Copy PRD to session as prd_snapshot if not already there
+    if [[ -f "$PRD_FILE" && ! -f "$SESSION_DIR/prd_snapshot.md" ]]; then
+        cp "$PRD_FILE" "$SESSION_DIR/prd_snapshot.md"
+    fi
+    print -P "%F{cyan}[BUGFIX]%f Using session: $(basename "$SESSION_DIR")"
+
 # Only resolve sessions if PRD exists (skip for --bug-hunt without PRD)
-if [[ -f "$PRD_FILE" ]]; then
+elif [[ -f "$PRD_FILE" ]]; then
     # Handle manual session selection first
     if [[ -n "$TARGET_SESSION" ]]; then
         TARGET_DIR=$(get_session_dir "$TARGET_SESSION")
@@ -345,16 +454,42 @@ if [[ -f "$PRD_FILE" ]]; then
     if [[ "$TASKS_FILE" == "tasks.json" ]]; then
         TASKS_FILE="$SESSION_DIR/tasks.json"
     fi
-
-    BUG_RESULTS_FILE="$SESSION_DIR/TEST_RESULTS.md"
 fi
 
-# Auto-detect bug hunt cycle: if bug hunt artifacts exist, we're mid-cycle and should resume
+# Auto-detect bug hunt cycle: check for incomplete bug hunt tasks
+# Sets RESUME_BUGFIX_TASKS_FILE if found, so bug hunt section can resume properly
+RESUME_BUGFIX_TASKS_FILE=""
+RESUME_BUGFIX_SESSION=""
+
 if [[ "$ONLY_BUG_HUNT" == "false" && "$SKIP_BUG_FINDING" == "false" && -n "$SESSION_DIR" ]]; then
-    # Check for TEST_RESULTS.md (bug report exists)
-    if [[ -f "$BUG_RESULTS_FILE" ]]; then
-        print -P "%F{yellow}[AUTO-DETECT]%f Found $BUG_RESULTS_FILE - resuming bug hunt cycle"
+    # Helper to check if a tasks file has incomplete items
+    has_incomplete_tasks() {
+        local file=$1
+        [[ ! -f "$file" ]] && return 1
+        local incomplete=$(jq '[.. | objects | select(.status? and .status != "Complete" and .status != "Completed")] | length' "$file" 2>/dev/null)
+        [[ "$incomplete" != "0" ]]
+    }
+
+    # Priority 1: Check for incomplete bugfix sessions (new format - preferred)
+    if [[ -d "$SESSION_DIR/bugfix" ]]; then
+        LATEST_BUGFIX=$(find "$SESSION_DIR/bugfix" -maxdepth 1 -type d -name '[0-9]*_*' 2>/dev/null | sort -n | tail -1)
+        if [[ -n "$LATEST_BUGFIX" && -f "$LATEST_BUGFIX/tasks.json" ]] && has_incomplete_tasks "$LATEST_BUGFIX/tasks.json"; then
+            print -P "%F{yellow}[AUTO-DETECT]%f Found incomplete bugfix session: bugfix/$(basename "$LATEST_BUGFIX")"
+            ONLY_BUG_HUNT=true
+            RESUME_BUGFIX_TASKS_FILE="$LATEST_BUGFIX/tasks.json"
+            RESUME_BUGFIX_SESSION="$LATEST_BUGFIX"
+        fi
+    fi
+
+    # Priority 2: Check for bug_hunt_tasks.json at session level (old format - backwards compat)
+    if [[ "$ONLY_BUG_HUNT" == "false" && -f "$SESSION_DIR/bug_hunt_tasks.json" ]] && has_incomplete_tasks "$SESSION_DIR/bug_hunt_tasks.json"; then
+        print -P "%F{yellow}[AUTO-DETECT]%f Found incomplete bug hunt tasks (legacy): $(basename "$SESSION_DIR")/bug_hunt_tasks.json"
         ONLY_BUG_HUNT=true
+        RESUME_BUGFIX_TASKS_FILE="$SESSION_DIR/bug_hunt_tasks.json"
+        # Find corresponding bugfix session for this old-format bug hunt
+        if [[ -d "$SESSION_DIR/bugfix" ]]; then
+            RESUME_BUGFIX_SESSION=$(find "$SESSION_DIR/bugfix" -maxdepth 1 -type d -name '[0-9]*_*' 2>/dev/null | sort -n | tail -1)
+        fi
     fi
 fi
 
@@ -371,9 +506,14 @@ tsk_cmd() {
 }
 
 # Auto-resume logic
-if [[ "$MANUAL_START" == "false" && -f "$TASKS_FILE" ]]; then
+# Use bug hunt tasks file if resuming a bug fix, otherwise use main tasks
+AUTO_RESUME_TASKS_FILE="$TASKS_FILE"
+if [[ -n "$RESUME_BUGFIX_TASKS_FILE" && -f "$RESUME_BUGFIX_TASKS_FILE" ]]; then
+    AUTO_RESUME_TASKS_FILE="$RESUME_BUGFIX_TASKS_FILE"
+fi
+if [[ "$MANUAL_START" == "false" && -f "$AUTO_RESUME_TASKS_FILE" ]]; then
     # Note: -s must come BEFORE the subcommand for commander.js to parse it as a global option
-    NEXT_ITEM=$(tsk -f "$TASKS_FILE" -s "$SCOPE" next 2>/dev/null)
+    NEXT_ITEM=$(tsk -f "$AUTO_RESUME_TASKS_FILE" -s "$SCOPE" next 2>/dev/null)
     if [[ -n "$NEXT_ITEM" ]]; then
         print -P "%F{cyan}[RESUME]%f Auto-resuming from: %F{yellow}$NEXT_ITEM%f"
 
@@ -1465,7 +1605,7 @@ Think creatively about what could go wrong:
 
 ### Phase 4: Documentation as Bug Report
 
-Write a structured bug report to \`./$BUG_RESULTS_FILE\` that can be used as a PRD for fixes:
+Write a structured bug report to \`\$BUG_RESULTS_FILE\` that can be used as a PRD for fixes:
 
 \`\`\`markdown
 # Bug Fix Requirements
@@ -1517,8 +1657,8 @@ Small improvements or polish items.
 
 **It is IMPORTANT that you follow these rules exactly:**
 
-- **If you find Critical or Major bugs**: You MUST write the bug report to \`./$BUG_RESULTS_FILE\`. It is imperative that actionable bugs are documented.
-- **If you find NO Critical or Major bugs**: Do NOT write any file. Do NOT create \`./$BUG_RESULTS_FILE\`. Leave no trace. The absence of the file signals success.
+- **If you find Critical or Major bugs**: You MUST write the bug report to \`\$BUG_RESULTS_FILE\`. It is imperative that actionable bugs are documented.
+- **If you find NO Critical or Major bugs**: Do NOT write any file. Do NOT create \`\$BUG_RESULTS_FILE\`. Leave no trace. The absence of the file signals success.
 
 This is imperative. The presence or absence of the bug report file controls the entire bugfix pipeline. Writing an empty or "no bugs found" file will cause unnecessary work. Not writing the file when there ARE bugs will cause bugs to be missed.
 EOF
@@ -1693,7 +1833,7 @@ The previous PRP defines what will exist when your item begins implementation.
     # Run research in background subshell
     (
         run_with_retry tsk_cmd update "$id" Researching
-        run_with_retry $AGENT -p "$PRP_CREATE_PROMPT Create a PRP for $(get_scope_name) $id of the PRD. Store it at $dirname/PRP.md.
+        run_with_retry $AGENT $PRP_AGENT_MCP_ARGS -p "$PRP_CREATE_PROMPT Create a PRP for $(get_scope_name) $id of the PRD. Store it at $dirname/PRP.md.
 <item_title>$(get_item_title $phase_num $ms_num $task_num $subtask_num)</item_title>
 <item_description>$(get_item_description $phase_num $ms_num $task_num $subtask_num)</item_description>
 <plan_status>$(tsk_cmd status)</plan_status>$prev_context"
@@ -1864,7 +2004,7 @@ execute_item() {
         run_with_retry tsk_cmd update "$id" Implementing
     else
         run_with_retry tsk_cmd update "$id" Researching
-        run_with_retry $AGENT -p "$PRP_CREATE_PROMPT Create a PRP for $(get_scope_name) $id of the PRD. Store it at $dirname/PRP.md.
+        run_with_retry $AGENT $PRP_AGENT_MCP_ARGS -p "$PRP_CREATE_PROMPT Create a PRP for $(get_scope_name) $id of the PRD. Store it at $dirname/PRP.md.
 <item_title>$(get_item_title $phase_num $ms_num $task_num $subtask_num)</item_title>
 <item_description>$(get_item_description $phase_num $ms_num $task_num $subtask_num)</item_description>
 <plan_status>$(tsk_cmd status)</plan_status>"
@@ -1974,37 +2114,40 @@ smart_commit() {
 
 # --- 5. Main Workflow ---
 
-# Bug Hunt Only Mode - skip everything and go straight to bug finding
+# Bug Hunt Resume Mode - resume incomplete bug fix with existing tasks
+# This runs BEFORE the if/elif to modify variables so main loop runs
+if [[ "$ONLY_BUG_HUNT" == "true" && -n "$RESUME_BUGFIX_TASKS_FILE" ]]; then
+    print -P "%F{cyan}[CONFIG]%f Running in %F{magenta}BUG FIX RESUME%f mode"
+
+    # Set SESSION_DIR to the bugfix session so artifacts go to the right place
+    if [[ -n "$RESUME_BUGFIX_SESSION" ]]; then
+        SESSION_DIR="$RESUME_BUGFIX_SESSION"
+        print -P "%F{cyan}[CONFIG]%f Bugfix session: %F{yellow}$(basename "$RESUME_BUGFIX_SESSION")%f"
+    fi
+
+    # Override TASKS_FILE to use the bug fix tasks
+    TASKS_FILE="$RESUME_BUGFIX_TASKS_FILE"
+    TASKS_CONTENT=$(cat "$TASKS_FILE")
+    print -P "%F{cyan}[CONFIG]%f Tasks file: %F{yellow}$TASKS_FILE%f"
+
+    # Clear ONLY_BUG_HUNT so main execution loop runs
+    ONLY_BUG_HUNT=false
+    SKIP_BUG_FINDING=true  # Don't run bug finding after - we're mid-fix
+fi
+
+# Bug Hunt Only Mode - skip to bug finding stage
 if [[ "$ONLY_BUG_HUNT" == "true" ]]; then
     print -P "%F{cyan}[CONFIG]%f Running in %F{magenta}BUG HUNT ONLY%f mode"
     print -P "%F{cyan}[CONFIG]%f Bug finder agent: %F{yellow}$BUG_FINDER_AGENT%f"
 
-    # If bug report already exists, skip bug finding and go straight to fix pipeline
-    elif [[ -f "$BUG_RESULTS_FILE" ]]; then
-        print -P "%F{yellow}[BUG HUNT]%f Existing bug report found: $BUG_RESULTS_FILE"
-        print -P "%F{cyan}[BUG HUNT]%f Skipping to bug fix pipeline..."
-        # Re-run with bugfix parameters to resume
-        SKIP_BUG_FINDING=true \
-        PRD_FILE="$BUG_RESULTS_FILE" \
-        SCOPE="$BUGFIX_SCOPE" \
-        AGENT="$AGENT" \
-        PLAN_DIR="${PLAN_DIR}/bugfix" \
-        "$0"
-
-        # Handle bugfix subprocess result
-        BUGFIX_EXIT_CODE=$?
-        if [[ $BUGFIX_EXIT_CODE -eq 0 ]]; then
-        # No resume files found - need PRD and tasks to run fresh bug discovery
-        print -P "%F{yellow}[BUG HUNT]%f No existing bug report ($BUG_RESULTS_FILE) found."
-        print -P "%F{cyan}[BUG HUNT]%f Will run fresh bug discovery..."
-        if [[ ! -f "$PRD_FILE" ]]; then
-            print -P "%F{red}[ERROR]%f $PRD_FILE not found. Need PRD to run bug discovery."
-            exit 1
-        fi
-        if [[ ! -f "$TASKS_FILE" ]]; then
-            print -P "%F{red}[ERROR]%f $TASKS_FILE not found. Need completed tasks to run bug discovery."
-            exit 1
-        fi
+    # Validate requirements
+    if [[ ! -f "$PRD_FILE" ]]; then
+        print -P "%F{red}[ERROR]%f $PRD_FILE not found. Need PRD to run bug discovery."
+        exit 1
+    fi
+    if [[ ! -f "$TASKS_FILE" ]]; then
+        print -P "%F{red}[ERROR]%f $TASKS_FILE not found. Need completed tasks to run bug discovery."
+        exit 1
     fi
     # Skip to bug finding stage (handled at end of script)
 
@@ -2047,8 +2190,8 @@ if [[ "$INTEGRATE_CHANGES" == "true" && -f "$TASKS_FILE" ]]; then
     print -P "%F{green}[UPDATE]%f Task hierarchy updated with PRD changes."
 
     # Commit the updated tasks
-    git add "$TASKS_FILE"
-    git commit -m "Update tasks for PRD changes (mid-session integration)" 2>/dev/null || true
+    git add "$TASKS_FILE" 2>/dev/null
+    git commit -m "Update tasks for PRD changes (mid-session integration)" &>/dev/null || true
 fi
 
 # A. Task Breakdown (Only run if tasks.json is missing)
@@ -2072,8 +2215,8 @@ if [[ ! -f "$TASKS_FILE" ]]; then
 
         # Commit the task breakdown
         print -P "%F{blue}[GIT]%f Committing task breakdown..."
-        git add "$TASKS_FILE" "$SESSION_DIR"
-        git commit -m "Add task breakdown and architecture research" 2>/dev/null || true
+        git add "$TASKS_FILE" "$SESSION_DIR" 2>/dev/null
+        git commit -m "Add task breakdown and architecture research" &>/dev/null || true
     fi
 fi
 
@@ -2287,14 +2430,6 @@ if [[ -n "$FINAL_TASK" ]]; then
     run_with_retry tsk_cmd update "$FINAL_TASK" Complete
 fi
 
-# If in bugfix mode, delete bugfix artifacts before final commit
-if [[ "$SKIP_BUG_FINDING" == "true" ]]; then
-    print -P "%F{blue}[CLEANUP]%f Removing bugfix artifacts before final commit..."
-    rm -f "$BUG_RESULTS_FILE" 2>/dev/null
-    rm -f "$BUGFIX_TASKS_FILE" 2>/dev/null
-    git add -A  # Stage the deletions
-fi
-
 # Final smart commit after validation
 print -P "%F{blue}[GIT]%f Committing final changes with smart commit..."
 smart_commit
@@ -2302,74 +2437,96 @@ smart_commit
 fi  # End of validation block (skip if bug-hunt only mode)
 
 # --- Creative Bug Finding Stage ---
-# Loops until no bugs are found (no bug report file created)
+# Each bug hunt iteration creates its own session in bugfix/
 if [[ "$SKIP_BUG_FINDING" == "false" ]]; then
-    BUG_HUNT_ITERATION=1
+    BUGFIX_DIR="${SESSION_DIR}/bugfix"
+    mkdir -p "$BUGFIX_DIR"
 
-    while true; do
-        print -P "\n%F{magenta}[BUG HUNT]%f Iteration $BUG_HUNT_ITERATION: Starting creative bug finding with $BUG_FINDER_AGENT..."
+    # Find or create bug hunt session
+    # Check for incomplete bug hunt session (has TEST_RESULTS.md but tasks not complete)
+    get_latest_bugfix_session() {
+        find "$BUGFIX_DIR" -maxdepth 1 -type d -name '[0-9]*_*' 2>/dev/null | sort -n | tail -1
+    }
 
-        # Check if bug report already exists (resuming interrupted session)
-        if [[ -f "$BUG_RESULTS_FILE" ]]; then
-            print -P "%F{yellow}[BUG HUNT]%f Existing bug report found: $BUG_RESULTS_FILE"
-            print -P "%F{cyan}[BUG HUNT]%f Skipping discovery, proceeding to bug fix pipeline..."
+    is_bugfix_session_complete() {
+        local bugfix_dir=$1
+        local tasks_file="$bugfix_dir/tasks.json"
+        [[ ! -f "$tasks_file" ]] && return 1
+        local incomplete=$(jq '[.. | objects | select(.status? and .status != "Complete" and .status != "Completed")] | length' "$tasks_file" 2>/dev/null)
+        [[ "$incomplete" != "0" ]] && return 1
+        return 0
+    }
+
+    CURRENT_BUGFIX_SESSION=$(get_latest_bugfix_session)
+
+    # Determine if we need a new session or should resume existing
+    if [[ -n "$CURRENT_BUGFIX_SESSION" ]]; then
+        if is_bugfix_session_complete "$CURRENT_BUGFIX_SESSION"; then
+            # Previous session complete - start fresh
+            BUGFIX_NUM=$(( $(basename "$CURRENT_BUGFIX_SESSION" | cut -d_ -f1 | sed 's/^0*//') + 1 ))
+            CURRENT_BUGFIX_SESSION=""
         else
-            # Run bug finding - agent will ONLY create file if bugs found
-            run_with_retry $BUG_FINDER_AGENT -p "$BUG_FINDING_PROMPT"
+            print -P "%F{yellow}[BUG HUNT]%f Resuming incomplete bug hunt session: $(basename "$CURRENT_BUGFIX_SESSION")"
         fi
+    fi
 
-        # If no file was created, no bugs were found - we're done!
-        if [[ ! -f "$BUG_RESULTS_FILE" ]]; then
-            print -P "%F{green}[BUG HUNT]%f No bugs found. Quality looks good!"
-            break
-        fi
+    # Create new session if needed
+    if [[ -z "$CURRENT_BUGFIX_SESSION" ]]; then
+        BUGFIX_NUM=${BUGFIX_NUM:-1}
+        BUGFIX_HASH=$(date +%s | sha256sum | cut -c1-12)
+        CURRENT_BUGFIX_SESSION="$BUGFIX_DIR/$(printf "%03d" $BUGFIX_NUM)_${BUGFIX_HASH}"
+        mkdir -p "$CURRENT_BUGFIX_SESSION"
+        print -P "%F{cyan}[BUG HUNT]%f Created bug hunt session: $(basename "$CURRENT_BUGFIX_SESSION")"
+    fi
 
+    BUG_RESULTS_FILE="$CURRENT_BUGFIX_SESSION/TEST_RESULTS.md"
+
+    print -P "\n%F{magenta}[BUG HUNT]%f Starting creative bug finding with $BUG_FINDER_AGENT..."
+
+    # Check if bug report already exists (resuming interrupted session)
+    if [[ -f "$BUG_RESULTS_FILE" ]]; then
+        print -P "%F{yellow}[BUG HUNT]%f Existing bug report found: $BUG_RESULTS_FILE"
+        print -P "%F{cyan}[BUG HUNT]%f Skipping discovery, proceeding to bug fix pipeline..."
+    else
+        # Run bug finding - agent will ONLY create file if bugs found
+        # Expand $BUG_RESULTS_FILE in the prompt template
+        EXPANDED_BUG_PROMPT=$(echo "$BUG_FINDING_PROMPT" | BUG_RESULTS_FILE="$BUG_RESULTS_FILE" envsubst '$BUG_RESULTS_FILE')
+        run_with_retry $BUG_FINDER_AGENT -p "$EXPANDED_BUG_PROMPT"
+    fi
+
+    # If no file was created, no bugs were found - we're done!
+    if [[ ! -f "$BUG_RESULTS_FILE" ]]; then
+        print -P "%F{green}[BUG HUNT]%f No bugs found. Quality looks good!"
+        # Clean up empty session
+        rmdir "$CURRENT_BUGFIX_SESSION" 2>/dev/null
+    else
         # Bug report exists - run the fix pipeline
         print -P "%F{cyan}[BUG HUNT]%f Bug report generated: $BUG_RESULTS_FILE"
         print -P "\n%F{yellow}[BUG FIX]%f Bugs found! Starting bug fix pipeline..."
         print -P "%F{yellow}[BUG FIX]%f PRD: $BUG_RESULTS_FILE"
-        print -P "%F{yellow}[BUG FIX]%f Tasks: $BUGFIX_TASKS_FILE"
+        print -P "%F{yellow}[BUG FIX]%f Session: $(basename "$CURRENT_BUGFIX_SESSION")"
         print -P "%F{yellow}[BUG FIX]%f Scope: $BUGFIX_SCOPE"
 
         # Commit the bug report before starting fix cycle
-        git add "$BUG_RESULTS_FILE"
-        git commit -m "Add bug report from creative testing (iteration $BUG_HUNT_ITERATION)" 2>/dev/null || true
+        git add "$BUG_RESULTS_FILE" 2>/dev/null
+        git commit -m "Add bug report: $(basename "$CURRENT_BUGFIX_SESSION")" &>/dev/null || true
 
-        # Re-run the pipeline with bug fixes
+        # Re-run the pipeline with bug fixes - session dir IS the bugfix session
         SKIP_BUG_FINDING=true \
         PRD_FILE="$BUG_RESULTS_FILE" \
         SCOPE="$BUGFIX_SCOPE" \
         AGENT="$AGENT" \
-        PLAN_DIR="${SESSION_DIR}/bugfix" \
+        PLAN_DIR="$CURRENT_BUGFIX_SESSION" \
         "$0"
 
         # Check if bugfix pipeline succeeded
         if [[ $? -ne 0 ]]; then
-            print -P "%F{red}[ERROR]%f Bug fix pipeline failed. Keeping bug report for review."
-            break
-        fi
-
-        # Cleanup after successful bugfix - move artifacts to session directory
-        print -P "%F{green}[CLEANUP]%f Bug fix pipeline completed. Moving artifacts..."
-
-        # Archive artifacts to the bugfix session
-        LATEST_BUG_SESSION=$(find "${SESSION_DIR}/bugfix" -maxdepth 1 -type d -name '[0-9]*_*' 2>/dev/null | sort -n | tail -1)
-        if [[ -n "$LATEST_BUG_SESSION" ]]; then
-             mv "$BUG_RESULTS_FILE" "$LATEST_BUG_SESSION/" 2>/dev/null
-             mv "$BUGFIX_TASKS_FILE" "$LATEST_BUG_SESSION/" 2>/dev/null
-             print -P "%F{cyan}[INFO]%f Artifacts moved to $(basename "$LATEST_BUG_SESSION")"
+            print -P "%F{red}[ERROR]%f Bug fix pipeline failed. Session preserved for review: $(basename "$CURRENT_BUGFIX_SESSION")"
         else
-             # Should not happen if bugfix pipeline ran, but fallback
-             rm -f "$BUG_RESULTS_FILE" 2>/dev/null
-             rm -f "$BUGFIX_TASKS_FILE" 2>/dev/null
+            print -P "%F{green}[BUG HUNT]%f Bug fix session complete: $(basename "$CURRENT_BUGFIX_SESSION")"
+            print -P "%F{cyan}[INFO]%f Run again to check for more bugs"
         fi
-
-        # Do NOT remove bugfix/ directory
-        # rm -rf "${SESSION_DIR}/bugfix" 2>/dev/null
-
-        ((BUG_HUNT_ITERATION++))
-        print -P "%F{cyan}[BUG HUNT]%f Re-running bug discovery to verify fixes..."
-    done
+    fi
 else
     print -P "%F{cyan}[CONFIG]%f Bug finding skipped (SKIP_BUG_FINDING=true)"
 fi
