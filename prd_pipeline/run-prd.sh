@@ -727,6 +727,20 @@ Use your file writing tools to create \`./$TASKS_FILE\` with this structure:
   ]
 }
 \`\`\`
+
+## FORBIDDEN OPERATIONS - CRITICAL
+
+**You are a TASK BREAKDOWN agent. You create the task hierarchy ONLY.**
+
+### NEVER MODIFY:
+- \`PRD.md\` - The product requirements document (READ-ONLY, owned by humans)
+- \`.gitignore\` - Never modify gitignore
+- Source code files - you are planning, not implementing
+- Any existing tasks.json in other directories - create ONLY at specified path
+
+### YOUR OUTPUT:
+You write ONLY to \`$TASKS_FILE\` and \`$SESSION_DIR/architecture/\`.
+Nothing else. Do not modify any other files.
 EOF
 
 read -r -d '' TASK_BREAKDOWN_PROMPT <<EOF
@@ -868,6 +882,24 @@ Store the PRP and documentation at the path specified in your instructions.
 **Confidence Score**: Rate 1-10 for one-pass implementation success likelihood
 
 **Validation**: The completed PRP should enable an AI agent unfamiliar with the codebase to implement the feature successfully using only the PRP content and codebase access.
+
+## FORBIDDEN OPERATIONS - CRITICAL
+
+**You are a RESEARCH agent creating a PRP. You do NOT modify the codebase or pipeline.**
+
+### NEVER MODIFY:
+- \`PRD.md\` - The product requirements document (READ-ONLY, owned by humans)
+- \`**/tasks.json\` - Any tasks.json file anywhere (owned by orchestrator)
+- \`**/bug_hunt_tasks.json\` - Any bug hunt tasks file (owned by orchestrator)
+- \`**/prd_snapshot.md\` - Any PRD snapshots (owned by orchestrator)
+- \`.gitignore\` - Never add plan/, PRD.md, or task files to gitignore
+- Any source code files - you are researching, not implementing
+
+### YOUR OUTPUT:
+You write ONLY to the PRP.md file path specified in your instructions.
+You may also write research notes to the research/ subdirectory of the work item.
+Nothing else. Do not modify any other files.
+
 <PRP-README>
 $PRP_README
 </PRP-README>
@@ -1253,6 +1285,33 @@ PRPs enable working code on the first attempt through:
 
 If a fundamental issue with the plan is found, halt and produce a thorough explanation of the problem at a 10th grade level.
 
+## FORBIDDEN OPERATIONS - CRITICAL
+
+**You are an IMPLEMENTATION agent. You implement the PRP. You do NOT manage the pipeline.**
+
+The following files and directories are managed by the orchestration pipeline and you must NEVER read, modify, delete, move, or reference them in any way:
+
+### NEVER MODIFY:
+- \`PRD.md\` - The product requirements document (READ-ONLY, owned by humans)
+- \`plan/\` - The entire plan directory and all contents (owned by orchestrator)
+- \`**/tasks.json\` - Any tasks.json file anywhere (owned by orchestrator)
+- \`**/bug_hunt_tasks.json\` - Any bug hunt tasks file (owned by orchestrator)
+- \`**/prd_snapshot.md\` - Any PRD snapshots (owned by orchestrator)
+- \`**/PRP.md\` - The PRP files in plan directories (you READ them, never WRITE them)
+- \`**/TEST_RESULTS.md\` - Bug hunt results (owned by QA agent)
+
+### NEVER ADD TO .gitignore:
+- \`plan/\` or any subdirectory
+- \`PRD.md\`
+- Any \`*.json\` task files
+- Any \`*.md\` documentation that is part of the project
+
+### YOUR SCOPE:
+You may ONLY modify files in the \`src/\`, \`tests/\`, \`lib/\`, or other **implementation directories**.
+If you need to create configuration files, create them in the project root (not plan/).
+
+**Violation of these rules will corrupt the entire pipeline state. You have been warned.**
+
 Strictly output your results in this JSON format:
 
 \`\`\`json
@@ -1437,6 +1496,20 @@ The file must maintain this structure:
   ]
 }
 \`\`\`
+
+## FORBIDDEN OPERATIONS - CRITICAL
+
+**You are a TASK UPDATE agent. You modify the task hierarchy ONLY.**
+
+### NEVER MODIFY:
+- \`PRD.md\` - The product requirements document (READ-ONLY, owned by humans)
+- \`.gitignore\` - Never modify gitignore
+- Source code files - you are planning, not implementing
+- \`prd_snapshot.md\` - You read this for comparison only
+
+### YOUR OUTPUT:
+You modify ONLY \`$TASKS_FILE\` as specified.
+Nothing else. Do not modify any other files.
 EOF
 
 read -r -d '' PREVIOUS_SESSION_CONTEXT_PROMPT <<EOF
@@ -1559,6 +1632,22 @@ The validation script should be executable, practical, and give complete confide
 If validation passes, the user should have 100% confidence their application works correctly in production.
 
 **CLEANUP NOTE:** These files (validate.sh and validation_report.md) are temporary and will be deleted after validation completes.
+
+## FORBIDDEN OPERATIONS - CRITICAL
+
+**You are a VALIDATION agent. You test and report. You do NOT fix code or modify the pipeline.**
+
+### NEVER MODIFY:
+- \`PRD.md\` - The product requirements document (READ-ONLY)
+- \`plan/\` - The entire plan directory and all contents
+- \`**/tasks.json\` - Any tasks.json file anywhere
+- \`**/bug_hunt_tasks.json\` - Any bug hunt tasks file
+- \`.gitignore\` - Never add plan/, PRD.md, or task files to gitignore
+- Source code files - you are validating, not implementing
+
+### YOUR OUTPUT:
+You write ONLY to \`./validate.sh\` and \`./validation_report.md\`.
+Nothing else. Do not modify any other files.
 EOF
 
 read -r -d '' BUG_FINDING_PROMPT <<EOF
@@ -1661,6 +1750,22 @@ Small improvements or polish items.
 - **If you find NO Critical or Major bugs**: Do NOT write any file. Do NOT create \`\$BUG_RESULTS_FILE\`. Leave no trace. The absence of the file signals success.
 
 This is imperative. The presence or absence of the bug report file controls the entire bugfix pipeline. Writing an empty or "no bugs found" file will cause unnecessary work. Not writing the file when there ARE bugs will cause bugs to be missed.
+
+## FORBIDDEN OPERATIONS - CRITICAL
+
+**You are a BUG HUNTER agent. You test and report bugs. You do NOT fix code or modify the pipeline.**
+
+### NEVER MODIFY:
+- \`PRD.md\` - The product requirements document (READ-ONLY)
+- \`plan/\` - The entire plan directory and all contents
+- \`**/tasks.json\` - Any tasks.json file anywhere
+- \`**/bug_hunt_tasks.json\` - Any bug hunt tasks file
+- \`.gitignore\` - Never add plan/, PRD.md, or task files to gitignore
+- Source code files - you are hunting bugs, not fixing them
+
+### YOUR OUTPUT:
+You write ONLY to \`\$BUG_RESULTS_FILE\` (if bugs are found).
+Nothing else. Do not modify any other files.
 EOF
 
 
