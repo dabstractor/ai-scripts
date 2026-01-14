@@ -1,5 +1,14 @@
 #!/usr/bin/env zsh
 
+# --- 0. Nested Execution Guard ---
+# Prevent agents from accidentally running this script during implementation
+if [[ -n "$PRP_PIPELINE_RUNNING" && "$SKIP_BUG_FINDING" != "true" ]]; then
+    echo "[ERROR] PRP Pipeline is already running. Nested execution blocked."
+    echo "This script cannot be called from within an agent session."
+    exit 1
+fi
+export PRP_PIPELINE_RUNNING=$$
+
 # --- 1. Environment Handling ---
 unalias() { builtin unalias "$@" 2>/dev/null || true }
 
@@ -1306,6 +1315,11 @@ The following files and directories are managed by the orchestration pipeline an
 - Any \`*.json\` task files
 - Any \`*.md\` documentation that is part of the project
 
+### NEVER RUN:
+- \`prd\`, \`run-prd.sh\`, or any pipeline/orchestration scripts
+- Any command that would trigger the pipeline to run again
+- \`tsk\` commands (the orchestrator handles task status)
+
 ### YOUR SCOPE:
 You may ONLY modify files in the \`src/\`, \`tests/\`, \`lib/\`, or other **implementation directories**.
 If you need to create configuration files, create them in the project root (not plan/).
@@ -1381,14 +1395,35 @@ We are preparing to commit. Ensure the repo is clean.
    - Duplicate files
    - Files that serve no ongoing purpose
 
-2. **Gitignore** (Update .gitignore if needed):
-   - Build artifacts (dist/, build/, etc.)
-   - Dependency directories (node_modules/, venv/, etc.)
+2. **Gitignore** - ONLY add these standard entries if they're missing:
+   - Build artifacts (dist/, build/)
+   - Dependency directories (node_modules/, venv/)
    - Environment files (.env)
    - OS-specific files (.DS_Store)
-   - Any other generated files that should NOT be committed
 
-Be selective - keep the root clean and organized.
+## FORBIDDEN OPERATIONS - CRITICAL
+
+**You are a CLEANUP agent. You organize files. You do NOT modify pipeline state.**
+
+### NEVER MODIFY OR DELETE:
+- \`PRD.md\` - The product requirements document (NEVER TOUCH)
+- \`plan/\` - NEVER create, delete, or modify plan directories
+- \`**/tasks.json\` - NEVER touch any tasks.json file
+- \`**/prd_snapshot.md\` - NEVER touch any prd_snapshot.md file
+- \`**/TEST_RESULTS.md\` - NEVER touch bug report files
+
+### NEVER ADD TO .gitignore:
+- \`plan/\` or any subdirectory of plan
+- \`PRD.md\`
+- Any \`*.json\` task files
+- Any pipeline-related files
+
+### NEVER CREATE:
+- New directories matching pattern \`[0-9]*_*\` (these are session directories)
+- Any files in the plan/ directory
+
+Your job is ONLY to organize documentation files into \$SESSION_DIR/docs/ and clean temporary files.
+Nothing else.
 EOF
 
 # --- Delta Operation Prompts ---
