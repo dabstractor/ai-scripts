@@ -1768,6 +1768,96 @@ You write ONLY to \`\$BUG_RESULTS_FILE\` (if bugs are found).
 Nothing else. Do not modify any other files.
 EOF
 
+# Bug Fix Task Breakdown - SIMPLE flat structure for bug fixes
+# This is intentionally simpler than the full TASK_BREAKDOWN_SYSTEM_PROMPT
+read -r -d '' BUG_FIX_BREAKDOWN_SYSTEM_PROMPT <<'EOF'
+# Bug Fix Task Breakdown Agent
+
+You convert bug reports into a SIMPLE, FLAT task list. Bug fixes do NOT need phases, milestones, or complex hierarchies.
+
+## Output Format
+
+Create a SINGLE phase with ONE milestone containing ONE task per bug. Each bug = one task with 1-3 subtasks max.
+
+```json
+{
+  "backlog": [
+    {
+      "type": "Phase",
+      "id": "P1",
+      "title": "Bug Fixes",
+      "status": "Planned",
+      "milestones": [
+        {
+          "type": "Milestone",
+          "id": "P1.M1",
+          "title": "Critical and Major Bug Fixes",
+          "status": "Planned",
+          "tasks": [
+            {
+              "type": "Task",
+              "id": "P1.M1.T1",
+              "title": "[Bug title from report]",
+              "status": "Planned",
+              "subtasks": [
+                {
+                  "type": "Subtask",
+                  "id": "P1.M1.T1.S1",
+                  "title": "Fix [specific issue]",
+                  "status": "Planned",
+                  "story_points": 1,
+                  "context_scope": "Fix: [brief description]. File: [file path]. Change: [what to change]."
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+```
+
+## Rules
+
+1. **ONE task per bug** - Do not split a single bug into multiple tasks
+2. **1-3 subtasks per task MAX** - Keep it simple
+3. **Small story points** - 0.5 to 2 points per subtask
+4. **Direct context_scope** - Just say what file to change and how
+5. **NO research tasks** - Bug reports already contain the research
+6. **NO documentation tasks** - Just fix the bugs
+7. **Critical bugs first** - Order tasks by severity
+
+## FORBIDDEN OPERATIONS - CRITICAL
+
+**You are a BUG FIX BREAKDOWN agent. You create a simple task list ONLY.**
+
+### NEVER MODIFY:
+- `PRD.md` - The product requirements document (READ-ONLY)
+- `.gitignore` - Never modify gitignore
+- Source code files - you are planning, not implementing
+- Any files except the tasks.json you are creating
+
+### YOUR OUTPUT:
+You write ONLY to the tasks.json file path specified.
+Nothing else.
+EOF
+
+read -r -d '' BUG_FIX_BREAKDOWN_PROMPT <<EOF
+# Bug Fix Task Breakdown
+
+**BUG REPORT:**
+\$(cat "\$PRD_FILE")
+
+**INSTRUCTIONS:**
+1. Read the bug report above
+2. Create ONE task per Critical/Major bug (ignore Minor issues)
+3. Each task should have 1-3 simple subtasks that directly fix the issue
+4. Write the JSON to \`./\$TASKS_FILE\`
+
+Keep it SIMPLE. This is bug fixing, not a new project.
+EOF
+
 
 # --- 4. Helpers ---
 
@@ -2301,9 +2391,17 @@ fi
 
 # A. Task Breakdown (Only run if tasks.json is missing)
 if [[ ! -f "$TASKS_FILE" ]]; then
-    print -P "%F{magenta}[PHASE 0]%f Generating breakdown..."
-    mkdir -p "$SESSION_DIR/architecture"
-    run_with_retry $BREAKDOWN_AGENT --system-prompt="$TASK_BREAKDOWN_SYSTEM_PROMPT" -p "$TASK_BREAKDOWN_PROMPT"
+    # Use simpler breakdown for bug fixes, full breakdown for PRDs
+    if [[ "$BUG_FIX_MODE" == "true" ]]; then
+        print -P "%F{magenta}[BUG FIX]%f Generating simple bug fix task list..."
+        # Expand the bug fix prompt with current PRD_FILE
+        EXPANDED_BUG_FIX_PROMPT=$(PRD_FILE="$PRD_FILE" TASKS_FILE="$TASKS_FILE" envsubst '$PRD_FILE $TASKS_FILE' <<< "$BUG_FIX_BREAKDOWN_PROMPT")
+        run_with_retry $AGENT --system-prompt="$BUG_FIX_BREAKDOWN_SYSTEM_PROMPT" -p "$EXPANDED_BUG_FIX_PROMPT"
+    else
+        print -P "%F{magenta}[PHASE 0]%f Generating breakdown..."
+        mkdir -p "$SESSION_DIR/architecture"
+        run_with_retry $BREAKDOWN_AGENT --system-prompt="$TASK_BREAKDOWN_SYSTEM_PROMPT" -p "$TASK_BREAKDOWN_PROMPT"
+    fi
 
     # If file still doesn't exist, demand the agent write it
     if [[ ! -f "$TASKS_FILE" ]]; then
@@ -2314,9 +2412,12 @@ if [[ ! -f "$TASKS_FILE" ]]; then
     if [[ -f "$TASKS_FILE" ]]; then
         print -P "%F{green}[PHASE 0]%f Task breakdown complete."
 
-        # Cleanup phase: organize .md files created during breakdown
-        print -P "%F{blue}[CLEANUP]%f Organizing files after task breakdown..."
-        run_with_retry $AGENT -p "$CLEANUP_PROMPT" || print -P "%F{yellow}[WARN]%f Cleanup failed, proceeding to commit..."
+        # Skip cleanup for bug fix mode (no architecture research to organize)
+        if [[ "$BUG_FIX_MODE" != "true" ]]; then
+            # Cleanup phase: organize .md files created during breakdown
+            print -P "%F{blue}[CLEANUP]%f Organizing files after task breakdown..."
+            run_with_retry $AGENT -p "$CLEANUP_PROMPT" || print -P "%F{yellow}[WARN]%f Cleanup failed, proceeding to commit..."
+        fi
 
         # Commit the task breakdown
         print -P "%F{blue}[GIT]%f Committing task breakdown..."
@@ -2617,7 +2718,9 @@ if [[ "$SKIP_BUG_FINDING" == "false" ]]; then
         git commit -m "Add bug report: $(basename "$CURRENT_BUGFIX_SESSION")" &>/dev/null || true
 
         # Re-run the pipeline with bug fixes - session dir IS the bugfix session
+        # BUG_FIX_MODE uses simpler task breakdown (not full PRD hierarchy)
         SKIP_BUG_FINDING=true \
+        BUG_FIX_MODE=true \
         PRD_FILE="$BUG_RESULTS_FILE" \
         SCOPE="$BUGFIX_SCOPE" \
         AGENT="$AGENT" \
