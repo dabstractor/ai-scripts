@@ -2,11 +2,17 @@
 
 # --- 0. Nested Execution Guard ---
 # Prevent agents from accidentally running this script during implementation
-if [[ -n "$PRP_PIPELINE_RUNNING" && "$SKIP_BUG_FINDING" != "true" ]]; then
-    echo "[ERROR] PRP Pipeline is already running. Nested execution blocked."
-    echo "This script cannot be called from within an agent session."
-    exit 1
+# Use a separate variable for nesting detection that can't be bypassed
+if [[ -n "$PRP_PIPELINE_RUNNING" ]]; then
+    # Only allow through if this is a LEGITIMATE recursive call (has PLAN_DIR set to a bugfix path)
+    if [[ "$SKIP_BUG_FINDING" != "true" || "$PLAN_DIR" != *"bugfix"* ]]; then
+        echo "[ERROR] PRP Pipeline is already running (PID: $PRP_PIPELINE_RUNNING). Nested execution blocked."
+        echo "This script cannot be called from within an agent session."
+        echo "[DEBUG] SKIP_BUG_FINDING='$SKIP_BUG_FINDING' PLAN_DIR='$PLAN_DIR' PWD='$PWD'"
+        exit 1
+    fi
 fi
+# Export for nesting detection - but DON'T export SKIP_BUG_FINDING (it's only for legitimate recursive calls)
 export PRP_PIPELINE_RUNNING=$$
 
 # --- 1. Environment Handling ---
@@ -254,6 +260,25 @@ create_session() {
     local hash=$2
     local padded=$(printf "%03d" $num)
     local session_dir="$PLAN_DIR/${padded}_${hash}"
+
+    # Guard: In bug fix mode (SKIP_BUG_FINDING=true), we should NOT be creating
+    # sessions in the main plan/ directory - only in the bugfix subdirectory
+    # Check if PLAN_DIR is the root plan directory (not a bugfix subdirectory)
+    local plan_basename=$(basename "$PLAN_DIR")
+    if [[ "$SKIP_BUG_FINDING" == "true" && "$plan_basename" == "plan" ]]; then
+        print -P "%F{red}[ERROR]%f Attempted to create session in main plan/ during bug fix mode!"
+        print -P "%F{red}[ERROR]%f This is a bug in the pipeline. PLAN_DIR should be the bugfix session."
+        print -P "%F{yellow}[DEBUG]%f PLAN_DIR=$PLAN_DIR, SESSION_DIR=$SESSION_DIR, SKIP_BUG_FINDING=$SKIP_BUG_FINDING"
+        exit 1
+    fi
+
+    # Additional guard: session_dir should contain "bugfix" if in bug fix mode
+    if [[ "$SKIP_BUG_FINDING" == "true" && "$session_dir" != *"bugfix"* ]]; then
+        print -P "%F{red}[ERROR]%f Bug fix session path doesn't contain 'bugfix': $session_dir"
+        print -P "%F{yellow}[DEBUG]%f PLAN_DIR=$PLAN_DIR, SKIP_BUG_FINDING=$SKIP_BUG_FINDING"
+        exit 1
+    fi
+
     mkdir -p "$session_dir/architecture"
     echo "$session_dir"
 }
@@ -314,6 +339,8 @@ SKIP_EXECUTION_LOOP=false
 # Bug fix mode: PLAN_DIR is already the session, use it directly
 # This happens during recursive calls for bug fixes
 if [[ "$SKIP_BUG_FINDING" == "true" && -d "$PLAN_DIR" ]]; then
+    print -P "%F{magenta}[BUGFIX MODE]%f SKIP_BUG_FINDING=true, using PLAN_DIR as session"
+    print -P "%F{cyan}[DEBUG]%f PLAN_DIR=$PLAN_DIR"
     SESSION_DIR="$PLAN_DIR"
     TASKS_FILE="$SESSION_DIR/tasks.json"
     # Copy PRD to session as prd_snapshot if not already there
@@ -2426,17 +2453,9 @@ fi
 
 # A. Task Breakdown (Only run if tasks.json is missing)
 if [[ ! -f "$TASKS_FILE" ]]; then
-    # Use simpler breakdown for bug fixes, full breakdown for PRDs
-    if [[ "$BUG_FIX_MODE" == "true" ]]; then
-        print -P "%F{magenta}[BUG FIX]%f Generating simple bug fix task list..."
-        # Expand the bug fix prompt with current PRD_FILE
-        EXPANDED_BUG_FIX_PROMPT=$(PRD_FILE="$PRD_FILE" TASKS_FILE="$TASKS_FILE" envsubst '$PRD_FILE $TASKS_FILE' <<< "$BUG_FIX_BREAKDOWN_PROMPT")
-        run_with_retry $AGENT --system-prompt="$BUG_FIX_BREAKDOWN_SYSTEM_PROMPT" -p "$EXPANDED_BUG_FIX_PROMPT"
-    else
-        print -P "%F{magenta}[PHASE 0]%f Generating breakdown..."
-        mkdir -p "$SESSION_DIR/architecture"
-        run_with_retry $BREAKDOWN_AGENT --system-prompt="$TASK_BREAKDOWN_SYSTEM_PROMPT" -p "$TASK_BREAKDOWN_PROMPT"
-    fi
+    print -P "%F{magenta}[PHASE 0]%f Generating breakdown..."
+    mkdir -p "$SESSION_DIR/architecture"
+    run_with_retry $BREAKDOWN_AGENT --system-prompt="$TASK_BREAKDOWN_SYSTEM_PROMPT" -p "$TASK_BREAKDOWN_PROMPT"
 
     # If file still doesn't exist, demand the agent write it
     if [[ ! -f "$TASKS_FILE" ]]; then
@@ -2447,12 +2466,9 @@ if [[ ! -f "$TASKS_FILE" ]]; then
     if [[ -f "$TASKS_FILE" ]]; then
         print -P "%F{green}[PHASE 0]%f Task breakdown complete."
 
-        # Skip cleanup for bug fix mode (no architecture research to organize)
-        if [[ "$BUG_FIX_MODE" != "true" ]]; then
-            # Cleanup phase: organize .md files created during breakdown
-            print -P "%F{blue}[CLEANUP]%f Organizing files after task breakdown..."
-            run_with_retry $AGENT -p "$CLEANUP_PROMPT" || print -P "%F{yellow}[WARN]%f Cleanup failed, proceeding to commit..."
-        fi
+        # Cleanup phase: organize .md files created during breakdown
+        print -P "%F{blue}[CLEANUP]%f Organizing files after task breakdown..."
+        run_with_retry $AGENT -p "$CLEANUP_PROMPT" || print -P "%F{yellow}[WARN]%f Cleanup failed, proceeding to commit..."
 
         # Commit the task breakdown
         print -P "%F{blue}[GIT]%f Committing task breakdown..."
@@ -2753,9 +2769,7 @@ if [[ "$SKIP_BUG_FINDING" == "false" ]]; then
         git commit -m "Add bug report: $(basename "$CURRENT_BUGFIX_SESSION")" &>/dev/null || true
 
         # Re-run the pipeline with bug fixes - session dir IS the bugfix session
-        # BUG_FIX_MODE uses simpler task breakdown (not full PRD hierarchy)
         SKIP_BUG_FINDING=true \
-        BUG_FIX_MODE=true \
         PRD_FILE="$BUG_RESULTS_FILE" \
         SCOPE="$BUGFIX_SCOPE" \
         AGENT="$AGENT" \
