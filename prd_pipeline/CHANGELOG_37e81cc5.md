@@ -3,21 +3,126 @@
 ## Changes Since Commit 37e81cc5
 
 **Base commit:** `37e81cc5` - "rewrite PRD spec with detailed technical implementation plan"
-**Latest commit:** `d9bf0b3` - "fix(prd): enhance task subcommand and bug hunt workflow"
-**Date range:** Commits b569e7f through d9bf0b3 (8 commits)
-**Files changed:** `run-prd.sh` (+299 lines, -136 lines)
+**Latest commit:** `104d93f` - "fix(prd): add nested execution guard and cleanup safety measures"
+**Date range:** Commits b569e7f through 104d93f (11 commits)
+**Files changed:** `run-prd.sh` (+553 lines, -147 lines)
 
 ---
 
 ## Summary of Changes
 
-This release introduces a major refactor of the bug hunt workflow with a new self-contained session architecture, enhanced task management via the `prd task` subcommand, improved session completion handling, and better artifact management.
+This release introduces a major refactor of the bug hunt workflow with a new self-contained session architecture, enhanced task management via the `prd task` subcommand, improved session completion handling, and better artifact management. Additionally, strict operational boundaries have been added to all pipeline agents to prevent accidental pipeline corruption, and a nested execution guard prevents agents from recursively invoking the pipeline during implementation.
 
 ---
 
 ## Detailed Changelog
 
-### 1. New `prd task` Subcommand (d9bf0b3)
+### 1. Nested Execution Guard (104d93f)
+
+**Problem Solved:** Agents could accidentally invoke `run-prd.sh` during implementation, causing recursive execution and corrupted pipeline state.
+
+**Solution:** Added `PRP_PIPELINE_RUNNING` environment variable guard at script entry.
+
+**Implementation:**
+```bash
+if [[ -n "$PRP_PIPELINE_RUNNING" && "$SKIP_BUG_FINDING" != "true" ]]; then
+    echo "[ERROR] PRP Pipeline is already running. Nested execution blocked."
+    echo "This script cannot be called from within an agent session."
+    exit 1
+fi
+export PRP_PIPELINE_RUNNING=$$
+```
+
+**Behavior:**
+- Sets `PRP_PIPELINE_RUNNING` to current PID on script start
+- Blocks nested execution unless `SKIP_BUG_FINDING=true` (legitimate bug fix recursion)
+- Provides clear error message if blocked
+
+**Code Location:** Lines 4-12
+
+---
+
+### 2. Clear Operational Boundaries for All Agents (410c9e3)
+
+**Problem Solved:** Agents would sometimes modify pipeline state files, task files, or add plan directories to `.gitignore`, corrupting the orchestration state.
+
+**Solution:** Added explicit "FORBIDDEN OPERATIONS" documentation to every agent prompt.
+
+**Affected Agents:**
+
+| Agent Type | Output Scope | Forbidden |
+|------------|--------------|-----------|
+| Task Breakdown | `tasks.json`, `architecture/` | PRD.md, source code, gitignore |
+| Research (PRP) | `PRP.md`, `research/` | tasks.json, source code, prd_snapshot.md |
+| Implementation | `src/`, `tests/`, `lib/` | plan/, PRD.md, tasks.json, pipeline scripts |
+| Cleanup | `docs/` organization | plan/, PRD.md, tasks.json, session directories |
+| Task Update | `tasks.json` modifications | PRD.md, source code, prd_snapshot.md |
+| Validation | `validate.sh`, `validation_report.md` | plan/, source code, tasks.json |
+| Bug Hunter | `TEST_RESULTS.md` (if bugs found) | plan/, source code, tasks.json |
+
+**Standard Forbidden Operations (all agents):**
+- Never modify `PRD.md` (human-owned)
+- Never add `plan/`, `PRD.md`, or task files to `.gitignore`
+- Never run `prd`, `run-prd.sh`, or `tsk` commands
+
+**Implementation Notes:**
+- Each agent prompt now includes a "FORBIDDEN OPERATIONS - CRITICAL" section
+- Implementation agent additionally forbidden from running pipeline scripts
+- Cleanup agent restricted from creating session-pattern directories (`[0-9]*_*`)
+
+---
+
+### 3. Simplified Bug Fix Task Breakdown (acd6d3c)
+
+**Problem Solved:** Bug fixes were being broken down using the full PRD task hierarchy (Phases → Milestones → Tasks → Subtasks), resulting in overly complex task structures for simple bug fixes.
+
+**Solution:** Added `BUG_FIX_MODE` flag and dedicated `BUG_FIX_BREAKDOWN_SYSTEM_PROMPT` with simpler structure.
+
+**New Environment Variable:**
+- `BUG_FIX_MODE` - When `true`, uses simplified task breakdown
+
+**Simplified Structure:**
+```json
+{
+  "backlog": [{
+    "type": "Phase",
+    "id": "P1",
+    "title": "Bug Fixes",
+    "milestones": [{
+      "type": "Milestone",
+      "id": "P1.M1",
+      "title": "Critical and Major Bug Fixes",
+      "tasks": [
+        // ONE task per bug, 1-3 subtasks max
+      ]
+    }]
+  }]
+}
+```
+
+**Rules for Bug Fix Breakdown:**
+1. ONE task per bug (no splitting)
+2. 1-3 subtasks per task maximum
+3. Small story points (0.5-2)
+4. Direct context_scope (file + change)
+5. No research or documentation tasks
+6. Critical bugs ordered first
+
+**Implementation:**
+```bash
+if [[ "$BUG_FIX_MODE" == "true" ]]; then
+    print -P "%F{magenta}[BUG FIX]%f Generating simple bug fix task list..."
+    run_with_retry $AGENT --system-prompt="$BUG_FIX_BREAKDOWN_SYSTEM_PROMPT" -p "$EXPANDED_BUG_FIX_PROMPT"
+else
+    # Full PRD breakdown
+fi
+```
+
+**Additional Change:** Cleanup phase skipped for bug fix mode (no architecture research to organize).
+
+---
+
+### 4. New `prd task` Subcommand (d9bf0b3)
 
 **Purpose:** Provides a convenient wrapper to interact with tasks in the current session without needing to know the exact tasks file path.
 
@@ -42,7 +147,7 @@ prd task -f <file>    # Override with specific file
 
 ---
 
-### 2. Self-Contained Bug Fix Workflow (9382a85)
+### 5. Self-Contained Bug Fix Workflow (9382a85)
 
 **Problem Solved:** Previous implementation had complex dependencies between parent and child sessions, with task files being passed between recursive calls, leading to state corruption and resume failures.
 
@@ -71,7 +176,7 @@ plan/
 
 ---
 
-### 3. Bug Fix Artifact Archiving (c1cf485, 7bc3c3b)
+### 6. Bug Fix Artifact Archiving (c1cf485, 7bc3c3b)
 
 **Problem Solved:** Bug fix artifacts were being deleted after completion, losing valuable debugging history.
 
@@ -90,7 +195,7 @@ plan/
 
 ---
 
-### 4. Interactive Prompts for Bug Hunt (0edbd0c)
+### 7. Interactive Prompts for Bug Hunt (0edbd0c)
 
 **Problem Solved:** Bug hunt could automatically resume corrupted or unwanted state, leading to infinite loops.
 
@@ -113,7 +218,7 @@ plan/
 
 ---
 
-### 5. Session Completion Logic Enhancement (847ac48)
+### 8. Session Completion Logic Enhancement (847ac48)
 
 **Problem Solved:** When a session was complete, the script would exit before allowing bug hunt to run on completed work.
 
@@ -128,7 +233,7 @@ plan/
 
 ---
 
-### 6. Bug Fix Directory Structure Correction (b569e7f)
+### 9. Bug Fix Directory Structure Correction (b569e7f)
 
 **Problem Solved:** Bug fix artifacts were being written to incorrect directories due to global vs session-specific path confusion.
 
@@ -146,7 +251,7 @@ fi
 
 ---
 
-### 7. Tasks File Path Preservation (0cd59a6)
+### 10. Tasks File Path Preservation (0cd59a6)
 
 **Problem Solved:** Resuming a bug fix cycle would erroneously trigger a new breakdown because `TASKS_FILE` was being overwritten.
 
@@ -164,7 +269,7 @@ fi
 
 ---
 
-### 8. MCP Server Configuration for PRP Creation
+### 11. MCP Server Configuration for PRP Creation
 
 **New Feature:** Web search capability for research during PRP creation.
 
@@ -184,7 +289,7 @@ $AGENT $PRP_AGENT_MCP_ARGS -p "$PRP_CREATE_PROMPT..."
 
 ---
 
-### 9. Session Hash Calculation Change
+### 12. Session Hash Calculation Change
 
 **Previous:** Hash extracted from directory name (`001_abc123` → `abc123`)
 
@@ -205,7 +310,7 @@ get_session_hash() {
 
 ---
 
-### 10. Auto-Resume Logic Enhancement
+### 13. Auto-Resume Logic Enhancement
 
 **New Variables:**
 - `RESUME_BUGFIX_TASKS_FILE` - Path to bug fix tasks to resume
@@ -219,7 +324,7 @@ get_session_hash() {
 
 ---
 
-### 11. Git Command Noise Reduction
+### 14. Git Command Noise Reduction
 
 **Change:** Git commands now redirect stderr to null and use `&>/dev/null` for silent failures:
 ```bash
@@ -234,7 +339,7 @@ git commit -m "..." &>/dev/null || true
 
 ---
 
-### 12. `is_session_complete()` Function Enhancement
+### 15. `is_session_complete()` Function Enhancement
 
 **Extended Checks:**
 - Main `tasks.json` completion status
@@ -254,6 +359,8 @@ git commit -m "..." &>/dev/null || true
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `PRP_PIPELINE_RUNNING` | (empty) | Guard to prevent nested execution (set to PID) |
+| `BUG_FIX_MODE` | `false` | Use simplified task breakdown for bug fixes |
 | `BUG_FINDER_AGENT` | `glp` | Agent used for bug discovery |
 | `BUG_RESULTS_FILE` | `TEST_RESULTS.md` | Bug report output file |
 | `BUGFIX_SCOPE` | `subtask` | Granularity for bug fix tasks |
@@ -320,7 +427,7 @@ None. The changes are backwards compatible with existing sessions.
 
 | File | Lines Added | Lines Removed |
 |------|-------------|---------------|
-| `run-prd.sh` | 299 | 136 |
+| `run-prd.sh` | 553 | 147 |
 
 ---
 
@@ -336,3 +443,6 @@ None. The changes are backwards compatible with existing sessions.
 | `7bc3c3b` | fix(prd): simplify artifact archiving |
 | `9382a85` | fix(prd): refactor bug fix workflow to be self-contained |
 | `d9bf0b3` | fix(prd): enhance task subcommand and bug hunt workflow |
+| `410c9e3` | fix(prd): add clear operational boundaries for all pipeline agents |
+| `acd6d3c` | fix(prd): add self-contained bug fix sessions and prd task subcommand |
+| `104d93f` | fix(prd): add nested execution guard and cleanup safety measures |
