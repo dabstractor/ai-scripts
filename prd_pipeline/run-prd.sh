@@ -68,13 +68,7 @@ if [[ "$1" == "task" ]]; then
         fi
     fi
 
-    # Priority 2: Check for bug_hunt_tasks.json at session level (old format - backwards compat)
-    if [[ -z "$TASKS_FILE" && -f "$SESSION_DIR/bug_hunt_tasks.json" ]] && is_tasks_incomplete "$SESSION_DIR/bug_hunt_tasks.json"; then
-        TASKS_FILE="$SESSION_DIR/bug_hunt_tasks.json"
-        print -P "%F{cyan}[prd task]%f Using bug hunt tasks: $(basename "$SESSION_DIR")/bug_hunt_tasks.json" >&2
-    fi
-
-    # Priority 3: Fall back to main session tasks
+    # Priority 2: Fall back to main session tasks
     if [[ -z "$TASKS_FILE" ]]; then
         TASKS_FILE="$SESSION_DIR/tasks.json"
         if [[ ! -f "$TASKS_FILE" ]]; then
@@ -198,7 +192,6 @@ get_session_dir() {
 # Usage: is_session_complete <session_dir>
 # Returns false (1) if:
 #   - tasks.json doesn't exist or has incomplete items
-#   - bug_hunt_tasks.json exists with incomplete items
 #   - bugfix sessions exist with incomplete items
 is_session_complete() {
     local session_dir=$1
@@ -209,13 +202,6 @@ is_session_complete() {
     local incomplete=$(jq '[.. | objects | select(.status? and .status != "Complete" and .status != "Completed")] | length' "$tasks_file" 2>/dev/null)
     [[ "$incomplete" != "0" ]] && return 1
 
-    # Check for incomplete bug_hunt_tasks.json at session level
-    local bug_tasks="$session_dir/bug_hunt_tasks.json"
-    if [[ -f "$bug_tasks" ]]; then
-        incomplete=$(jq '[.. | objects | select(.status? and .status != "Complete" and .status != "Completed")] | length' "$bug_tasks" 2>/dev/null)
-        [[ "$incomplete" != "0" ]] && return 1
-    fi
-
     # Check for incomplete bugfix sessions (inside session dir)
     if [[ -d "$session_dir/bugfix" ]]; then
         local bugfix_session
@@ -224,11 +210,6 @@ is_session_complete() {
             # Check tasks.json in bugfix session
             if [[ -f "$bugfix_session/tasks.json" ]]; then
                 incomplete=$(jq '[.. | objects | select(.status? and .status != "Complete" and .status != "Completed")] | length' "$bugfix_session/tasks.json" 2>/dev/null)
-                [[ "$incomplete" != "0" ]] && return 1
-            fi
-            # Check bug_hunt_tasks.json in bugfix session
-            if [[ -f "$bugfix_session/bug_hunt_tasks.json" ]]; then
-                incomplete=$(jq '[.. | objects | select(.status? and .status != "Complete" and .status != "Completed")] | length' "$bugfix_session/bug_hunt_tasks.json" 2>/dev/null)
                 [[ "$incomplete" != "0" ]] && return 1
             fi
         done
@@ -385,6 +366,18 @@ elif [[ -f "$PRD_FILE" ]]; then
 
         CURRENT_MATCH_INCOMPLETE)
             print -P "%F{cyan}[SESSION]%f Resuming session: $(basename "$CURRENT_SESSION_DIR")"
+
+            # Check if this is a delta session that never got its delta PRD generated
+            if [[ -f "$CURRENT_SESSION_DIR/delta_from.txt" && ! -f "$CURRENT_SESSION_DIR/delta_prd.md" ]]; then
+                local prev_session_num=$(cat "$CURRENT_SESSION_DIR/delta_from.txt")
+                local prev_session_pattern=$(printf "%03d_*" "$prev_session_num")
+                local prev_session_match=("$PLAN_DIR"/$prev_session_pattern(N))
+                if [[ ${#prev_session_match[@]} -gt 0 && -d "${prev_session_match[1]}" ]]; then
+                    PREV_SESSION_DIR="${prev_session_match[1]}"
+                    CREATE_DELTA=true
+                    print -P "%F{yellow}[DELTA]%f Delta PRD missing, will regenerate from session $prev_session_num"
+                fi
+            fi
             ;;
 
         CURRENT_MATCH_COMPLETE)
@@ -514,17 +507,6 @@ if [[ "$ONLY_BUG_HUNT" == "false" && "$SKIP_BUG_FINDING" == "false" && -n "$SESS
             ONLY_BUG_HUNT=true
             RESUME_BUGFIX_TASKS_FILE="$LATEST_BUGFIX/tasks.json"
             RESUME_BUGFIX_SESSION="$LATEST_BUGFIX"
-        fi
-    fi
-
-    # Priority 2: Check for bug_hunt_tasks.json at session level (old format - backwards compat)
-    if [[ "$ONLY_BUG_HUNT" == "false" && -f "$SESSION_DIR/bug_hunt_tasks.json" ]] && has_incomplete_tasks "$SESSION_DIR/bug_hunt_tasks.json"; then
-        print -P "%F{yellow}[AUTO-DETECT]%f Found incomplete bug hunt tasks (legacy): $(basename "$SESSION_DIR")/bug_hunt_tasks.json"
-        ONLY_BUG_HUNT=true
-        RESUME_BUGFIX_TASKS_FILE="$SESSION_DIR/bug_hunt_tasks.json"
-        # Find corresponding bugfix session for this old-format bug hunt
-        if [[ -d "$SESSION_DIR/bugfix" ]]; then
-            RESUME_BUGFIX_SESSION=$(find "$SESSION_DIR/bugfix" -maxdepth 1 -type d -name '[0-9]*_*' 2>/dev/null | sort -n | tail -1)
         fi
     fi
 fi
@@ -926,7 +908,6 @@ Store the PRP and documentation at the path specified in your instructions.
 ### NEVER MODIFY:
 - \`PRD.md\` - The product requirements document (READ-ONLY, owned by humans)
 - \`**/tasks.json\` - Any tasks.json file anywhere (owned by orchestrator)
-- \`**/bug_hunt_tasks.json\` - Any bug hunt tasks file (owned by orchestrator)
 - \`**/prd_snapshot.md\` - Any PRD snapshots (owned by orchestrator)
 - \`.gitignore\` - Never add plan/, PRD.md, or task files to gitignore
 - Any source code files - you are researching, not implementing
@@ -1331,7 +1312,6 @@ The following files and directories are managed by the orchestration pipeline an
 - \`PRD.md\` - The product requirements document (READ-ONLY, owned by humans)
 - \`plan/\` - The entire plan directory and all contents (owned by orchestrator)
 - \`**/tasks.json\` - Any tasks.json file anywhere (owned by orchestrator)
-- \`**/bug_hunt_tasks.json\` - Any bug hunt tasks file (owned by orchestrator)
 - \`**/prd_snapshot.md\` - Any PRD snapshots (owned by orchestrator)
 - \`**/PRP.md\` - The PRP files in plan directories (you READ them, never WRITE them)
 - \`**/TEST_RESULTS.md\` - Bug hunt results (owned by QA agent)
@@ -1372,20 +1352,20 @@ Clean up, organize files, and PREPARE FOR COMMIT. Check \`git diff\` for referen
 ## SESSION-SPECIFIC PATHS (CURRENT SESSION):
 - Session directory: $SESSION_DIR
 - Tasks file: $SESSION_DIR/tasks.json
-- Bug hunt tasks: $SESSION_DIR/bug_hunt_tasks.json
 - Bug report: $SESSION_DIR/TEST_RESULTS.md
 - Architecture docs: $SESSION_DIR/architecture/
 - Documentation: $SESSION_DIR/docs/
 
-## CRITICAL - NEVER DELETE THESE FILES:
+## CRITICAL - NEVER DELETE OR MOVE THESE FILES:
 **IMPORTANT**: The following files are CRITICAL to the pipeline and must NEVER be deleted, moved, or modified:
-- **$SESSION_DIR/tasks.json** - Pipeline state tracking (NEVER DELETE)
-- **$SESSION_DIR/bug_hunt_tasks.json** - Bug fix pipeline state (NEVER DELETE)
-- **$SESSION_DIR/prd_snapshot.md** - PRD snapshot for this session (NEVER DELETE)
-- **$SESSION_DIR/delta_from.txt** - Delta session linkage (NEVER DELETE if exists)
-- **PRD.md** - Product requirements document in project root (NEVER DELETE)
-- **$SESSION_DIR/TEST_RESULTS.md** - Bug report file (NEVER DELETE)
-- Any file matching \`*tasks*.json\` pattern (NEVER DELETE)
+- **$SESSION_DIR/tasks.json** - Pipeline state tracking (NEVER DELETE OR MOVE)
+- **$SESSION_DIR/prd_snapshot.md** - PRD snapshot for this session (NEVER DELETE OR MOVE)
+- **$SESSION_DIR/delta_prd.md** - Delta PRD for incremental sessions (NEVER DELETE OR MOVE)
+- **$SESSION_DIR/delta_from.txt** - Delta session linkage (NEVER DELETE OR MOVE)
+- **PRD.md** - Product requirements document in project root (NEVER DELETE OR MOVE)
+- **$SESSION_DIR/TEST_RESULTS.md** - Bug report file (NEVER DELETE OR MOVE)
+- Any file matching \`*tasks*.json\` pattern (NEVER DELETE OR MOVE)
+- Any file directly in $SESSION_DIR/ root (NEVER MOVE to subdirectories)
 
 If you delete any of the above files, the entire pipeline will break. Do NOT delete them under any circumstances.
 
@@ -1703,7 +1683,6 @@ If validation passes, the user should have 100% confidence their application wor
 - \`PRD.md\` - The product requirements document (READ-ONLY)
 - \`plan/\` - The entire plan directory and all contents
 - \`**/tasks.json\` - Any tasks.json file anywhere
-- \`**/bug_hunt_tasks.json\` - Any bug hunt tasks file
 - \`.gitignore\` - Never add plan/, PRD.md, or task files to gitignore
 - Source code files - you are validating, not implementing
 
@@ -1821,7 +1800,6 @@ This is imperative. The presence or absence of the bug report file controls the 
 - \`PRD.md\` - The product requirements document (READ-ONLY)
 - \`plan/\` - The entire plan directory and all contents
 - \`**/tasks.json\` - Any tasks.json file anywhere
-- \`**/bug_hunt_tasks.json\` - Any bug hunt tasks file
 - \`.gitignore\` - Never add plan/, PRD.md, or task files to gitignore
 - Source code files - you are hunting bugs, not fixing them
 
@@ -2136,7 +2114,20 @@ get_next_item() {
     local ms_num=$2
     local task_num=$3
     local subtask_num=$4
-    local phase_idx=$((phase_num - 1))
+
+    # Find actual array indices by searching for matching IDs
+    # This handles delta sessions where P3 might be at backlog[0]
+    local phase_idx=-1
+    local total_phases=$(jq '.backlog | length' "$TASKS_FILE")
+    for (( i=0; i<total_phases; i++ )); do
+        local pid=$(jq -r ".backlog[$i].id // empty" "$TASKS_FILE")
+        if [[ "$pid" == "P$phase_num" ]]; then
+            phase_idx=$i
+            break
+        fi
+    done
+    [[ $phase_idx -lt 0 ]] && return 1
+
     local ms_idx=$((ms_num - 1))
     local task_idx=$((task_num - 1))
     local subtask_idx=$((subtask_num - 1))
@@ -2429,12 +2420,21 @@ Previous session directory: $PREV_SESSION_DIR
 
 $PREVIOUS_SESSION_CONTEXT_PROMPT"
 
+    # Retry if delta PRD wasn't created
+    if [[ ! -f "$SESSION_DIR/delta_prd.md" ]]; then
+        print -P "%F{yellow}[DELTA]%f delta_prd.md not found. Demanding agent write it..."
+        run_with_retry $BREAKDOWN_AGENT --continue -p "You did NOT write the delta PRD file. You MUST write it to $SESSION_DIR/delta_prd.md immediately. This file is REQUIRED before we can proceed."
+    fi
+
+    # Final validation - FAIL if delta PRD is still missing
     if [[ -f "$SESSION_DIR/delta_prd.md" ]]; then
         print -P "%F{green}[DELTA]%f Delta PRD generated: $SESSION_DIR/delta_prd.md"
         # Use delta PRD as input for task breakdown
         PRD_CONTENT=$(cat "$SESSION_DIR/delta_prd.md")
     else
-        print -P "%F{yellow}[DELTA]%f Delta PRD not generated. Using full PRD for breakdown."
+        print -P "%F{red}[ERROR]%f Delta PRD generation FAILED. Required file missing: $SESSION_DIR/delta_prd.md"
+        print -P "%F{red}[ERROR]%f Cannot proceed with delta session without delta PRD."
+        exit 1
     fi
 fi
 

@@ -3,15 +3,15 @@
 ## Changes Since Commit 37e81cc5
 
 **Base commit:** `37e81cc5` - "rewrite PRD spec with detailed technical implementation plan"
-**Latest commit:** `104d93f` - "fix(prd): add nested execution guard and cleanup safety measures"
-**Date range:** Commits b569e7f through 104d93f (11 commits)
-**Files changed:** `run-prd.sh` (+553 lines, -147 lines)
+**Latest commit:** `5b01ab7` - "fix(prd): add nested execution guard and agent operational boundaries"
+**Date range:** Commits b569e7f through 5b01ab7 (13 commits)
+**Files changed:** `run-prd.sh` (+590 lines, -170 lines)
 
 ---
 
 ## Summary of Changes
 
-This release introduces a major refactor of the bug hunt workflow with a new self-contained session architecture, enhanced task management via the `prd task` subcommand, improved session completion handling, and better artifact management. Additionally, strict operational boundaries have been added to all pipeline agents to prevent accidental pipeline corruption, and a nested execution guard prevents agents from recursively invoking the pipeline during implementation.
+This release introduces a major refactor of the bug hunt workflow with a new self-contained session architecture, enhanced task management via the `prd task` subcommand, improved session completion handling, and better artifact management. Additionally, strict operational boundaries have been added to all pipeline agents to prevent accidental pipeline corruption, and a nested execution guard prevents agents from recursively invoking the pipeline during implementation. Recent updates have further hardened these guards with session path validation and removed the separate BUG_FIX_MODE in favor of consistent SKIP_BUG_FINDING usage.
 
 ---
 
@@ -38,7 +38,88 @@ export PRP_PIPELINE_RUNNING=$$
 - Blocks nested execution unless `SKIP_BUG_FINDING=true` (legitimate bug fix recursion)
 - Provides clear error message if blocked
 
-**Code Location:** Lines 4-12
+**Code Location:** Lines 4-17
+
+---
+
+### 1b. Enhanced Nested Execution Guards & Session Path Validation (a73950e)
+
+**Problem Solved:** The original nested execution guard could be bypassed by setting `SKIP_BUG_FINDING=true` without a legitimate bugfix context. Additionally, sessions could accidentally be created in the main `plan/` directory during bug fix mode.
+
+**Solutions:**
+
+1. **Stricter Recursion Validation:** Now requires both `SKIP_BUG_FINDING=true` AND `PLAN_DIR` to contain "bugfix" for legitimate recursive calls.
+
+2. **Session Creation Guards:** Added guards in `create_session()` to prevent incorrect session placement.
+
+**Enhanced Guard Implementation:**
+```bash
+if [[ -n "$PRP_PIPELINE_RUNNING" ]]; then
+    # Only allow through if this is a LEGITIMATE recursive call (has PLAN_DIR set to a bugfix path)
+    if [[ "$SKIP_BUG_FINDING" != "true" || "$PLAN_DIR" != *"bugfix"* ]]; then
+        echo "[ERROR] PRP Pipeline is already running (PID: $PRP_PIPELINE_RUNNING). Nested execution blocked."
+        echo "This script cannot be called from within an agent session."
+        echo "[DEBUG] SKIP_BUG_FINDING='$SKIP_BUG_FINDING' PLAN_DIR='$PLAN_DIR' PWD='$PWD'"
+        exit 1
+    fi
+fi
+```
+
+**Session Path Validation in `create_session()`:**
+```bash
+# Guard: In bug fix mode, prevent creating sessions in main plan/ directory
+local plan_basename=$(basename "$PLAN_DIR")
+if [[ "$SKIP_BUG_FINDING" == "true" && "$plan_basename" == "plan" ]]; then
+    print -P "%F{red}[ERROR]%f Attempted to create session in main plan/ during bug fix mode!"
+    exit 1
+fi
+
+# Additional guard: session_dir must contain "bugfix" in bug fix mode
+if [[ "$SKIP_BUG_FINDING" == "true" && "$session_dir" != *"bugfix"* ]]; then
+    print -P "%F{red}[ERROR]%f Bug fix session path doesn't contain 'bugfix': $session_dir"
+    exit 1
+fi
+```
+
+**Debug Logging:**
+- Added `[BUGFIX MODE]` and `[DEBUG]` output when entering bug fix mode
+- Shows `PLAN_DIR`, `SESSION_DIR`, and `SKIP_BUG_FINDING` values for troubleshooting
+
+---
+
+### 1c. Removal of BUG_FIX_MODE Variable (a73950e)
+
+**Problem Solved:** Having both `BUG_FIX_MODE` and `SKIP_BUG_FINDING` variables created confusion and potential state inconsistencies.
+
+**Solution:** Removed `BUG_FIX_MODE` entirely in favor of using `SKIP_BUG_FINDING` consistently.
+
+**Changes:**
+- Removed `BUG_FIX_MODE=true` from recursive bug fix call
+- Removed conditional task breakdown logic that used `BUG_FIX_MODE`
+- All sessions now use full PRD task breakdown approach
+- Cleanup phase now runs for all sessions (including bug fixes)
+
+**Before:**
+```bash
+if [[ "$BUG_FIX_MODE" == "true" ]]; then
+    # Simpler breakdown for bug fixes
+else
+    # Full PRD breakdown
+fi
+```
+
+**After:**
+```bash
+# Full PRD breakdown for all sessions
+print -P "%F{magenta}[PHASE 0]%f Generating breakdown..."
+mkdir -p "$SESSION_DIR/architecture"
+run_with_retry $BREAKDOWN_AGENT --system-prompt="$TASK_BREAKDOWN_SYSTEM_PROMPT" -p "$TASK_BREAKDOWN_PROMPT"
+```
+
+**Impact:**
+- Simpler codebase with single source of truth for bug fix mode detection
+- More consistent behavior between regular and bug fix sessions
+- Bug fix sessions get proper architecture directory and cleanup
 
 ---
 
@@ -360,14 +441,16 @@ git commit -m "..." &>/dev/null || true
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PRP_PIPELINE_RUNNING` | (empty) | Guard to prevent nested execution (set to PID) |
-| `BUG_FIX_MODE` | `false` | Use simplified task breakdown for bug fixes |
 | `BUG_FINDER_AGENT` | `glp` | Agent used for bug discovery |
 | `BUG_RESULTS_FILE` | `TEST_RESULTS.md` | Bug report output file |
 | `BUGFIX_SCOPE` | `subtask` | Granularity for bug fix tasks |
-| `SKIP_BUG_FINDING` | `false` | Skip bug hunt stage |
+| `SKIP_BUG_FINDING` | `false` | Skip bug hunt stage; also used to identify bug fix mode |
 | `SKIP_EXECUTION_LOOP` | `false` | Skip task execution (internal) |
 | `RESUME_BUGFIX_TASKS_FILE` | (empty) | Auto-detected resume file |
 | `RESUME_BUGFIX_SESSION` | (empty) | Auto-detected session path |
+
+**Removed Variables:**
+- `BUG_FIX_MODE` - Removed in favor of `SKIP_BUG_FINDING` (a73950e)
 
 ### Bug Hunt Session Lifecycle
 
@@ -427,7 +510,8 @@ None. The changes are backwards compatible with existing sessions.
 
 | File | Lines Added | Lines Removed |
 |------|-------------|---------------|
-| `run-prd.sh` | 553 | 147 |
+| `run-prd.sh` | 590 | 170 |
+| `CHANGELOG_37e81cc5.md` | 127 | 17 |
 
 ---
 
@@ -446,3 +530,5 @@ None. The changes are backwards compatible with existing sessions.
 | `410c9e3` | fix(prd): add clear operational boundaries for all pipeline agents |
 | `acd6d3c` | fix(prd): add self-contained bug fix sessions and prd task subcommand |
 | `104d93f` | fix(prd): add nested execution guard and cleanup safety measures |
+| `a73950e` | fix(prd): enhance nested execution guards and bug fix mode safeguards |
+| `5b01ab7` | fix(prd): add nested execution guard and agent operational boundaries |
