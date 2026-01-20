@@ -529,7 +529,34 @@ AUTO_RESUME_TASKS_FILE="$TASKS_FILE"
 if [[ -n "$RESUME_BUGFIX_TASKS_FILE" && -f "$RESUME_BUGFIX_TASKS_FILE" ]]; then
     AUTO_RESUME_TASKS_FILE="$RESUME_BUGFIX_TASKS_FILE"
 fi
+
+# Clean up orphaned "Researching" items that don't have a PRP
+# These occur when parallel research was started but never completed
+cleanup_orphan_researching() {
+    local tasks_file=$1
+    local session_dir=$2
+    [[ ! -f "$tasks_file" ]] && return
+
+    # Find all items with status "Researching"
+    local researching_items=$(jq -r '.. | objects | select(.status? == "Researching") | .id // empty' "$tasks_file" 2>/dev/null)
+
+    for item_id in $researching_items; do
+        # Convert ID to directory name (P3.M1.T2.S1 -> P3M1T2S1)
+        local dirname=$(echo "$item_id" | tr -d '.')
+        local prp_path="$session_dir/$dirname/PRP.md"
+
+        # If no PRP exists, this is an orphan - reset to Planned
+        if [[ ! -f "$prp_path" ]]; then
+            print -P "%F{yellow}[CLEANUP]%f Resetting orphan item $item_id (no PRP.md) to Planned"
+            tsk -f "$tasks_file" update "$item_id" Planned 2>/dev/null
+        fi
+    done
+}
+
 if [[ "$MANUAL_START" == "false" && -f "$AUTO_RESUME_TASKS_FILE" ]]; then
+    # Clean up orphans before finding next item
+    cleanup_orphan_researching "$AUTO_RESUME_TASKS_FILE" "$SESSION_DIR"
+
     # Note: -s must come BEFORE the subcommand for commander.js to parse it as a global option
     NEXT_ITEM=$(tsk -f "$AUTO_RESUME_TASKS_FILE" -s "$SCOPE" next 2>/dev/null)
     if [[ -n "$NEXT_ITEM" ]]; then
@@ -1440,6 +1467,19 @@ read -r -d '' DELTA_PRD_GENERATION_PROMPT <<EOF
 
 You are analyzing changes between two versions of a PRD to create a focused delta PRD.
 
+## CRITICAL: PROPORTIONAL SIZING
+
+**The delta PRD size MUST be proportional to the actual change size.**
+
+- 1-line change → 1-2 paragraph PRD, 1 task with 1-2 subtasks
+- Small tweak (few lines) → Short PRD, 1 phase, 1 milestone, 1-3 tasks
+- Medium feature addition → Medium PRD, 1 phase, 1-2 milestones
+- Large new feature → Full PRD structure
+
+**If you produce a 9-phase PRD for a 3-line change, you have FAILED.**
+
+Count the actual lines/words changed. Match your output complexity to input complexity.
+
 ## Previous PRD (Completed Session):
 \$(cat "$PREV_SESSION_DIR/prd_snapshot.md")
 
@@ -1453,21 +1493,20 @@ You are analyzing changes between two versions of a PRD to create a focused delt
 Check $PREV_SESSION_DIR/architecture/ for existing research that may still apply.
 
 ## Instructions:
-1. **DIFF ANALYSIS**: Identify what changed between the two PRD versions
-2. **SCOPE DELTA**: Create a new PRD focusing ONLY on:
+1. **DIFF ANALYSIS**: Identify what ACTUALLY changed (count lines/words)
+2. **SIZE CHECK**: Small diff = small PRD. Do NOT inflate scope.
+3. **SCOPE DELTA**: Create a PRD focusing ONLY on:
    - New features/requirements added
    - Modified requirements (note what changed from original)
-   - Removed requirements (note for awareness, but don't create tasks to implement)
-3. **REFERENCE COMPLETED WORK**: The previous session implemented the original PRD.
+   - Removed requirements (note for awareness, but don't create tasks)
+4. **REFERENCE COMPLETED WORK**: The previous session implemented the original PRD.
    - Reference existing implementations rather than re-implementing
    - If a modification affects completed work, note which files/functions need updates
-4. **LEVERAGE PRIOR RESEARCH**: Check $PREV_SESSION_DIR/architecture/ for research that applies
+5. **LEVERAGE PRIOR RESEARCH**: Check $PREV_SESSION_DIR/architecture/ for research that applies
    - Don't duplicate research that's already been done
-   - Reference it directly in your delta PRD
-5. **OUTPUT**: Write the delta PRD to \`$SESSION_DIR/delta_prd.md\`
+6. **OUTPUT**: Write the delta PRD to \`$SESSION_DIR/delta_prd.md\`
 
-The delta PRD should be self-contained but reference the previous session's work.
-It will be used as input to the task breakdown process for this delta session.
+**Remember: Minimal change = minimal PRD. Do NOT over-engineer.**
 EOF
 
 read -r -d '' TASK_UPDATE_PROMPT <<EOF
@@ -1945,6 +1984,23 @@ generate_dirname() {
     esac
 }
 
+# Find array index for a phase by its ID (handles delta sessions where P3 is at index 0)
+# Usage: find_phase_idx <phase_num>
+# Returns: array index via stdout, or -1 if not found
+find_phase_idx() {
+    local phase_num=$1
+    local total=$(jq '.backlog | length' "$TASKS_FILE")
+    for (( i=0; i<total; i++ )); do
+        local pid=$(jq -r ".backlog[$i].id // empty" "$TASKS_FILE")
+        if [[ "$pid" == "P$phase_num" ]]; then
+            echo $i
+            return 0
+        fi
+    done
+    echo -1
+    return 1
+}
+
 # Get item title from tasks.json
 # Usage: get_item_title <phase_num> <milestone_num> <task_num> <subtask_num>
 get_item_title() {
@@ -1952,7 +2008,8 @@ get_item_title() {
     local milestone_num=$2
     local task_num=$3
     local subtask_num=$4
-    local phase_idx=$((phase_num - 1))
+    local phase_idx=$(find_phase_idx $phase_num)
+    [[ $phase_idx -lt 0 ]] && return 1
     local ms_idx=$((milestone_num - 1))
     local task_idx=$((task_num - 1))
     local subtask_idx=$((subtask_num - 1))
@@ -1980,7 +2037,8 @@ get_item_description() {
     local milestone_num=$2
     local task_num=$3
     local subtask_num=$4
-    local phase_idx=$((phase_num - 1))
+    local phase_idx=$(find_phase_idx $phase_num)
+    [[ $phase_idx -lt 0 ]] && return 1
     local ms_idx=$((milestone_num - 1))
     local task_idx=$((task_num - 1))
     local subtask_idx=$((subtask_num - 1))
@@ -2066,15 +2124,28 @@ The previous PRP defines what will exist when your item begins implementation.
     fi
 
     # Run research in background subshell
+    # Status: Researching (in progress) -> Ready (PRP created, ready to implement)
+    # The orphan cleanup function handles cases where research fails before PRP is created
     (
-        run_with_retry tsk_cmd update "$id" Researching
-        run_with_retry $AGENT $PRP_AGENT_MCP_ARGS -p "$PRP_CREATE_PROMPT Create a PRP for $(get_scope_name) $id of the PRD. Store it at $dirname/PRP.md.
+        tsk -f "$TASKS_FILE" update "$id" Researching
+        $AGENT $PRP_AGENT_MCP_ARGS -p "$PRP_CREATE_PROMPT Create a PRP for $(get_scope_name) $id of the PRD.
+
+CRITICAL OUTPUT PATHS (use these EXACT paths):
+- PRP file: $dirname/PRP.md
+- Research files: $dirname/research/
+
+DO NOT write files to any other location. All research MUST go in $dirname/research/ and the final PRP MUST be at $dirname/PRP.md.
+
 <item_title>$(get_item_title $phase_num $ms_num $task_num $subtask_num)</item_title>
 <item_description>$(get_item_description $phase_num $ms_num $task_num $subtask_num)</item_description>
-<plan_status>$(tsk_cmd status)</plan_status>$prev_context"
+<plan_status>$(tsk -f "$TASKS_FILE" status)</plan_status>$prev_context"
         if [[ ! -f "$dirname/PRP.md" ]]; then
             print -P "%F{yellow}[PARALLEL]%f PRP.md not found for $id, retrying..."
             $AGENT --continue -p "You didn't write the file. Make sure you write the file to $dirname/PRP.md"
+        fi
+        # Mark as Ready when PRP is successfully created
+        if [[ -f "$dirname/PRP.md" ]]; then
+            tsk -f "$TASKS_FILE" update "$id" Ready
         fi
     ) &
 
@@ -2085,23 +2156,45 @@ The previous PRP defines what will exist when your item begins implementation.
 }
 
 # Wait for background research to complete if it matches the given item
+# Logic: If process alive, wait. If process dead without PRP, it crashed - return error to trigger sync retry.
 # Usage: wait_for_background_research <id>
 wait_for_background_research() {
     local id=$1
 
     if [[ -n "$RESEARCH_PID" && "$RESEARCH_ITEM_ID" == "$id" ]]; then
-        print -P "%F{cyan}[PARALLEL]%f Waiting for background research of $id to complete..."
-        wait $RESEARCH_PID
-        local exit_code=$?
-        RESEARCH_PID=""
-        RESEARCH_ITEM_ID=""
-        RESEARCH_DIRNAME=""
-        if [[ $exit_code -ne 0 ]]; then
-            print -P "%F{yellow}[PARALLEL]%f Background research exited with code $exit_code"
-        else
-            print -P "%F{green}[PARALLEL]%f Background research for $id completed"
-        fi
-        return $exit_code
+        print -P "%F{cyan}[PARALLEL]%f Waiting for background research of $id..."
+
+        while true; do
+            # Check if PRP exists - success
+            if [[ -f "$RESEARCH_DIRNAME/PRP.md" ]]; then
+                print -P "%F{green}[PARALLEL]%f PRP for $id ready"
+                RESEARCH_PID=""
+                RESEARCH_ITEM_ID=""
+                RESEARCH_DIRNAME=""
+                return 0
+            fi
+
+            # Check if process is still alive
+            if kill -0 $RESEARCH_PID 2>/dev/null; then
+                # Process alive, wait
+                sleep 5
+            else
+                # Process dead - check if it succeeded
+                wait $RESEARCH_PID 2>/dev/null
+                local exit_code=$?
+                RESEARCH_PID=""
+                RESEARCH_ITEM_ID=""
+                RESEARCH_DIRNAME=""
+
+                if [[ -f "$RESEARCH_DIRNAME/PRP.md" ]]; then
+                    print -P "%F{green}[PARALLEL]%f Background research completed"
+                    return 0
+                else
+                    print -P "%F{red}[PARALLEL]%f Background research CRASHED (exit $exit_code), will retry synchronously"
+                    return 1
+                fi
+            fi
+        done
     fi
     return 0
 }
@@ -2115,17 +2208,8 @@ get_next_item() {
     local task_num=$3
     local subtask_num=$4
 
-    # Find actual array indices by searching for matching IDs
-    # This handles delta sessions where P3 might be at backlog[0]
-    local phase_idx=-1
-    local total_phases=$(jq '.backlog | length' "$TASKS_FILE")
-    for (( i=0; i<total_phases; i++ )); do
-        local pid=$(jq -r ".backlog[$i].id // empty" "$TASKS_FILE")
-        if [[ "$pid" == "P$phase_num" ]]; then
-            phase_idx=$i
-            break
-        fi
-    done
+    # Find actual array index for this phase (handles delta sessions)
+    local phase_idx=$(find_phase_idx $phase_num)
     [[ $phase_idx -lt 0 ]] && return 1
 
     local ms_idx=$((ms_num - 1))

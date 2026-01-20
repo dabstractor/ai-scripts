@@ -3,19 +3,80 @@
 ## Changes Since Commit 37e81cc5
 
 **Base commit:** `37e81cc5` - "rewrite PRD spec with detailed technical implementation plan"
-**Latest commit:** `5b01ab7` - "fix(prd): add nested execution guard and agent operational boundaries"
-**Date range:** Commits b569e7f through 5b01ab7 (13 commits)
-**Files changed:** `run-prd.sh` (+590 lines, -170 lines)
+**Latest commit:** `ebc7157` - "fix(prd): harden nested execution guards and remove legacy bug hunt artifacts"
+**Date range:** Commits b569e7f through ebc7157 (14 commits)
+**Files changed:** `run-prd.sh` (+628 lines, -224 lines)
 
 ---
 
 ## Summary of Changes
 
-This release introduces a major refactor of the bug hunt workflow with a new self-contained session architecture, enhanced task management via the `prd task` subcommand, improved session completion handling, and better artifact management. Additionally, strict operational boundaries have been added to all pipeline agents to prevent accidental pipeline corruption, and a nested execution guard prevents agents from recursively invoking the pipeline during implementation. Recent updates have further hardened these guards with session path validation and removed the separate BUG_FIX_MODE in favor of consistent SKIP_BUG_FINDING usage.
+This release introduces a major refactor of the bug hunt workflow with a new self-contained session architecture, enhanced task management via the `prd task` subcommand, improved session completion handling, and better artifact management. Additionally, strict operational boundaries have been added to all pipeline agents to prevent accidental pipeline corruption, and a nested execution guard prevents agents from recursively invoking the pipeline during implementation. Recent updates have further hardened these guards with session path validation, removed the separate BUG_FIX_MODE in favor of consistent SKIP_BUG_FINDING usage, and eliminated legacy `bug_hunt_tasks.json` support in favor of the new bugfix session architecture.
 
 ---
 
 ## Detailed Changelog
+
+### 0. Background Research Timeout Fix (CURRENT)
+
+**Problem Solved:** All pipeline instances were hanging indefinitely at "Waiting for background research to complete..." when the Claude Code CLI crashed or failed to respond. The `wait $RESEARCH_PID` call would block forever with no timeout.
+
+**Solution:** Replaced blocking `wait` with a polling loop that:
+1. Checks every 5 seconds if the process is still running
+2. Checks if the PRP file was created (early success)
+3. Times out after 5 minutes (configurable via `RESEARCH_TIMEOUT`)
+4. Kills the stuck process and falls back to synchronous research
+
+**Implementation:**
+```bash
+wait_for_background_research() {
+    local id=$1
+    local timeout_seconds=${RESEARCH_TIMEOUT:-300}  # 5 minute default
+    local check_interval=5
+
+    if [[ -n "$RESEARCH_PID" && "$RESEARCH_ITEM_ID" == "$id" ]]; then
+        local elapsed=0
+        while [[ $elapsed -lt $timeout_seconds ]]; do
+            # Check if process finished
+            if ! kill -0 $RESEARCH_PID 2>/dev/null; then
+                wait $RESEARCH_PID 2>/dev/null
+                # ... handle exit code
+                return $exit_code
+            fi
+
+            # Check if PRP was created (success)
+            if [[ -f "$RESEARCH_DIRNAME/PRP.md" ]]; then
+                return 0
+            fi
+
+            sleep $check_interval
+            elapsed=$((elapsed + check_interval))
+        done
+
+        # Timeout - kill process and fall back to sync
+        kill $RESEARCH_PID 2>/dev/null
+        wait $RESEARCH_PID 2>/dev/null
+        return 1  # Triggers synchronous research
+    fi
+    return 0
+}
+```
+
+**New Environment Variable:**
+- `RESEARCH_TIMEOUT` - Timeout in seconds for background research (default: 300)
+
+**Behavior:**
+- Shows progress every 5 seconds: `Still waiting... (30s/300s)`
+- If PRP file appears, returns success immediately
+- If timeout reached, kills process and returns error
+- Error triggers fallback to synchronous research in `execute_item()`
+
+**Impact:**
+- Prevents indefinite hangs when Claude Code crashes
+- Provides visibility into wait progress
+- Graceful degradation to synchronous mode on failure
+
+---
 
 ### 1. Nested Execution Guard (104d93f)
 
@@ -120,6 +181,113 @@ run_with_retry $BREAKDOWN_AGENT --system-prompt="$TASK_BREAKDOWN_SYSTEM_PROMPT" 
 - Simpler codebase with single source of truth for bug fix mode detection
 - More consistent behavior between regular and bug fix sessions
 - Bug fix sessions get proper architecture directory and cleanup
+
+---
+
+### 1d. Remove Legacy bug_hunt_tasks.json Support (ebc7157)
+
+**Problem Solved:** The codebase maintained backwards compatibility with the old `bug_hunt_tasks.json` format, adding complexity and potential confusion with the new bugfix session architecture.
+
+**Solution:** Completely removed all references to `bug_hunt_tasks.json` in favor of the new `bugfix/NNN_hash/tasks.json` structure.
+
+**Removed Code:**
+- Priority 2 check in `prd task` subcommand for `bug_hunt_tasks.json`
+- `bug_hunt_tasks.json` check in `is_session_complete()` function
+- `bug_hunt_tasks.json` check in bugfix session completion loops
+- Auto-detection logic for legacy `bug_hunt_tasks.json` in auto-resume
+- All agent prompt references to `bug_hunt_tasks.json` as forbidden file
+
+**Updated Cleanup Rules:**
+```bash
+## CRITICAL - NEVER DELETE OR MOVE THESE FILES:
+- **$SESSION_DIR/tasks.json** - Pipeline state tracking
+- **$SESSION_DIR/prd_snapshot.md** - PRD snapshot for this session
+- **$SESSION_DIR/delta_prd.md** - Delta PRD for incremental sessions
+- **$SESSION_DIR/delta_from.txt** - Delta session linkage
+- **PRD.md** - Product requirements document
+- **$SESSION_DIR/TEST_RESULTS.md** - Bug report file
+- Any file matching `*tasks*.json` pattern
+- Any file directly in $SESSION_DIR/ root (NEVER MOVE to subdirectories)
+```
+
+**Impact:**
+- Cleaner codebase with single bugfix session architecture
+- Reduced cognitive load for understanding bug hunt workflows
+- Session completion checks are simpler and more reliable
+
+---
+
+### 1e. Improved Delta PRD Generation (ebc7157)
+
+**Problem Solved:** Delta sessions could get stuck if the delta PRD wasn't generated, with no way to recover. Additionally, the `get_next_item()` function assumed phase numbers matched array indices, which fails for delta sessions.
+
+**Solutions:**
+
+1. **Delta PRD Retry Logic:** Added retry mechanism when delta PRD isn't created on first attempt.
+
+2. **Delta PRD Validation:** Session now fails fast if delta PRD cannot be generated.
+
+3. **Missing Delta PRD Recovery:** Incomplete delta sessions now detect and regenerate missing delta PRDs.
+
+4. **Fixed Phase Indexing:** `get_next_item()` now searches for phase IDs instead of using array indices.
+
+**Delta PRD Retry Implementation:**
+```bash
+# Retry if delta PRD wasn't created
+if [[ ! -f "$SESSION_DIR/delta_prd.md" ]]; then
+    print -P "%F{yellow}[DELTA]%f delta_prd.md not found. Demanding agent write it..."
+    run_with_retry $BREAKDOWN_AGENT --continue -p "You did NOT write the delta PRD file..."
+fi
+
+# Final validation - FAIL if delta PRD is still missing
+if [[ ! -f "$SESSION_DIR/delta_prd.md" ]]; then
+    print -P "%F{red}[ERROR]%f Delta PRD generation FAILED."
+    exit 1
+fi
+```
+
+**Resume Missing Delta PRD Detection:**
+```bash
+# Check if this is a delta session that never got its delta PRD generated
+if [[ -f "$CURRENT_SESSION_DIR/delta_from.txt" && ! -f "$CURRENT_SESSION_DIR/delta_prd.md" ]]; then
+    # ... find previous session and set CREATE_DELTA=true
+    print -P "%F{yellow}[DELTA]%f Delta PRD missing, will regenerate from session $prev_session_num"
+fi
+```
+
+**Fixed Phase Indexing in `get_next_item()`:**
+```bash
+# Find actual array indices by searching for matching IDs
+# This handles delta sessions where P3 might be at backlog[0]
+local phase_idx=-1
+for (( i=0; i<total_phases; i++ )); do
+    local pid=$(jq -r ".backlog[$i].id // empty" "$TASKS_FILE")
+    if [[ "$pid" == "P$phase_num" ]]; then
+        phase_idx=$i
+        break
+    fi
+done
+```
+
+**Impact:**
+- Delta sessions are more robust and recoverable
+- Clear error messages when delta PRD generation fails
+- Delta sessions with non-sequential phase IDs now work correctly
+
+---
+
+### 1f. New PRD Brainstormer System Prompt (ebc7157)
+
+**Addition:** New system prompt file `prompts/system_prompts/prd-brainstormer.md` for an AI-powered PRD interrogation agent.
+
+**Purpose:** Defines a "Requirements Interrogation and Convergence Engine" that produces comprehensive PRDs through aggressive questioning rather than invention.
+
+**Key Features:**
+- Four-phase model: Discovery → Interrogation → Convergence → Finalization
+- Decision Ledger for tracking confirmed facts
+- Linear questioning rule (no parallel questions that could invalidate each other)
+- Testability requirements for all specs
+- Impossibility detection for conflicting requirements
 
 ---
 
@@ -493,16 +661,19 @@ Note: `TASKS_FILE` is intentionally NOT passed - child session creates its own.
 
 ### From Pre-37e81cc5 Sessions
 
-Old sessions with these files at session root level are still supported:
-- `bug_hunt_tasks.json` - Legacy bug hunt tasks
-- `bug_fix_tasks.json` - Legacy bug fix tasks (backwards compat check)
-- `TEST_RESULTS.md` - Bug reports at session level
+**As of ebc7157:** Legacy `bug_hunt_tasks.json` support has been removed. Sessions must use the new bugfix session architecture.
 
-The new format stores everything within `bugfix/NNN_hash/` subdirectories.
+Old sessions with these files at session root level are **no longer supported**:
+- ~~`bug_hunt_tasks.json`~~ - Removed in ebc7157
+- ~~`bug_fix_tasks.json`~~ - Removed in ebc7157
+
+The current format stores everything within `bugfix/NNN_hash/` subdirectories:
+- `bugfix/001_hash/tasks.json` - Bug fix tasks
+- `bugfix/001_hash/TEST_RESULTS.md` - Bug reports
 
 ### Breaking Changes
 
-None. The changes are backwards compatible with existing sessions.
+**ebc7157:** Removed backwards compatibility for `bug_hunt_tasks.json` at session root level. If you have old sessions using this format, you will need to manually migrate them to the new `bugfix/NNN_hash/` structure or start fresh.
 
 ---
 
@@ -510,8 +681,10 @@ None. The changes are backwards compatible with existing sessions.
 
 | File | Lines Added | Lines Removed |
 |------|-------------|---------------|
-| `run-prd.sh` | 590 | 170 |
-| `CHANGELOG_37e81cc5.md` | 127 | 17 |
+| `run-prd.sh` | 628 | 224 |
+| `CHANGELOG_37e81cc5.md` | 229 | 17 |
+| `prompts/system_prompts/prd-brainstormer.md` | 241 | 0 |
+| `prompts/changelog_update.md` | 1 | 0 |
 
 ---
 
@@ -532,3 +705,4 @@ None. The changes are backwards compatible with existing sessions.
 | `104d93f` | fix(prd): add nested execution guard and cleanup safety measures |
 | `a73950e` | fix(prd): enhance nested execution guards and bug fix mode safeguards |
 | `5b01ab7` | fix(prd): add nested execution guard and agent operational boundaries |
+| `ebc7157` | fix(prd): harden nested execution guards and remove legacy bug hunt artifacts |
