@@ -1,0 +1,149 @@
+#!/usr/bin/env node
+
+const http = require('http');
+const https = require('https');
+const fs = require('fs');
+const path = require('path');
+const net = require('net');
+
+const TARGET = 'api.z.ai';
+const TARGET_PATH = '/api/anthropic';
+
+let PORT;
+let LOG_DIR;
+let requestCount = 0;
+
+function findAvailablePort(startPort = 9400) {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.listen(startPort, '127.0.0.1', () => {
+      // Don't close - return the server with the port already bound
+      resolve({ port: server.address().port, server });
+    });
+    server.on('error', () => {
+      resolve(findAvailablePort(startPort + 1));
+    });
+  });
+}
+
+function getLogPath(reqId, type) {
+  return path.join(LOG_DIR, `${String(reqId).padStart(6, '0')}_${type}`);
+}
+
+function log(msg) {
+  const ts = new Date().toISOString();
+  const line = `[${ts}] ${msg}\n`;
+  fs.appendFileSync(path.join(LOG_DIR, 'proxy.log'), line);
+  process.stdout.write(line);
+}
+
+async function main() {
+  // Find port and get a placeholder server that holds it
+  const { port, server: placeholder } = await findAvailablePort();
+  PORT = port;
+  LOG_DIR = `/tmp/glm-proxy-debug-${PORT}`;
+
+  // Create log directory
+  if (!fs.existsSync(LOG_DIR)) {
+    fs.mkdirSync(LOG_DIR, { recursive: true });
+  }
+
+  // Write port to stdout for caller to capture
+  console.log(`PORT:${PORT}`);
+
+  // Close placeholder and immediately start real server
+  placeholder.close();
+
+  const server = http.createServer((req, res) => {
+    let body = [];
+    const reqId = ++requestCount;
+    const endpoint = req.url.split('?')[0];
+
+    req.on('data', chunk => body.push(chunk));
+    req.on('end', () => {
+      body = Buffer.concat(body);
+      const bodyStr = body.toString();
+
+      let model = 'unknown';
+      try {
+        const parsed = JSON.parse(bodyStr);
+        model = parsed.model || 'unknown';
+      } catch {}
+
+      log(`[REQ#${reqId}] ${req.method} ${req.url} | ${model} | ${body.length}b`);
+
+      // Log FULL request
+      fs.writeFileSync(getLogPath(reqId, 'req_headers.json'), JSON.stringify(req.headers, null, 2));
+      fs.writeFileSync(getLogPath(reqId, 'req_body.txt'), bodyStr);
+
+      // Intercept event_logging
+      if (endpoint === '/api/event_logging/batch') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end('{"success":true}');
+        log(`[RES#${reqId}] event_logging intercepted`);
+        return;
+      }
+
+      const options = {
+        hostname: TARGET,
+        port: 443,
+        path: TARGET_PATH + req.url,
+        method: req.method,
+        headers: { ...req.headers, host: TARGET },
+      };
+
+      const startTime = Date.now();
+      const proxyReq = https.request(options, proxyRes => {
+        let responseBody = [];
+
+        proxyRes.on('data', chunk => responseBody.push(chunk));
+        proxyRes.on('end', () => {
+          const fullResponse = Buffer.concat(responseBody).toString();
+          const duration = Date.now() - startTime;
+
+          log(`[RES#${reqId}] ${proxyRes.statusCode} (${duration}ms) ${fullResponse.length}b`);
+
+          // Log FULL response
+          fs.writeFileSync(getLogPath(reqId, 'res_headers.json'), JSON.stringify(proxyRes.headers, null, 2));
+          fs.writeFileSync(getLogPath(reqId, 'res_body.txt'), fullResponse);
+          fs.writeFileSync(getLogPath(reqId, 'res_status.txt'), `${proxyRes.statusCode}`);
+
+          // Forward response
+          res.writeHead(proxyRes.statusCode, proxyRes.headers);
+          res.end(fullResponse);
+        });
+      });
+
+      proxyReq.on('error', err => {
+        const duration = Date.now() - startTime;
+        log(`[ERR#${reqId}] ${err.message} (${duration}ms)`);
+        fs.writeFileSync(getLogPath(reqId, 'error.txt'), `${err.message}\n${err.stack}`);
+        if (!res.headersSent) {
+          res.writeHead(502);
+          res.end(`Proxy error: ${err.message}`);
+        }
+      });
+
+      proxyReq.setTimeout(600000, () => {
+        log(`[ERR#${reqId}] TIMEOUT 10min`);
+        fs.writeFileSync(getLogPath(reqId, 'error.txt'), 'TIMEOUT 10min');
+        proxyReq.destroy();
+      });
+
+      proxyReq.write(body);
+      proxyReq.end();
+    });
+  });
+
+  server.listen(PORT, '127.0.0.1', () => {
+    log(`CWD: ${process.cwd()}`);
+    log('############################################################');
+    log('GLM DEBUG PROXY - FULL LOGGING');
+    log(`Port: ${PORT}`);
+    log(`Target: https://${TARGET}${TARGET_PATH}`);
+    log(`Logs: ${LOG_DIR}/`);
+    log('############################################################');
+  });
+}
+
+main();
