@@ -304,6 +304,77 @@ BUG_RESULTS_FILE="${BUG_RESULTS_FILE:-TEST_RESULTS.md}"
 BUGFIX_SCOPE="${BUGFIX_SCOPE:-subtask}"
 SKIP_BUG_FINDING="${SKIP_BUG_FINDING:-false}"
 
+# --- Staged PRD Change Detection ---
+# Check if PRD.md has staged changes and classify them before proceeding
+check_staged_prd_changes() {
+    # Only check if we're in a git repo and PRD exists
+    [[ ! -d ".git" ]] && return 0
+    [[ ! -f "$PRD_FILE" ]] && return 0
+
+    # Check if PRD.md is in the staging area
+    if ! git diff --cached --name-only | grep -q "^PRD\.md$"; then
+        return 0  # PRD not staged, nothing to do
+    fi
+
+    print -P "%F{yellow}[PRD CHECK]%f Detected staged changes to PRD.md"
+
+    # Get the diff for analysis
+    local PRD_DIFF=$(git diff --cached "$PRD_FILE")
+
+    if [[ -z "$PRD_DIFF" ]]; then
+        return 0  # No actual diff content
+    fi
+
+    print -P "%F{cyan}[PRD CHECK]%f Analyzing changes..."
+
+    local CLASSIFY_PROMPT="Analyze this git diff of a Product Requirements Document (PRD.md).
+
+DIFF:
+$PRD_DIFF
+
+CLASSIFICATION RULES:
+- COSMETIC: Only whitespace, formatting, markdown table alignment, blank lines, typo fixes, or rewording that doesn't change requirements
+- SUBSTANTIVE: Any change to actual requirements, features, constraints, scope, acceptance criteria, or technical specifications
+
+Output ONLY one word: COSMETIC or SUBSTANTIVE"
+
+    local RESULT=$(claude --print --allowed-tools "" --system-prompt "You are a binary classifier for PRD changes. Output only COSMETIC or SUBSTANTIVE." "$CLASSIFY_PROMPT" 2>/dev/null)
+    local CLEAN_RESULT=$(echo "$RESULT" | tr -d '[:space:]')
+
+    # Retry if invalid response
+    if [[ "$CLEAN_RESULT" != "COSMETIC" && "$CLEAN_RESULT" != "SUBSTANTIVE" ]]; then
+        print -P "%F{yellow}[RETRY]%f Invalid response: '$RESULT'. Retrying..."
+        RESULT=$(claude --print --continue --allowed-tools "" "ERROR: You replied with '$RESULT'. Output exactly one word: COSMETIC or SUBSTANTIVE." 2>/dev/null)
+        CLEAN_RESULT=$(echo "$RESULT" | tr -d '[:space:]')
+    fi
+
+    print -P "%F{cyan}[PRD CHECK]%f Classification: $CLEAN_RESULT"
+
+    if [[ "$CLEAN_RESULT" == "SUBSTANTIVE" ]]; then
+        print -P "%F{red}[PRD CHECK]%f Substantive PRD changes detected!"
+        print -P "%F{yellow}[PRD CHECK]%f Removing PRD.md from staging area."
+        print -P "%F{yellow}[PRD CHECK]%f To apply PRD changes, commit other files first, then run the pipeline to handle PRD changes properly."
+        git reset HEAD "$PRD_FILE" >/dev/null 2>&1
+        print -P "%F{green}[PRD CHECK]%f PRD.md unstaged. Other staged files remain."
+    elif [[ "$CLEAN_RESULT" == "COSMETIC" ]]; then
+        print -P "%F{green}[PRD CHECK]%f Cosmetic changes only. Updating snapshot..."
+        # Find current session and update its snapshot
+        local latest_num=$(get_latest_session_number)
+        if [[ $latest_num -gt 0 ]]; then
+            local latest_dir=$(get_session_dir $latest_num)
+            if [[ -d "$latest_dir" ]]; then
+                cp "$PRD_FILE" "$latest_dir/prd_snapshot.md"
+                print -P "%F{green}[PRD CHECK]%f Snapshot updated in $(basename "$latest_dir")"
+            fi
+        fi
+    else
+        print -P "%F{yellow}[PRD CHECK]%f Could not classify changes. Proceeding without action."
+    fi
+}
+
+# Run the staged PRD check
+check_staged_prd_changes
+
 # --- Session State Resolution ---
 # Must happen before bug hunt auto-detect so paths are correct
 
@@ -438,7 +509,8 @@ elif [[ -f "$PRD_FILE" ]]; then
             print -P "%F{yellow}[QUESTION]%f How would you like to proceed?"
             print "  1) Integrate changes into current session (update tasks)"
             print "  2) Finish current session first, then start delta session"
-            read -r "choice?Select [1/2]: "
+            print "  3) Ignore changes (cosmetic/unrelated edits - update hash only)"
+            read -r "choice?Select [1/2/3]: "
 
             case "$choice" in
                 1)
@@ -453,6 +525,12 @@ elif [[ -f "$PRD_FILE" ]]; then
                     print -P "%F{cyan}[SESSION]%f Will queue delta for after current session completes..."
                     # Store the new PRD hash for later
                     echo "$(hash_prd_content "$PRD_FILE")" > "$CURRENT_SESSION_DIR/.pending_delta_hash"
+                    ;;
+                3)
+                    print -P "%F{cyan}[SESSION]%f Acknowledging PRD change as non-impacting..."
+                    # Update snapshot so future detection sees current PRD as baseline
+                    cp "$PRD_FILE" "$CURRENT_SESSION_DIR/prd_snapshot.md"
+                    print -P "%F{cyan}[SESSION]%f Updated snapshot. Continuing with current tasks."
                     ;;
                 *)
                     print -P "%F{red}[ERROR]%f Invalid choice. Exiting."
@@ -2096,6 +2174,13 @@ start_background_research() {
     local prev_id=$7
     local prev_dirname=$8
 
+    # Skip if item is already complete
+    local item_status=$(get_item_status "$id")
+    if [[ "$item_status" == "Complete" || "$item_status" == "Completed" ]]; then
+        print -P "%F{yellow}[PARALLEL]%f $id already complete, skipping"
+        return 0
+    fi
+
     # Skip if PRP already exists
     if [[ -f "$dirname/PRP.md" ]]; then
         print -P "%F{yellow}[PARALLEL]%f PRP for $id already exists, skipping background research"
@@ -2143,9 +2228,12 @@ DO NOT write files to any other location. All research MUST go in $dirname/resea
             print -P "%F{yellow}[PARALLEL]%f PRP.md not found for $id, retrying..."
             $AGENT --continue -p "You didn't write the file. Make sure you write the file to $dirname/PRP.md"
         fi
-        # Mark as Ready when PRP is successfully created
+        # Mark as Ready when PRP is successfully created, or exit with error
         if [[ -f "$dirname/PRP.md" ]]; then
             tsk -f "$TASKS_FILE" update "$id" Ready
+        else
+            print -P "%F{red}[PARALLEL]%f Background research FAILED for $id - no PRP created"
+            exit 1
         fi
     ) &
 
@@ -2156,44 +2244,59 @@ DO NOT write files to any other location. All research MUST go in $dirname/resea
 }
 
 # Wait for background research to complete if it matches the given item
-# Logic: If process alive, wait. If process dead without PRP, it crashed - return error to trigger sync retry.
+# Handles: PRP ready, process died, process HUNG (alive but stuck)
 # Usage: wait_for_background_research <id>
 wait_for_background_research() {
     local id=$1
+    local elapsed=0
+    local max_wait=${RESEARCH_TIMEOUT:-600}  # 10 min max for hung processes
 
     if [[ -n "$RESEARCH_PID" && "$RESEARCH_ITEM_ID" == "$id" ]]; then
-        print -P "%F{cyan}[PARALLEL]%f Waiting for background research of $id..."
+        print -P "%F{cyan}[PARALLEL]%f Waiting for $id (PID $RESEARCH_PID, max ${max_wait}s)..."
 
         while true; do
-            # Check if PRP exists - success
+            # 1. Check if PRP exists - success
             if [[ -f "$RESEARCH_DIRNAME/PRP.md" ]]; then
-                print -P "%F{green}[PARALLEL]%f PRP for $id ready"
+                print -P "%F{green}[PARALLEL]%f PRP ready (${elapsed}s)"
                 RESEARCH_PID=""
                 RESEARCH_ITEM_ID=""
                 RESEARCH_DIRNAME=""
                 return 0
             fi
 
-            # Check if process is still alive
-            if kill -0 $RESEARCH_PID 2>/dev/null; then
-                # Process alive, wait
-                sleep 5
-            else
-                # Process dead - check if it succeeded
+            # 2. Check if process died
+            if ! kill -0 $RESEARCH_PID 2>/dev/null; then
                 wait $RESEARCH_PID 2>/dev/null
                 local exit_code=$?
+                local saved_dirname="$RESEARCH_DIRNAME"
                 RESEARCH_PID=""
                 RESEARCH_ITEM_ID=""
                 RESEARCH_DIRNAME=""
 
-                if [[ -f "$RESEARCH_DIRNAME/PRP.md" ]]; then
-                    print -P "%F{green}[PARALLEL]%f Background research completed"
+                if [[ -f "$saved_dirname/PRP.md" ]]; then
+                    print -P "%F{green}[PARALLEL]%f Done (${elapsed}s)"
                     return 0
                 else
-                    print -P "%F{red}[PARALLEL]%f Background research CRASHED (exit $exit_code), will retry synchronously"
+                    print -P "%F{red}[PARALLEL]%f FAILED (exit $exit_code, ${elapsed}s) - retrying sync"
                     return 1
                 fi
             fi
+
+            # 3. Process alive - check timeout for HUNG processes
+            if (( elapsed >= max_wait )); then
+                print -P "%F{red}[PARALLEL]%f HUNG! PID $RESEARCH_PID alive but no PRP after ${elapsed}s - killing"
+                kill -9 $RESEARCH_PID 2>/dev/null
+                wait $RESEARCH_PID 2>/dev/null
+                RESEARCH_PID=""
+                RESEARCH_ITEM_ID=""
+                RESEARCH_DIRNAME=""
+                return 1
+            fi
+
+            # 4. Still waiting
+            sleep 5
+            elapsed=$((elapsed + 5))
+            (( elapsed % 60 == 0 )) && print -P "%F{cyan}[PARALLEL]%f PID $RESEARCH_PID alive, ${elapsed}s/${max_wait}s..."
         done
     fi
     return 0
@@ -2340,8 +2443,15 @@ execute_item() {
 <item_title>$(get_item_title $phase_num $ms_num $task_num $subtask_num)</item_title>
 <item_description>$(get_item_description $phase_num $ms_num $task_num $subtask_num)</item_description>
 <plan_status>$(tsk_cmd status)</plan_status>"
-        [ ! -f "$dirname/PRP.md" ] && print -P "%F{red}[ERROR]%f PRP.md not found. Retrying..." && $AGENT --continue -p "You didn't write the file. Make sure you write the file to $dirname/PRP.md"
-        [ ! -f "$dirname/PRP.md" ] && print -P "%F{red}[ERROR]%f PRP.md not found. Aborting..." && exit 1
+        if [[ ! -f "$dirname/PRP.md" ]]; then
+            print -P "%F{yellow}[RETRY]%f PRP.md not found. Retrying..."
+            $AGENT --continue -p "You didn't write the file. Make sure you write the file to $dirname/PRP.md"
+        fi
+        if [[ ! -f "$dirname/PRP.md" ]]; then
+            print -P "%F{red}[FAILED]%f PRP creation failed for $id - marking as Failed and continuing"
+            run_with_retry tsk_cmd update "$id" Failed
+            return 1
+        fi
         run_with_retry tsk_cmd update "$id" Implementing
     fi
 
@@ -2355,10 +2465,18 @@ execute_item() {
         fi
     fi
 
-    run_with_retry $AGENT -p "$PRP_EXECUTE_PROMPT Execute the PRP for $(get_scope_name) $id. The PRP file is located at: $dirname/PRP.md. READ IT NOW."
+    if ! run_with_retry $AGENT -p "$PRP_EXECUTE_PROMPT Execute the PRP for $(get_scope_name) $id. The PRP file is located at: $dirname/PRP.md. READ IT NOW."; then
+        print -P "%F{red}[FAILED]%f Agent execution failed for $id - marking as Failed and continuing"
+        run_with_retry tsk_cmd update "$id" Failed
+        return 1
+    fi
 
     git add $TASKS_FILE
-    [[ -z "$(git diff HEAD --name-only)" ]] && print -P "%F{red}[ERROR]%f No diff found after $id. Aborting..." && exit 1
+    if [[ -z "$(git diff HEAD --name-only)" ]]; then
+        print -P "%F{red}[FAILED]%f No changes produced for $id - marking as Failed and continuing"
+        run_with_retry tsk_cmd update "$id" Failed
+        return 1
+    fi
 
     run_with_retry tsk_cmd update "$id" Complete
 
@@ -2371,12 +2489,11 @@ execute_item() {
     check_shutdown
 }
 
-# Alias-aware retry logic with interruptible wait for graceful shutdown
+# Simple retry logic with shutdown support
 run_with_retry() {
     local n=1
     local max=3
     local delay=5
-    local cmd_pid exit_status
 
     while true; do
         # Check shutdown before starting new attempt
@@ -2384,40 +2501,22 @@ run_with_retry() {
             return 130
         fi
 
-        # Run in background subshell - preserves alias expansion via eval
-        ( eval "${(q)@}" ) &
-        cmd_pid=$!
-        CURRENT_CMD_PID=$cmd_pid
+        # Run command directly
+        eval "${(q)@}"
+        local exit_status=$?
 
-        # Poll with sleep (sleep IS interruptible by signals, wait is NOT in zsh)
-        while kill -0 $cmd_pid 2>/dev/null; do
-            # Check shutdown - trap fires during sleep
-            if [[ "$SHUTDOWN_REQUESTED" == "true" ]]; then
-                kill -TERM $cmd_pid 2>/dev/null
-                wait $cmd_pid 2>/dev/null
-                CURRENT_CMD_PID=""
-                return 130
-            fi
-            sleep 0.1
-        done
-
-        # Process finished, get exit status
-        wait $cmd_pid 2>/dev/null
-        exit_status=$?
-        CURRENT_CMD_PID=""
-
-        # Success - return
+        # Success
         if [[ $exit_status -eq 0 ]]; then
             return 0
         fi
 
         # Retry logic
         if (( n < max )); then
-            print -P "%F{yellow}[RETRY]%f Command failed. Attempt $n/$max. Retrying in ${delay}s..."
+            print -P "%F{yellow}[RETRY]%f Command failed (exit $exit_status). Attempt $n/$max. Retrying in ${delay}s..."
             sleep $delay
             ((n++))
         else
-            print -P "%F{red}[ERROR]%f Command failed after $max attempts: $*"
+            print -P "%F{red}[ERROR]%f Command failed after $max attempts"
             return 1
         fi
     done
