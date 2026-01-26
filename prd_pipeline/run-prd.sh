@@ -61,10 +61,10 @@ if [[ "$1" == "task" ]]; then
 
     TASKS_FILE=""
 
-    # Priority 1: Check for incomplete bugfix session (new format - preferred)
+    # Priority 1: Always use latest bugfix session if it exists (regardless of task status)
     if [[ -d "$SESSION_DIR/bugfix" ]]; then
         LATEST_BUGFIX=$(find "$SESSION_DIR/bugfix" -maxdepth 1 -type d -name '[0-9]*_*' 2>/dev/null | sort -n | tail -1)
-        if [[ -n "$LATEST_BUGFIX" && -f "$LATEST_BUGFIX/tasks.json" ]] && has_actionable_tasks "$LATEST_BUGFIX/tasks.json"; then
+        if [[ -n "$LATEST_BUGFIX" && -f "$LATEST_BUGFIX/tasks.json" ]]; then
             TASKS_FILE="$LATEST_BUGFIX/tasks.json"
             print -P "%F{cyan}[prd task]%f Using bugfix tasks: bugfix/$(basename "$LATEST_BUGFIX")/tasks.json" >&2
         fi
@@ -141,7 +141,7 @@ esac
 
 # --- 3. Configuration ---
 AGENT="${AGENT:-pglp}"
-BREAKDOWN_AGENT="${BREAKDOWN_AGENT:-$AGENT}"
+BREAKDOWN_AGENT="${BREAKDOWN_AGENT:-clp}"
 TASKS_FILE="${TASKS_FILE:-tasks.json}"
 PRD_FILE="${PRD_FILE:-PRD.md}"
 PLAN_DIR="${PLAN_DIR:-plan}"
