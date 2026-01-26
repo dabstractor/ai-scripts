@@ -138,7 +138,7 @@ case $SCOPE in
 esac
 
 # --- 3. Configuration ---
-AGENT="${AGENT:-glp}"
+AGENT="${AGENT:-pglp}"
 BREAKDOWN_AGENT="${BREAKDOWN_AGENT:-$AGENT}"
 TASKS_FILE="${TASKS_FILE:-tasks.json}"
 PRD_FILE="${PRD_FILE:-PRD.md}"
