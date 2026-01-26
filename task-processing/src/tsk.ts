@@ -55,9 +55,20 @@ function matchStatus(input: string): Status {
 
 /**
  * Normalize an ID to uppercase with periods (e.g., 'p1m1t1s1' -> 'P1.M1.T1.S1').
+ * Also supports numeric-only format (e.g., '2.2.3.1' -> 'P2.M2.T3.S1').
  */
 function normalizeId(nodeId: string): string {
-  // Already has periods - just uppercase
+  // Check for numeric-only format: digits separated by dots (e.g., '2.2.3.1')
+  if (/^\d+(\.\d+)*$/.test(nodeId)) {
+    const prefixes = ['P', 'M', 'T', 'S'];
+    const numbers = nodeId.split('.');
+    return numbers.map((num, i) => {
+      const prefix = prefixes[i] || 'S'; // Default to 'S' if more than 4 levels
+      return `${prefix}${num}`;
+    }).join('.');
+  }
+
+  // Already has periods with letters - just uppercase
   if (nodeId.includes('.')) {
     return nodeId.toUpperCase();
   }
