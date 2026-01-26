@@ -2927,6 +2927,58 @@ if [[ "$SKIP_BUG_FINDING" == "false" ]]; then
 
     BUG_RESULTS_FILE="$CURRENT_BUGFIX_SESSION/TEST_RESULTS.md"
 
+    # --- Check for failed tasks from previous session ---
+    # Priority: previous bugfix session > main session
+    FAILED_TASKS_INFO=""
+    PREVIOUS_SESSION_FOR_FAILURES=""
+
+    # Find previous bugfix session (the most recent one that isn't the current session)
+    # zsh arrays are 1-indexed
+    ALL_BUGFIX_SESSIONS=("${(@f)$(find "$BUGFIX_DIR" -maxdepth 1 -type d -name '[0-9]*_*' 2>/dev/null | sort -n)}")
+    for session in "${(Oa)ALL_BUGFIX_SESSIONS[@]}"; do
+        [[ -z "$session" ]] && continue
+        if [[ "$session" != "$CURRENT_BUGFIX_SESSION" && -f "$session/tasks.json" ]]; then
+            PREVIOUS_SESSION_FOR_FAILURES="$session"
+            break
+        fi
+    done
+
+    # If no previous bugfix session, check main session
+    if [[ -z "$PREVIOUS_SESSION_FOR_FAILURES" ]]; then
+        PREVIOUS_SESSION_FOR_FAILURES="$SESSION_DIR"
+    fi
+
+    # Check for failed tasks in the previous session
+    if [[ -n "$PREVIOUS_SESSION_FOR_FAILURES" && -f "$PREVIOUS_SESSION_FOR_FAILURES/tasks.json" ]]; then
+        FAILED_TASK_OUTPUT=$(tsk -f "$PREVIOUS_SESSION_FOR_FAILURES/tasks.json" next-failed 2>/dev/null || true)
+        if [[ -n "$FAILED_TASK_OUTPUT" && "$FAILED_TASK_OUTPUT" != *"No failed tasks"* ]]; then
+            # Count failed tasks
+            FAILED_COUNT=$(jq '[.. | objects | select(.status? == "Failed")] | length' "$PREVIOUS_SESSION_FOR_FAILURES/tasks.json" 2>/dev/null || echo "0")
+            if [[ "$FAILED_COUNT" -gt 0 ]]; then
+                print -P "%F{yellow}[BUG HUNT]%f Found $FAILED_COUNT failed task(s) in previous session: $(basename "$PREVIOUS_SESSION_FOR_FAILURES")"
+                FAILED_TASKS_INFO="
+## Previously Failed Tasks - PRIORITY
+
+The following tasks FAILED in the previous session and should be investigated as part of bug hunting:
+
+**Source**: \`$(basename "$PREVIOUS_SESSION_FOR_FAILURES")/tasks.json\`
+**Failed Count**: $FAILED_COUNT
+
+\`\`\`json
+$(jq '[.. | objects | select(.status? == "Failed")]' "$PREVIOUS_SESSION_FOR_FAILURES/tasks.json" 2>/dev/null)
+\`\`\`
+
+These failures may indicate:
+1. Implementation bugs that need fixing
+2. Test issues that need investigation
+3. Edge cases that weren't handled
+
+Please include these in your bug report if they represent real issues.
+"
+            fi
+        fi
+    fi
+
     print -P "\n%F{magenta}[BUG HUNT]%f Starting creative bug finding with $BUG_FINDER_AGENT..."
 
     # Check if bug report already exists (resuming interrupted session)
@@ -2935,8 +2987,16 @@ if [[ "$SKIP_BUG_FINDING" == "false" ]]; then
         print -P "%F{cyan}[BUG HUNT]%f Skipping discovery, proceeding to bug fix pipeline..."
     else
         # Run bug finding - agent will ONLY create file if bugs found
-        # Expand $BUG_RESULTS_FILE in the prompt template
+        # Expand $BUG_RESULTS_FILE in the prompt template and inject failed tasks info
         EXPANDED_BUG_PROMPT=$(echo "$BUG_FINDING_PROMPT" | BUG_RESULTS_FILE="$BUG_RESULTS_FILE" envsubst '$BUG_RESULTS_FILE')
+
+        # Prepend failed tasks info if we have any
+        if [[ -n "$FAILED_TASKS_INFO" ]]; then
+            EXPANDED_BUG_PROMPT="${FAILED_TASKS_INFO}
+
+${EXPANDED_BUG_PROMPT}"
+        fi
+
         run_with_retry $BUG_FINDER_AGENT -p "$EXPANDED_BUG_PROMPT"
     fi
 
