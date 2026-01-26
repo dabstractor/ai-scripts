@@ -141,15 +141,149 @@ class TaskManager {
       throw new Error(`Task file not found: ${this.filePath}`);
     }
 
+    let jsonData: unknown;
     try {
-      const jsonData = JSON.parse(fs.readFileSync(this.filePath, 'utf8'));
+      jsonData = JSON.parse(fs.readFileSync(this.filePath, 'utf8'));
+    } catch (error) {
+      throw new Error(`Failed to parse JSON: ${error instanceof Error ? error.message : String(error)}`);
+    }
+
+    try {
       return BacklogSchema.parse(jsonData);
     } catch (error) {
       if (error instanceof z.ZodError) {
-        throw new Error(`Invalid task data format: ${error.message}`);
+        throw new Error(this.formatZodError(error, jsonData));
       }
       throw new Error(`Failed to load task file: ${error instanceof Error ? error.message : String(error)}`);
     }
+  }
+
+  /**
+   * Format a ZodError into a helpful, actionable error message.
+   * Shows: location (with ID), invalid value, valid options, and how to fix.
+   */
+  private formatZodError(error: z.ZodError, data: unknown): string {
+    const lines: string[] = ['Invalid task data:'];
+
+    for (const issue of error.issues) {
+      // Cast path to avoid PropertyKey type issues
+      const { path, location, value } = this.resolvePathInfo(issue.path as (string | number)[], data);
+
+      lines.push('');
+      lines.push(`  Location: ${location}`);
+      lines.push(`  Path:     ${path}`);
+      lines.push(`  Found:    ${JSON.stringify(value)}`);
+
+      // Zod 4.x uses 'invalid_value' for enum errors
+      if (issue.code === 'invalid_value') {
+        const iss = issue as any;
+        const values = iss.values as string[] | undefined;
+        if (values) {
+          lines.push(`  Expected: ${values.map((o: string) => JSON.stringify(o)).join(' | ')}`);
+        }
+      } else if (issue.code === 'invalid_type') {
+        lines.push(`  Expected: ${(issue as any).expected}`);
+      } else {
+        lines.push(`  Problem:  ${issue.message}`);
+      }
+
+      // Provide fix suggestion
+      lines.push(`  Fix:      ${this.getSuggestion(issue, value)}`);
+    }
+
+    return lines.join('\n');
+  }
+
+  /**
+   * Resolve a Zod path to human-readable location info.
+   * Returns the path string, a friendly location description, and the actual value.
+   */
+  private resolvePathInfo(zodPath: (string | number)[], data: unknown): { path: string; location: string; value: unknown } {
+    const pathStr = zodPath.map(p => typeof p === 'number' ? `[${p}]` : `.${p}`).join('').replace(/^\./, '');
+
+    // Walk the data to find the value and build location info
+    let current: any = data;
+    const locationParts: string[] = [];
+    let lastId: string | null = null;
+
+    for (let i = 0; i < zodPath.length; i++) {
+      const segment = zodPath[i];
+
+      if (current === undefined || current === null) break;
+
+      // Track IDs as we traverse
+      if (typeof current === 'object' && 'id' in current && typeof current.id === 'string') {
+        lastId = current.id;
+      }
+
+      // Build location description
+      if (segment === 'backlog') {
+        // Skip 'backlog' in location
+      } else if (typeof segment === 'number') {
+        // Array index - look ahead to get the item's id/title if possible
+        const item = current[segment];
+        if (item && typeof item === 'object') {
+          const itemId = item.id || `#${segment}`;
+          const itemTitle = item.title ? ` "${item.title}"` : '';
+          const itemType = item.type || 'item';
+          locationParts.push(`${itemType} ${itemId}${itemTitle}`);
+          lastId = item.id || lastId;
+        }
+      } else if (segment === 'milestones' || segment === 'tasks' || segment === 'subtasks') {
+        // Skip collection names in location output
+      } else {
+        // This is a field name (like 'status', 'title', etc.)
+        locationParts.push(`field '${segment}'`);
+      }
+
+      current = current[segment];
+    }
+
+    // Build a friendly location string
+    let location: string;
+    if (locationParts.length > 0) {
+      location = locationParts.join(' → ');
+    } else if (lastId) {
+      location = lastId;
+    } else {
+      location = pathStr;
+    }
+
+    return { path: pathStr, location, value: current };
+  }
+
+  /**
+   * Generate a fix suggestion based on the error type and value.
+   */
+  private getSuggestion(issue: z.ZodIssue, value: unknown): string {
+    // Zod 4.x uses 'invalid_value' for enum validation errors
+    if (issue.code === 'invalid_value') {
+      const iss = issue as any;
+      const options = (iss.values as string[] | undefined) || VALID_STATUSES;
+
+      // Try to fuzzy match the invalid value to suggest the closest option
+      if (typeof value === 'string') {
+        const valueLower = value.toLowerCase();
+
+        // Check for common typos/alternatives
+        const suggestion = options.find((opt: string) =>
+          opt.toLowerCase().startsWith(valueLower) ||
+          valueLower.startsWith(opt.toLowerCase())
+        );
+
+        if (suggestion) {
+          return `Change "${value}" to "${suggestion}"`;
+        }
+      }
+
+      return `Use one of: ${options.join(', ')}`;
+    }
+
+    if (issue.code === 'invalid_type') {
+      return `Change value to type ${(issue as any).expected}`;
+    }
+
+    return issue.message;
   }
 
   private saveBacklog(): void {
