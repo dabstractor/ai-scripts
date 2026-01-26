@@ -365,6 +365,56 @@ class TaskManager {
     return this.findNextActiveSubtask();
   }
 
+  private findNextFailedSubtask(): NextTaskContext {
+    for (const phase of this.data.backlog) {
+      if (phase.milestones) {
+        for (const milestone of phase.milestones) {
+          if (milestone.tasks) {
+            for (const task of milestone.tasks) {
+              if (task.subtasks) {
+                for (const subtask of task.subtasks) {
+                  if (subtask.status === 'Failed') {
+                    return {
+                      context: 'CURRENT_FOCUS',
+                      phase: {
+                        type: phase.type,
+                        id: phase.id,
+                        title: phase.title,
+                        status: phase.status,
+                        description: phase.description
+                      },
+                      milestone: {
+                        type: milestone.type,
+                        id: milestone.id,
+                        title: milestone.title,
+                        status: milestone.status,
+                        description: milestone.description
+                      },
+                      task: {
+                        type: task.type,
+                        id: task.id,
+                        title: task.title,
+                        status: task.status,
+                        description: task.description
+                      },
+                      subtask: subtask
+                    };
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    return { context: 'NO_FAILURES' };
+  }
+
+  public getNextFailed(): NextTaskContext {
+    return this.findNextFailedSubtask();
+  }
+
   private completeChildrenRecursively(node: any): void {
     if (node.subtasks) {
       for (const subtask of node.subtasks) {
@@ -693,6 +743,76 @@ function main(): void {
     .description('Alias for next command')
     .argument('[json-file]', 'JSON file containing tasks (default: tasks.json)')
     .action(handleNextCommand);
+
+  // next-failed command - find and optionally retry failed tasks
+  const handleNextFailedCommand = (jsonFile: string | undefined, options: { scope?: string; file?: string; retry?: boolean } | undefined, cmd: any) => {
+    try {
+      const globalOptions = cmd && cmd.parent ? cmd.parent.opts() : {};
+      const cmdOptions = (typeof options === 'object') ? options : {};
+      const mergedOptions = { ...globalOptions, ...cmdOptions };
+
+      const targetFile = resolveTargetFile(jsonFile, mergedOptions);
+      const manager = new TaskManager(targetFile);
+      const nextFailed = manager.getNextFailed();
+
+      if (nextFailed.context === 'NO_FAILURES') {
+        console.log(chalk.green('No failed tasks found.'));
+        return;
+      }
+
+      // If --retry flag is set, reset the failed task to Planned
+      if (mergedOptions.retry && nextFailed.subtask) {
+        const subtaskId = nextFailed.subtask.id;
+        manager.updateTaskStatus(subtaskId, 'Planned');
+        console.log(chalk.yellow(`Reset ${subtaskId} from Failed to Planned for retry`));
+        return;
+      }
+
+      if (mergedOptions.scope) {
+        const scope = mergedOptions.scope.toLowerCase();
+
+        if (!['phase', 'milestone', 'task', 'subtask'].includes(scope)) {
+          throw new Error(`Invalid scope '${scope}'. Valid scopes: phase, milestone, task, subtask`);
+        }
+
+        let result: ContextNode | undefined;
+
+        switch (scope) {
+          case 'phase':
+            result = nextFailed.phase;
+            break;
+          case 'milestone':
+            result = nextFailed.milestone;
+            break;
+          case 'task':
+            result = nextFailed.task;
+            break;
+          case 'subtask':
+            result = nextFailed.subtask;
+            break;
+        }
+
+        if (result && result.id) {
+          console.log(result.id);
+        } else {
+          console.error(chalk.red(`Error: Could not find ${scope} in failed task context.`));
+          process.exit(1);
+        }
+      } else {
+        console.log(JSON.stringify(nextFailed, null, 2));
+      }
+    } catch (error) {
+      console.error(chalk.red('Error:'), error instanceof Error ? error.message : String(error));
+      process.exit(1);
+    }
+  };
+
+  program
+    .command('next-failed')
+    .description('Get next failed subtask as JSON (for retry)')
+    .argument('[json-file]', 'JSON file containing tasks (default: tasks.json)')
+    .option('--retry', 'Reset the failed task to Planned status for retry')
+    .action(handleNextFailedCommand);
 
   // status command
   program

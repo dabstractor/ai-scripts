@@ -53,7 +53,7 @@ export interface ContextNode {
 }
 
 export interface NextTaskContext {
-  context: 'CURRENT_FOCUS' | 'ALL_COMPLETE';
+  context: 'CURRENT_FOCUS' | 'ALL_COMPLETE' | 'NO_FAILURES';
   phase?: ContextNode;
   milestone?: ContextNode;
   task?: ContextNode;

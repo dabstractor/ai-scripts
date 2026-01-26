@@ -14,6 +14,11 @@ Subtask: Atomic implementation steps. 0.5, 1, or 2 Story Points (SP). Max 2 SP p
 
 Critical Constraints & Standard of Work (SOW):
 
+Status Values (STRICT):
+Use ONLY these exact status values: Planned, Researching, Ready, Implementing, Complete, Failed.
+Do NOT invent new status values like "Prerequisite", "Blocked", "Pending", etc.
+Task ordering expresses sequence—items are implemented top-to-bottom. Position implies prerequisite relationships; do not encode this in status.
+
 Coherence & Continuity (Priority):
 
 You must ensure architectural flow. Subtasks must not exist in a vacuum.

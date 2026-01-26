@@ -44,11 +44,13 @@ if [[ "$1" == "task" ]]; then
         find "$PLAN_DIR" -maxdepth 1 -type d -name '[0-9]*_*' 2>/dev/null | sort -n | tail -1
     }
 
-    is_tasks_incomplete() {
+    # Check if tasks file has ACTIONABLE items (Planned/Researching/Ready/Implementing)
+    # Failed items are NOT actionable - they require manual intervention or retry
+    has_actionable_tasks() {
         local file=$1
         [[ ! -f "$file" ]] && return 1
-        local incomplete=$(jq '[.. | objects | select(.status? and .status != "Complete" and .status != "Completed")] | length' "$file" 2>/dev/null)
-        [[ "$incomplete" != "0" ]]
+        local actionable=$(jq '[.. | objects | select(.status? and (.status == "Planned" or .status == "Researching" or .status == "Ready" or .status == "Implementing"))] | length' "$file" 2>/dev/null)
+        [[ "$actionable" != "0" ]]
     }
 
     SESSION_DIR=$(get_latest_session)
@@ -62,7 +64,7 @@ if [[ "$1" == "task" ]]; then
     # Priority 1: Check for incomplete bugfix session (new format - preferred)
     if [[ -d "$SESSION_DIR/bugfix" ]]; then
         LATEST_BUGFIX=$(find "$SESSION_DIR/bugfix" -maxdepth 1 -type d -name '[0-9]*_*' 2>/dev/null | sort -n | tail -1)
-        if [[ -n "$LATEST_BUGFIX" && -f "$LATEST_BUGFIX/tasks.json" ]] && is_tasks_incomplete "$LATEST_BUGFIX/tasks.json"; then
+        if [[ -n "$LATEST_BUGFIX" && -f "$LATEST_BUGFIX/tasks.json" ]] && has_actionable_tasks "$LATEST_BUGFIX/tasks.json"; then
             TASKS_FILE="$LATEST_BUGFIX/tasks.json"
             print -P "%F{cyan}[prd task]%f Using bugfix tasks: bugfix/$(basename "$LATEST_BUGFIX")/tasks.json" >&2
         fi
@@ -145,12 +147,13 @@ PRD_FILE="${PRD_FILE:-PRD.md}"
 PLAN_DIR="${PLAN_DIR:-plan}"
 
 # MCP server configuration for PRP creation (web search for research)
-# Only add MCP servers when using glp agent
-if [[ "$AGENT" == "glp" ]]; then
-    PRP_AGENT_MCP_ARGS="--mcp-config=$(mcpp z-ai-web-search-prime)"
-else
-    PRP_AGENT_MCP_ARGS=""
-fi
+# DISABLED 2026-01-25: Testing if MCP server causes research phase stalls
+# if [[ "$AGENT" == "glp" ]]; then
+#     PRP_AGENT_MCP_ARGS="--mcp-config=$(mcpp z-ai-web-search-prime)"
+# else
+#     PRP_AGENT_MCP_ARGS=""
+# fi
+PRP_AGENT_MCP_ARGS=""
 
 # --- Session Management Functions ---
 
@@ -191,26 +194,27 @@ get_session_dir() {
 # Check if a session is complete
 # Usage: is_session_complete <session_dir>
 # Returns false (1) if:
-#   - tasks.json doesn't exist or has incomplete items
-#   - bugfix sessions exist with incomplete items
+#   - tasks.json doesn't exist or has ACTIONABLE items (Planned/Researching/Ready/Implementing)
+#   - bugfix sessions exist with actionable items
+# NOTE: Failed items do NOT make a session incomplete - they require explicit retry
 is_session_complete() {
     local session_dir=$1
     local tasks_file="$session_dir/tasks.json"
     [[ ! -f "$tasks_file" ]] && return 1
 
-    # Check if any items in main tasks are not Complete
-    local incomplete=$(jq '[.. | objects | select(.status? and .status != "Complete" and .status != "Completed")] | length' "$tasks_file" 2>/dev/null)
-    [[ "$incomplete" != "0" ]] && return 1
+    # Check if any items in main tasks are actionable (not Complete/Failed)
+    local actionable=$(jq '[.. | objects | select(.status? and (.status == "Planned" or .status == "Researching" or .status == "Ready" or .status == "Implementing"))] | length' "$tasks_file" 2>/dev/null)
+    [[ "$actionable" != "0" ]] && return 1
 
-    # Check for incomplete bugfix sessions (inside session dir)
+    # Check for actionable items in bugfix sessions (inside session dir)
     if [[ -d "$session_dir/bugfix" ]]; then
         local bugfix_session
         for bugfix_session in "$session_dir/bugfix"/[0-9]*_*(N); do
             [[ ! -d "$bugfix_session" ]] && continue
             # Check tasks.json in bugfix session
             if [[ -f "$bugfix_session/tasks.json" ]]; then
-                incomplete=$(jq '[.. | objects | select(.status? and .status != "Complete" and .status != "Completed")] | length' "$bugfix_session/tasks.json" 2>/dev/null)
-                [[ "$incomplete" != "0" ]] && return 1
+                actionable=$(jq '[.. | objects | select(.status? and (.status == "Planned" or .status == "Researching" or .status == "Ready" or .status == "Implementing"))] | length' "$bugfix_session/tasks.json" 2>/dev/null)
+                [[ "$actionable" != "0" ]] && return 1
             fi
         done
     fi
@@ -563,25 +567,26 @@ elif [[ -f "$PRD_FILE" ]]; then
     fi
 fi
 
-# Auto-detect bug hunt cycle: check for incomplete bug hunt tasks
+# Auto-detect bug hunt cycle: check for actionable bug hunt tasks
 # Sets RESUME_BUGFIX_TASKS_FILE if found, so bug hunt section can resume properly
+# NOTE: Failed items do NOT trigger auto-resume - use `tsk next --failed` to retry them
 RESUME_BUGFIX_TASKS_FILE=""
 RESUME_BUGFIX_SESSION=""
 
 if [[ "$ONLY_BUG_HUNT" == "false" && "$SKIP_BUG_FINDING" == "false" && -n "$SESSION_DIR" ]]; then
-    # Helper to check if a tasks file has incomplete items
-    has_incomplete_tasks() {
+    # Helper to check if a tasks file has actionable items (not Complete/Failed)
+    has_actionable_bugfix_tasks() {
         local file=$1
         [[ ! -f "$file" ]] && return 1
-        local incomplete=$(jq '[.. | objects | select(.status? and .status != "Complete" and .status != "Completed")] | length' "$file" 2>/dev/null)
-        [[ "$incomplete" != "0" ]]
+        local actionable=$(jq '[.. | objects | select(.status? and (.status == "Planned" or .status == "Researching" or .status == "Ready" or .status == "Implementing"))] | length' "$file" 2>/dev/null)
+        [[ "$actionable" != "0" ]]
     }
 
-    # Priority 1: Check for incomplete bugfix sessions (new format - preferred)
+    # Priority 1: Check for actionable bugfix sessions (new format - preferred)
     if [[ -d "$SESSION_DIR/bugfix" ]]; then
         LATEST_BUGFIX=$(find "$SESSION_DIR/bugfix" -maxdepth 1 -type d -name '[0-9]*_*' 2>/dev/null | sort -n | tail -1)
-        if [[ -n "$LATEST_BUGFIX" && -f "$LATEST_BUGFIX/tasks.json" ]] && has_incomplete_tasks "$LATEST_BUGFIX/tasks.json"; then
-            print -P "%F{yellow}[AUTO-DETECT]%f Found incomplete bugfix session: bugfix/$(basename "$LATEST_BUGFIX")"
+        if [[ -n "$LATEST_BUGFIX" && -f "$LATEST_BUGFIX/tasks.json" ]] && has_actionable_bugfix_tasks "$LATEST_BUGFIX/tasks.json"; then
+            print -P "%F{yellow}[AUTO-DETECT]%f Found actionable bugfix session: bugfix/$(basename "$LATEST_BUGFIX")"
             ONLY_BUG_HUNT=true
             RESUME_BUGFIX_TASKS_FILE="$LATEST_BUGFIX/tasks.json"
             RESUME_BUGFIX_SESSION="$LATEST_BUGFIX"
@@ -2883,17 +2888,18 @@ if [[ "$SKIP_BUG_FINDING" == "false" ]]; then
     mkdir -p "$BUGFIX_DIR"
 
     # Find or create bug hunt session
-    # Check for incomplete bug hunt session (has TEST_RESULTS.md but tasks not complete)
+    # Check for actionable bug hunt session (has tasks in Planned/Researching/Ready/Implementing)
     get_latest_bugfix_session() {
         find "$BUGFIX_DIR" -maxdepth 1 -type d -name '[0-9]*_*' 2>/dev/null | sort -n | tail -1
     }
 
+    # Returns true (0) if session has no actionable items (all Complete or Failed)
     is_bugfix_session_complete() {
         local bugfix_dir=$1
         local tasks_file="$bugfix_dir/tasks.json"
         [[ ! -f "$tasks_file" ]] && return 1
-        local incomplete=$(jq '[.. | objects | select(.status? and .status != "Complete" and .status != "Completed")] | length' "$tasks_file" 2>/dev/null)
-        [[ "$incomplete" != "0" ]] && return 1
+        local actionable=$(jq '[.. | objects | select(.status? and (.status == "Planned" or .status == "Researching" or .status == "Ready" or .status == "Implementing"))] | length' "$tasks_file" 2>/dev/null)
+        [[ "$actionable" != "0" ]] && return 1
         return 0
     }
 
@@ -2902,11 +2908,11 @@ if [[ "$SKIP_BUG_FINDING" == "false" ]]; then
     # Determine if we need a new session or should resume existing
     if [[ -n "$CURRENT_BUGFIX_SESSION" ]]; then
         if is_bugfix_session_complete "$CURRENT_BUGFIX_SESSION"; then
-            # Previous session complete - start fresh
+            # Previous session complete (or only has failures) - start fresh
             BUGFIX_NUM=$(( $(basename "$CURRENT_BUGFIX_SESSION" | cut -d_ -f1 | sed 's/^0*//') + 1 ))
             CURRENT_BUGFIX_SESSION=""
         else
-            print -P "%F{yellow}[BUG HUNT]%f Resuming incomplete bug hunt session: $(basename "$CURRENT_BUGFIX_SESSION")"
+            print -P "%F{yellow}[BUG HUNT]%f Resuming actionable bug hunt session: $(basename "$CURRENT_BUGFIX_SESSION")"
         fi
     fi
 
