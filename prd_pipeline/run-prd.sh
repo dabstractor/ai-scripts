@@ -145,6 +145,7 @@ BREAKDOWN_AGENT="${BREAKDOWN_AGENT:-clp}"
 TASKS_FILE="${TASKS_FILE:-tasks.json}"
 PRD_FILE="${PRD_FILE:-PRD.md}"
 PLAN_DIR="${PLAN_DIR:-plan}"
+CURRENT_PROCESSING_ID=""  # Set by execute_item for smart_commit protection
 
 # MCP server configuration for PRP creation (web search for research)
 # DISABLED 2026-01-25: Testing if MCP server causes research phase stalls
@@ -303,7 +304,7 @@ determine_session_state() {
 }
 
 # Bug finding configuration
-BUG_FINDER_AGENT="${BUG_FINDER_AGENT:-glp}"
+BUG_FINDER_AGENT="${BUG_FINDER_AGENT:-pglp}"
 BUG_RESULTS_FILE="${BUG_RESULTS_FILE:-TEST_RESULTS.md}"
 BUGFIX_SCOPE="${BUGFIX_SCOPE:-subtask}"
 SKIP_BUG_FINDING="${SKIP_BUG_FINDING:-false}"
@@ -342,13 +343,13 @@ CLASSIFICATION RULES:
 
 Output ONLY one word: COSMETIC or SUBSTANTIVE"
 
-    local RESULT=$(claude --print --allowed-tools "" --system-prompt "You are a binary classifier for PRD changes. Output only COSMETIC or SUBSTANTIVE." "$CLASSIFY_PROMPT" 2>/dev/null)
+    local RESULT=$(claude --print --allowed-tools "" --system-prompt "You are a binary classifier for PRD changes. Output only COSMETIC or SUBSTANTIVE." "$CLASSIFY_PROMPT" < /dev/null 2>/dev/null)
     local CLEAN_RESULT=$(echo "$RESULT" | tr -d '[:space:]')
 
     # Retry if invalid response
     if [[ "$CLEAN_RESULT" != "COSMETIC" && "$CLEAN_RESULT" != "SUBSTANTIVE" ]]; then
         print -P "%F{yellow}[RETRY]%f Invalid response: '$RESULT'. Retrying..."
-        RESULT=$(claude --print --continue --allowed-tools "" "ERROR: You replied with '$RESULT'. Output exactly one word: COSMETIC or SUBSTANTIVE." 2>/dev/null)
+        RESULT=$(claude --print --continue --allowed-tools "" "ERROR: You replied with '$RESULT'. Output exactly one word: COSMETIC or SUBSTANTIVE." < /dev/null 2>/dev/null)
         CLEAN_RESULT=$(echo "$RESULT" | tr -d '[:space:]')
     fi
 
@@ -2228,10 +2229,10 @@ DO NOT write files to any other location. All research MUST go in $dirname/resea
 
 <item_title>$(get_item_title $phase_num $ms_num $task_num $subtask_num)</item_title>
 <item_description>$(get_item_description $phase_num $ms_num $task_num $subtask_num)</item_description>
-<plan_status>$(tsk -f "$TASKS_FILE" status)</plan_status>$prev_context"
+<plan_status>$(tsk -f "$TASKS_FILE" status)</plan_status>$prev_context" < /dev/null
         if [[ ! -f "$dirname/PRP.md" ]]; then
             print -P "%F{yellow}[PARALLEL]%f PRP.md not found for $id, retrying..."
-            $AGENT --continue -p "You didn't write the file. Make sure you write the file to $dirname/PRP.md"
+            $AGENT --continue -p "You didn't write the file. Make sure you write the file to $dirname/PRP.md" < /dev/null
         fi
         # Mark as Ready when PRP is successfully created, or exit with error
         if [[ -f "$dirname/PRP.md" ]]; then
@@ -2422,6 +2423,9 @@ execute_item() {
     local task_num=$5
     local subtask_num=$6
 
+    # Set current processing ID for smart_commit protection
+    CURRENT_PROCESSING_ID="$id"
+
     # Check current status from tsk
     local current_status=$(get_item_status "$id")
 
@@ -2447,10 +2451,10 @@ execute_item() {
         run_with_retry $AGENT $PRP_AGENT_MCP_ARGS -p "$PRP_CREATE_PROMPT Create a PRP for $(get_scope_name) $id of the PRD. Store it at $dirname/PRP.md.
 <item_title>$(get_item_title $phase_num $ms_num $task_num $subtask_num)</item_title>
 <item_description>$(get_item_description $phase_num $ms_num $task_num $subtask_num)</item_description>
-<plan_status>$(tsk_cmd status)</plan_status>"
+<plan_status>$(tsk_cmd status)</plan_status>" < /dev/null
         if [[ ! -f "$dirname/PRP.md" ]]; then
             print -P "%F{yellow}[RETRY]%f PRP.md not found. Retrying..."
-            $AGENT --continue -p "You didn't write the file. Make sure you write the file to $dirname/PRP.md"
+            $AGENT --continue -p "You didn't write the file. Make sure you write the file to $dirname/PRP.md" < /dev/null
         fi
         if [[ ! -f "$dirname/PRP.md" ]]; then
             print -P "%F{red}[FAILED]%f PRP creation failed for $id - marking as Failed and continuing"
@@ -2470,14 +2474,26 @@ execute_item() {
         fi
     fi
 
-    if ! run_with_retry $AGENT -p "$PRP_EXECUTE_PROMPT Execute the PRP for $(get_scope_name) $id. The PRP file is located at: $dirname/PRP.md. READ IT NOW."; then
+    if ! run_with_retry $AGENT -p "$PRP_EXECUTE_PROMPT Execute the PRP for $(get_scope_name) $id. The PRP file is located at: $dirname/PRP.md. READ IT NOW." < /dev/null; then
         print -P "%F{red}[FAILED]%f Agent execution failed for $id - marking as Failed and continuing"
+        # Restore tasks.json from HEAD to undo any unauthorized agent modifications
+        git checkout HEAD -- "$TASKS_FILE" 2>/dev/null || true
         run_with_retry tsk_cmd update "$id" Failed
         return 1
     fi
 
-    git add $TASKS_FILE
-    if [[ -z "$(git diff HEAD --name-only)" ]]; then
+    # CRITICAL: Restore tasks.json from HEAD to undo any unauthorized agent modifications
+    # Agents sometimes ignore FORBIDDEN OPERATIONS and mark other tasks as Failed/Complete
+    # The orchestrator is the ONLY authority on task status
+    print -P "%F{cyan}[PROTECT]%f Restoring tasks.json to prevent unauthorized status changes..."
+    git checkout HEAD -- "$TASKS_FILE" 2>/dev/null || true
+
+    # Now check for ACTUAL code changes (modified OR new untracked files, excluding tasks.json)
+    # git diff HEAD only shows modified tracked files, so we also need to check for new untracked files
+    local modified_files=$(git diff HEAD --name-only -- ':!**/tasks.json' 2>/dev/null)
+    local untracked_files=$(git ls-files --others --exclude-standard -- ':!**/tasks.json' ':!plan/**' 2>/dev/null)
+
+    if [[ -z "$modified_files" && -z "$untracked_files" ]]; then
         print -P "%F{red}[FAILED]%f No changes produced for $id - marking as Failed and continuing"
         run_with_retry tsk_cmd update "$id" Failed
         return 1
@@ -2486,7 +2502,12 @@ execute_item() {
     run_with_retry tsk_cmd update "$id" Complete
 
     print -P "%F{blue}[CLEANUP]%f Cleaning up $id..."
-    run_with_retry $AGENT -p "$CLEANUP_PROMPT" || print -P "%F{yellow}[WARN]%f Cleanup failed, proceeding to commit..."
+    run_with_retry $AGENT -p "$CLEANUP_PROMPT" < /dev/null || print -P "%F{yellow}[WARN]%f Cleanup failed, proceeding to commit..."
+
+    # Restore tasks.json again after cleanup (cleanup agent might also modify it)
+    git checkout HEAD -- "$TASKS_FILE" 2>/dev/null || true
+    # Re-apply the legitimate status update
+    run_with_retry tsk_cmd update "$id" Complete
 
     smart_commit
 
@@ -2494,10 +2515,9 @@ execute_item() {
     check_shutdown
 }
 
-# Simple retry logic with shutdown support
+# Simple retry logic with shutdown support (infinite retries)
 run_with_retry() {
     local n=1
-    local max=3
     local delay=5
 
     while true; do
@@ -2515,15 +2535,10 @@ run_with_retry() {
             return 0
         fi
 
-        # Retry logic
-        if (( n < max )); then
-            print -P "%F{yellow}[RETRY]%f Command failed (exit $exit_status). Attempt $n/$max. Retrying in ${delay}s..."
-            sleep $delay
-            ((n++))
-        else
-            print -P "%F{red}[ERROR]%f Command failed after $max attempts"
-            return 1
-        fi
+        # Retry forever until success or shutdown
+        print -P "%F{yellow}[RETRY]%f Command failed (exit $exit_status). Attempt $n. Retrying in ${delay}s..."
+        sleep $delay
+        ((n++))
     done
 }
 
@@ -2537,6 +2552,25 @@ smart_commit() {
         print -P "%F{yellow}[WARN]%f $TASKS_FILE missing! Restoring..."
         git checkout HEAD -- "$TASKS_FILE"
         git add "$TASKS_FILE"
+    fi
+
+    # Critical protection: Verify tasks.json status changes are legitimate
+    # Count how many status fields changed in tasks.json
+    local status_changes
+    status_changes=$(git diff --staged -- "$TASKS_FILE" 2>/dev/null | grep -c '"status":') || true
+    status_changes=${status_changes:-0}
+    if [[ "$status_changes" -gt 4 ]]; then
+        # More than 4 status changes (item + its ancestors) is suspicious
+        # This catches cases where the agent marked many items as Failed/Complete
+        print -P "%F{red}[PROTECT]%f WARNING: Detected $status_changes status changes in tasks.json!"
+        print -P "%F{red}[PROTECT]%f This may indicate unauthorized agent modifications."
+        print -P "%F{yellow}[PROTECT]%f Restoring tasks.json from last commit and re-applying current item status..."
+        # Get the current item being processed (set by process_item)
+        if [[ -n "$CURRENT_PROCESSING_ID" ]]; then
+            git checkout HEAD -- "$TASKS_FILE"
+            tsk -f "$TASKS_FILE" update "$CURRENT_PROCESSING_ID" Complete 2>/dev/null || true
+            git add "$TASKS_FILE"
+        fi
     fi
 
     # Unstage the next item's plan directory if parallel research is active
@@ -2606,12 +2640,12 @@ Previous session directory: $PREV_SESSION_DIR
     # Run delta PRD generation
     run_with_retry $BREAKDOWN_AGENT -p "$DELTA_PRD_GENERATION_PROMPT
 
-$PREVIOUS_SESSION_CONTEXT_PROMPT"
+$PREVIOUS_SESSION_CONTEXT_PROMPT" < /dev/null
 
     # Retry if delta PRD wasn't created
     if [[ ! -f "$SESSION_DIR/delta_prd.md" ]]; then
         print -P "%F{yellow}[DELTA]%f delta_prd.md not found. Demanding agent write it..."
-        run_with_retry $BREAKDOWN_AGENT --continue -p "You did NOT write the delta PRD file. You MUST write it to $SESSION_DIR/delta_prd.md immediately. This file is REQUIRED before we can proceed."
+        run_with_retry $BREAKDOWN_AGENT --continue -p "You did NOT write the delta PRD file. You MUST write it to $SESSION_DIR/delta_prd.md immediately. This file is REQUIRED before we can proceed." < /dev/null
     fi
 
     # Final validation - FAIL if delta PRD is still missing
@@ -2630,7 +2664,7 @@ fi
 if [[ "$INTEGRATE_CHANGES" == "true" && -f "$TASKS_FILE" ]]; then
     print -P "%F{magenta}[UPDATE]%f Integrating PRD changes into existing tasks..."
 
-    run_with_retry $AGENT -p "$TASK_UPDATE_PROMPT"
+    run_with_retry $AGENT -p "$TASK_UPDATE_PROMPT" < /dev/null
 
     print -P "%F{green}[UPDATE]%f Task hierarchy updated with PRD changes."
 
@@ -2643,12 +2677,12 @@ fi
 if [[ ! -f "$TASKS_FILE" ]]; then
     print -P "%F{magenta}[PHASE 0]%f Generating breakdown..."
     mkdir -p "$SESSION_DIR/architecture"
-    run_with_retry $BREAKDOWN_AGENT --system-prompt="$TASK_BREAKDOWN_SYSTEM_PROMPT" -p "$TASK_BREAKDOWN_PROMPT"
+    run_with_retry $BREAKDOWN_AGENT --system-prompt="$TASK_BREAKDOWN_SYSTEM_PROMPT" -p "$TASK_BREAKDOWN_PROMPT" < /dev/null
 
     # If file still doesn't exist, demand the agent write it
     if [[ ! -f "$TASKS_FILE" ]]; then
         print -P "%F{yellow}[PHASE 0]%f $TASKS_FILE not found. Demanding agent write it..."
-        run_with_retry $BREAKDOWN_AGENT --continue -p "You did NOT write the tasks file. You MUST write the JSON breakdown to \`./$TASKS_FILE\` (CURRENT WORKING DIRECTORY) immediately. Do NOT search for tasks.json in other directories. Create a NEW file at exactly \`./$TASKS_FILE\`. Use your file writing tools NOW."
+        run_with_retry $BREAKDOWN_AGENT --continue -p "You did NOT write the tasks file. You MUST write the JSON breakdown to \`./$TASKS_FILE\` (CURRENT WORKING DIRECTORY) immediately. Do NOT search for tasks.json in other directories. Create a NEW file at exactly \`./$TASKS_FILE\`. Use your file writing tools NOW." < /dev/null
     fi
 
     if [[ -f "$TASKS_FILE" ]]; then
@@ -2656,7 +2690,7 @@ if [[ ! -f "$TASKS_FILE" ]]; then
 
         # Cleanup phase: organize .md files created during breakdown
         print -P "%F{blue}[CLEANUP]%f Organizing files after task breakdown..."
-        run_with_retry $AGENT -p "$CLEANUP_PROMPT" || print -P "%F{yellow}[WARN]%f Cleanup failed, proceeding to commit..."
+        run_with_retry $AGENT -p "$CLEANUP_PROMPT" < /dev/null || print -P "%F{yellow}[WARN]%f Cleanup failed, proceeding to commit..."
 
         # Commit the task breakdown
         print -P "%F{blue}[GIT]%f Committing task breakdown..."
@@ -2809,7 +2843,7 @@ fi
 # Final Validation Step (skip if bug-hunt only mode)
 if [[ "$ONLY_BUG_HUNT" != "true" ]]; then
 print -P "\n%F{magenta}[VALIDATION]%f Starting final validation..."
-run_with_retry $AGENT -p "$VALIDATION_PROMPT"
+run_with_retry $AGENT -p "$VALIDATION_PROMPT" < /dev/null
 print -P "\n%F{magenta}[VALIDATION]%f Validation complete. Check validation_report.md."
 
 if [[ -f "validation_report.md" ]]; then
@@ -2830,13 +2864,13 @@ if [[ -f "validation_report.md" ]]; then
     - Output ONLY the single word."
 
     # First attempt
-    RESULT=$(claude --print --allowed-tools "" --system-prompt "You are a binary classifier. Output only CLEAN or DIRTY." "$CHECK_PROMPT")
+    RESULT=$(claude --print --allowed-tools "" --system-prompt "You are a binary classifier. Output only CLEAN or DIRTY." "$CHECK_PROMPT" < /dev/null)
     CLEAN_RESULT=$(echo "$RESULT" | tr -d '[:space:]')
 
     # Validate response and retry if necessary
     if [[ "$CLEAN_RESULT" != "CLEAN" && "$CLEAN_RESULT" != "DIRTY" ]]; then
         print -P "%F{yellow}[RETRY]%f Invalid checker output: '$RESULT'. Retrying..."
-        RESULT=$(claude --print --continue --allowed-tools "" "ERROR: You replied with '$RESULT'. You MUST output exactly one word: CLEAN or DIRTY.")
+        RESULT=$(claude --print --continue --allowed-tools "" "ERROR: You replied with '$RESULT'. You MUST output exactly one word: CLEAN or DIRTY." < /dev/null)
         CLEAN_RESULT=$(echo "$RESULT" | tr -d '[:space:]')
     fi
 
@@ -2854,7 +2888,7 @@ if [[ -f "validation_report.md" ]]; then
         2. Fix the code to resolve these issues.
         3. Verify your fixes."
 
-        run_with_retry $AGENT -p "$FIX_PROMPT"
+        run_with_retry $AGENT -p "$FIX_PROMPT" < /dev/null
         print -P "%F{green}[FIX]%f Fixes applied."
     fi
 fi
@@ -2863,7 +2897,7 @@ fi
 print -P "%F{blue}[CLEANUP]%f Removing validation artifacts..."
 
 # Ask agent to delete the files (in case they were created elsewhere)
-run_with_retry $AGENT -p "Delete the validation artifacts: remove ./validate.sh and ./validation_report.md from the current directory. These are temporary files that should not be committed."
+run_with_retry $AGENT -p "Delete the validation artifacts: remove ./validate.sh and ./validation_report.md from the current directory. These are temporary files that should not be committed." < /dev/null
 
 # Manual deletion as backup (in case agent didn't delete them)
 rm -f "./validate.sh" "./validation_report.md" 2>/dev/null
@@ -2997,7 +3031,7 @@ Please include these in your bug report if they represent real issues.
 ${EXPANDED_BUG_PROMPT}"
         fi
 
-        run_with_retry $BUG_FINDER_AGENT -p "$EXPANDED_BUG_PROMPT"
+        run_with_retry $BUG_FINDER_AGENT -p "$EXPANDED_BUG_PROMPT" < /dev/null
     fi
 
     # If no file was created, no bugs were found - we're done!
