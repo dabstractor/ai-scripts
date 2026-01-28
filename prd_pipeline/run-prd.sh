@@ -2624,10 +2624,9 @@ execute_item() {
     fi
     rm -f "$agent_output_file"
 
-    # CRITICAL: Restore tasks.json from HEAD to undo any unauthorized agent modifications
-    # Agents sometimes ignore FORBIDDEN OPERATIONS and mark other tasks as Failed/Complete
-    # The orchestrator is the ONLY authority on task status
-    print -P "%F{cyan}[PROTECT]%f Restoring tasks.json to prevent unauthorized status changes..."
+    # Restore tasks.json from HEAD to undo any agent modifications to it
+    # Agents should not modify tasks.json - only the orchestrator manages task status
+    print -P "%F{cyan}[PROTECT]%f Restoring tasks.json (agents must not modify it directly)..."
 
     # Now check for ACTUAL code changes (modified OR new untracked files, excluding tasks.json)
     # git diff HEAD only shows modified tracked files, so we also need to check for new untracked files
@@ -2714,20 +2713,9 @@ smart_commit() {
         git add "$TASKS_FILE"
     fi
 
-    # Critical protection: Verify tasks.json status changes are legitimate
-    # Count how many status fields changed in tasks.json
-    local status_changes
-    status_changes=$(git diff --staged -- "$TASKS_FILE" 2>/dev/null | grep -c '"status":') || true
-    status_changes=${status_changes:-0}
-    if [[ "$status_changes" -gt 4 ]]; then
-        # More than 4 status changes (item + its ancestors) is suspicious
-        # This catches cases where the agent marked many items as Failed/Complete
-        print -P "%F{red}[PROTECT]%f WARNING: Detected $status_changes status changes in tasks.json!"
-        print -P "%F{red}[PROTECT]%f This may indicate unauthorized agent modifications."
-        print -P "%F{yellow}[PROTECT]%f Restoring tasks.json and re-applying legitimate status changes..."
-        restore_tasks_json
-        git add "$TASKS_FILE"
-    fi
+    # Note: Status changes are expected and legitimate - that's how progress is tracked.
+    # Protection against agent corruption is handled by restore_tasks_json after agent execution,
+    # not by blocking status commits.
 
     # Unstage the next item's plan directory if parallel research is active
     if [[ "$PARALLEL_RESEARCH" == "true" && -n "$RESEARCH_DIRNAME" ]]; then
