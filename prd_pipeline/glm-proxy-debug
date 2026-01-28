@@ -13,18 +13,7 @@ let PORT;
 let LOG_DIR;
 let requestCount = 0;
 
-function findAvailablePort(startPort = 9400) {
-  return new Promise((resolve, reject) => {
-    const server = net.createServer();
-    server.listen(startPort, '127.0.0.1', () => {
-      // Don't close - return the server with the port already bound
-      resolve({ port: server.address().port, server });
-    });
-    server.on('error', () => {
-      resolve(findAvailablePort(startPort + 1));
-    });
-  });
-}
+// Removed findAvailablePort - we now bind the HTTP server directly
 
 function getLogPath(reqId, type) {
   return path.join(LOG_DIR, `${String(reqId).padStart(6, '0')}_${type}`);
@@ -34,27 +23,11 @@ function log(msg) {
   const ts = new Date().toISOString();
   const line = `[${ts}] ${msg}\n`;
   fs.appendFileSync(path.join(LOG_DIR, 'proxy.log'), line);
-  process.stdout.write(line);
+  // Log file only - don't pollute console
 }
 
-async function main() {
-  // Find port and get a placeholder server that holds it
-  const { port, server: placeholder } = await findAvailablePort();
-  PORT = port;
-  LOG_DIR = `/tmp/glm-proxy-debug-${PORT}`;
-
-  // Create log directory
-  if (!fs.existsSync(LOG_DIR)) {
-    fs.mkdirSync(LOG_DIR, { recursive: true });
-  }
-
-  // Write port to stdout for caller to capture
-  console.log(`PORT:${PORT}`);
-
-  // Close placeholder and immediately start real server
-  placeholder.close();
-
-  const server = http.createServer((req, res) => {
+function createRequestHandler() {
+  return (req, res) => {
     let body = [];
     const reqId = ++requestCount;
     const endpoint = req.url.split('?')[0];
@@ -84,12 +57,30 @@ async function main() {
         return;
       }
 
+      // Force non-streaming to avoid SSE issues
+      let modifiedBody = body;
+      try {
+        const parsed = JSON.parse(bodyStr);
+        if (parsed.stream === true) {
+          parsed.stream = false;
+          modifiedBody = Buffer.from(JSON.stringify(parsed));
+          log(`[REQ#${reqId}] REWRITE stream:true->false`);
+        }
+      } catch {}
+
+      // Clean request headers - remove compression, fix host and content-length
+      const cleanReqHeaders = { ...req.headers };
+      delete cleanReqHeaders['accept-encoding'];
+      delete cleanReqHeaders['Accept-Encoding'];
+      cleanReqHeaders.host = TARGET;
+      cleanReqHeaders['content-length'] = modifiedBody.length;
+
       const options = {
         hostname: TARGET,
         port: 443,
         path: TARGET_PATH + req.url,
         method: req.method,
-        headers: { ...req.headers, host: TARGET },
+        headers: cleanReqHeaders,
       };
 
       const startTime = Date.now();
@@ -98,19 +89,51 @@ async function main() {
 
         proxyRes.on('data', chunk => responseBody.push(chunk));
         proxyRes.on('end', () => {
-          const fullResponse = Buffer.concat(responseBody).toString();
+          const rawResponse = Buffer.concat(responseBody);
           const duration = Date.now() - startTime;
 
-          log(`[RES#${reqId}] ${proxyRes.statusCode} (${duration}ms) ${fullResponse.length}b`);
-
-          // Log FULL response
+          // Log FULL raw response
           fs.writeFileSync(getLogPath(reqId, 'res_headers.json'), JSON.stringify(proxyRes.headers, null, 2));
-          fs.writeFileSync(getLogPath(reqId, 'res_body.txt'), fullResponse);
+          fs.writeFileSync(getLogPath(reqId, 'res_body_raw.txt'), rawResponse.toString());
           fs.writeFileSync(getLogPath(reqId, 'res_status.txt'), `${proxyRes.statusCode}`);
 
-          // Forward response
-          res.writeHead(proxyRes.statusCode, proxyRes.headers);
-          res.end(fullResponse);
+          // Normalize response - add missing required fields
+          let finalResponse = rawResponse;
+          if (proxyRes.statusCode === 200 && endpoint.includes('/v1/messages') && !endpoint.includes('count_tokens')) {
+            try {
+              const json = JSON.parse(rawResponse.toString());
+              if (json.type !== 'error' && json.input_tokens === undefined) {
+                let modified = false;
+                const fixes = [];
+                if (!json.id) { json.id = 'msg_' + Date.now() + Math.random().toString(36).slice(2,8); fixes.push('id'); modified = true; }
+                if (!json.type || json.type !== 'message') { json.type = 'message'; fixes.push('type'); modified = true; }
+                if (!json.role) { json.role = 'assistant'; fixes.push('role'); modified = true; }
+                if (!json.model) { json.model = 'claude-3-5-sonnet-20241022'; fixes.push('model'); modified = true; }
+                if (!json.stop_reason) { json.stop_reason = 'end_turn'; fixes.push('stop_reason'); modified = true; }
+                if (json.stop_sequence === undefined) { json.stop_sequence = null; fixes.push('stop_sequence'); modified = true; }
+                if (!json.usage) { json.usage = { input_tokens: 1, output_tokens: 1 }; fixes.push('usage'); modified = true; }
+                if (modified) {
+                  log(`[RES#${reqId}] NORMALIZED: ${fixes.join(',')}`);
+                  finalResponse = Buffer.from(JSON.stringify(json));
+                  fs.writeFileSync(getLogPath(reqId, 'res_body_normalized.txt'), finalResponse.toString());
+                }
+              }
+            } catch (e) {
+              log(`[RES#${reqId}] NORMALIZE_FAIL: ${e.message}`);
+            }
+          }
+
+          log(`[RES#${reqId}] ${proxyRes.statusCode} (${duration}ms) ${finalResponse.length}b`);
+
+          // Sanitize headers and forward
+          const cleanHeaders = { ...proxyRes.headers };
+          delete cleanHeaders['transfer-encoding'];
+          delete cleanHeaders['content-encoding'];
+          cleanHeaders['content-length'] = finalResponse.length;
+          cleanHeaders['content-type'] = 'application/json';
+
+          res.writeHead(proxyRes.statusCode, cleanHeaders);
+          res.end(finalResponse);
         });
       });
 
@@ -130,20 +153,56 @@ async function main() {
         proxyReq.destroy();
       });
 
-      proxyReq.write(body);
+      proxyReq.write(modifiedBody);
       proxyReq.end();
     });
+  };
+}
+
+// Try to start server on a port, recursively try next port if in use
+function startServer(port) {
+  const server = http.createServer(createRequestHandler());
+
+  server.once('error', (err) => {
+    if (err.code === 'EADDRINUSE') {
+      // Port in use, try next one immediately
+      startServer(port + 1);
+    } else {
+      console.error(`Server error: ${err.message}`);
+      process.exit(1);
+    }
   });
 
-  server.listen(PORT, '127.0.0.1', () => {
-    log(`CWD: ${process.cwd()}`);
-    log('############################################################');
-    log('GLM DEBUG PROXY - FULL LOGGING');
-    log(`Port: ${PORT}`);
-    log(`Target: https://${TARGET}${TARGET_PATH}`);
-    log(`Logs: ${LOG_DIR}/`);
-    log('############################################################');
+  server.listen(port, '127.0.0.1', () => {
+    PORT = port;
+    LOG_DIR = `/tmp/glm-proxy-debug-${PORT}`;
+
+    // Create log directory AFTER we have the port
+    if (!fs.existsSync(LOG_DIR)) {
+      fs.mkdirSync(LOG_DIR, { recursive: true });
+    }
+
+    // Print port to stdout AFTER successfully binding - no race condition!
+    console.log(`PORT:${PORT}`);
+
+    // Startup banner to console AND log file
+    const banner = [
+      `CWD: ${process.cwd()}`,
+      '############################################################',
+      'GLM DEBUG PROXY - FULL LOGGING',
+      `Port: ${PORT}`,
+      `Target: https://${TARGET}${TARGET_PATH}`,
+      `Logs: ${LOG_DIR}/`,
+      '############################################################'
+    ];
+    banner.forEach(line => {
+      const ts = new Date().toISOString();
+      const formatted = `[${ts}] ${line}`;
+      console.log(formatted);
+      fs.appendFileSync(path.join(LOG_DIR, 'proxy.log'), formatted + '\n');
+    });
   });
 }
 
-main();
+// Start on port 9400
+startServer(9400);
