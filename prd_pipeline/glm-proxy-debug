@@ -66,14 +66,14 @@ function createRequestHandler() {
         return;
       }
 
-      // Force non-streaming to avoid SSE issues
+      // Track if this is a streaming request - we need to handle response differently
+      let isStreaming = false;
       let modifiedBody = body;
       try {
         const parsed = JSON.parse(bodyStr);
-        if (parsed.stream === true) {
-          parsed.stream = false;
-          modifiedBody = Buffer.from(JSON.stringify(parsed));
-          log(`[REQ#${reqId}] REWRITE stream:true->false`);
+        isStreaming = parsed.stream === true;
+        if (isStreaming) {
+          log(`[REQ#${reqId}] STREAMING request detected`);
         }
       } catch {}
 
@@ -94,6 +94,35 @@ function createRequestHandler() {
 
       const startTime = Date.now();
       const proxyReq = https.request(options, proxyRes => {
+        // For streaming responses, pipe directly without buffering
+        if (isStreaming && proxyRes.statusCode === 200) {
+          log(`[RES#${reqId}] STREAMING response - piping directly`);
+          fs.writeFileSync(getLogPath(reqId, 'res_headers.json'), JSON.stringify(proxyRes.headers, null, 2));
+          fs.writeFileSync(getLogPath(reqId, 'res_status.txt'), `${proxyRes.statusCode}`);
+
+          // Forward headers as-is for SSE
+          const streamHeaders = { ...proxyRes.headers };
+          res.writeHead(proxyRes.statusCode, streamHeaders);
+
+          // Pipe the stream directly, logging chunks
+          let totalBytes = 0;
+          proxyRes.on('data', chunk => {
+            totalBytes += chunk.length;
+            res.write(chunk);
+          });
+          proxyRes.on('end', () => {
+            const duration = Date.now() - startTime;
+            log(`[RES#${reqId}] STREAMING complete (${duration}ms) ${totalBytes}b`);
+            res.end();
+          });
+          proxyRes.on('error', err => {
+            log(`[ERR#${reqId}] STREAMING error: ${err.message}`);
+            res.end();
+          });
+          return;
+        }
+
+        // Non-streaming: buffer the full response
         let responseBody = [];
 
         proxyRes.on('data', chunk => responseBody.push(chunk));
@@ -108,10 +137,25 @@ function createRequestHandler() {
 
           // Normalize response - add missing fields and strip non-standard z.ai fields
           let finalResponse = rawResponse;
+          let forceStatus = null;
           if (proxyRes.statusCode === 200 && endpoint.includes('/v1/messages') && !endpoint.includes('count_tokens')) {
             try {
               const json = JSON.parse(rawResponse.toString());
-              if (json.type !== 'error' && json.input_tokens === undefined) {
+
+              // CRITICAL: Empty content array crashes Claude SDK with "No messages returned"
+              // Transform to 429 so Claude retries instead of crashing
+              if (!json.content || (Array.isArray(json.content) && json.content.length === 0)) {
+                log(`[RES#${reqId}] EMPTY_CONTENT detected - transforming to 429`);
+                fs.writeFileSync(getLogPath(reqId, 'empty_content_transformed.txt'), rawResponse.toString());
+                forceStatus = 429;
+                finalResponse = Buffer.from(JSON.stringify({
+                  type: 'error',
+                  error: {
+                    type: 'rate_limit_error',
+                    message: 'Empty content array from upstream - retry'
+                  }
+                }));
+              } else if (json.type !== 'error' && json.input_tokens === undefined) {
                 let modified = false;
                 const fixes = [];
 
@@ -143,7 +187,8 @@ function createRequestHandler() {
             }
           }
 
-          log(`[RES#${reqId}] ${proxyRes.statusCode} (${duration}ms) ${finalResponse.length}b`);
+          const actualStatus = forceStatus || proxyRes.statusCode;
+          log(`[RES#${reqId}] ${actualStatus}${forceStatus ? ' (was 200->429 EMPTY_CONTENT)' : ''} (${duration}ms) ${finalResponse.length}b`);
 
           // Sanitize headers and forward
           const cleanHeaders = { ...proxyRes.headers };
@@ -152,7 +197,7 @@ function createRequestHandler() {
           cleanHeaders['content-length'] = finalResponse.length;
           cleanHeaders['content-type'] = 'application/json';
 
-          res.writeHead(proxyRes.statusCode, cleanHeaders);
+          res.writeHead(forceStatus || proxyRes.statusCode, cleanHeaders);
           res.end(finalResponse);
         });
       });
