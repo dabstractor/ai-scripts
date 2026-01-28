@@ -9,6 +9,15 @@ const net = require('net');
 const TARGET = 'api.z.ai';
 const TARGET_PATH = '/api/anthropic';
 
+// Clear Claude's shell snapshots so it uses fresh function definitions
+const snapshotDir = path.join(process.env.HOME, '.claude/shell-snapshots');
+try {
+  const files = fs.readdirSync(snapshotDir);
+  files.filter(f => f.startsWith('snapshot-zsh-')).forEach(f => {
+    fs.unlinkSync(path.join(snapshotDir, f));
+  });
+} catch {}
+
 let PORT;
 let LOG_DIR;
 let requestCount = 0;
@@ -97,7 +106,7 @@ function createRequestHandler() {
           fs.writeFileSync(getLogPath(reqId, 'res_body_raw.txt'), rawResponse.toString());
           fs.writeFileSync(getLogPath(reqId, 'res_status.txt'), `${proxyRes.statusCode}`);
 
-          // Normalize response - add missing required fields
+          // Normalize response - add missing fields and strip non-standard z.ai fields
           let finalResponse = rawResponse;
           if (proxyRes.statusCode === 200 && endpoint.includes('/v1/messages') && !endpoint.includes('count_tokens')) {
             try {
@@ -105,13 +114,24 @@ function createRequestHandler() {
               if (json.type !== 'error' && json.input_tokens === undefined) {
                 let modified = false;
                 const fixes = [];
-                if (!json.id) { json.id = 'msg_' + Date.now() + Math.random().toString(36).slice(2,8); fixes.push('id'); modified = true; }
-                if (!json.type || json.type !== 'message') { json.type = 'message'; fixes.push('type'); modified = true; }
-                if (!json.role) { json.role = 'assistant'; fixes.push('role'); modified = true; }
-                if (!json.model) { json.model = 'claude-3-5-sonnet-20241022'; fixes.push('model'); modified = true; }
-                if (!json.stop_reason) { json.stop_reason = 'end_turn'; fixes.push('stop_reason'); modified = true; }
-                if (json.stop_sequence === undefined) { json.stop_sequence = null; fixes.push('stop_sequence'); modified = true; }
-                if (!json.usage) { json.usage = { input_tokens: 1, output_tokens: 1 }; fixes.push('usage'); modified = true; }
+
+                // Add missing required fields
+                if (!json.id) { json.id = 'msg_' + Date.now() + Math.random().toString(36).slice(2,8); fixes.push('+id'); modified = true; }
+                if (!json.type || json.type !== 'message') { json.type = 'message'; fixes.push('+type'); modified = true; }
+                if (!json.role) { json.role = 'assistant'; fixes.push('+role'); modified = true; }
+                if (!json.model) { json.model = 'claude-sonnet-4-20250514'; fixes.push('+model'); modified = true; }
+                if (!json.stop_reason) { json.stop_reason = 'end_turn'; fixes.push('+stop_reason'); modified = true; }
+                if (json.stop_sequence === undefined) { json.stop_sequence = null; fixes.push('+stop_sequence'); modified = true; }
+                if (!json.usage) { json.usage = { input_tokens: 1, output_tokens: 1 }; fixes.push('+usage'); modified = true; }
+
+                // Strip non-standard z.ai fields from usage that might confuse Claude SDK
+                if (json.usage) {
+                  if (json.usage.cache_read_input_tokens !== undefined) { delete json.usage.cache_read_input_tokens; fixes.push('-cache_read'); modified = true; }
+                  if (json.usage.cache_creation_input_tokens !== undefined) { delete json.usage.cache_creation_input_tokens; fixes.push('-cache_create'); modified = true; }
+                  if (json.usage.server_tool_use !== undefined) { delete json.usage.server_tool_use; fixes.push('-server_tool'); modified = true; }
+                  if (json.usage.service_tier !== undefined) { delete json.usage.service_tier; fixes.push('-service_tier'); modified = true; }
+                }
+
                 if (modified) {
                   log(`[RES#${reqId}] NORMALIZED: ${fixes.join(',')}`);
                   finalResponse = Buffer.from(JSON.stringify(json));
