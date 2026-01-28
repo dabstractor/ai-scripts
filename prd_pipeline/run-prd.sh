@@ -646,7 +646,7 @@ TASKS_CONTENT=""
 # Wrapper for tsk command to always use the correct tasks file
 # Defined early so auto-resume can use it
 tsk_cmd() {
-    tsk -f "$TASKS_FILE" "$@"
+    tsk -f "$TASKS_FILE" "$@" < /dev/null
 }
 
 # Auto-resume logic
@@ -2565,7 +2565,7 @@ execute_item() {
         fi
 
         # Clear output file for new attempt
-        > "$agent_output_file"
+        : > "$agent_output_file"
 
         # Use pipefail to get the agent's exit status, not tee's
         setopt pipefail
