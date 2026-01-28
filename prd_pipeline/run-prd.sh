@@ -146,6 +146,48 @@ TASKS_FILE="${TASKS_FILE:-tasks.json}"
 PRD_FILE="${PRD_FILE:-PRD.md}"
 PLAN_DIR="${PLAN_DIR:-plan}"
 CURRENT_PROCESSING_ID=""  # Set by execute_item for smart_commit protection
+CURRENT_PROCESSING_STATUS=""  # The status to apply to current item after restore (Complete/Failed)
+
+# Robust tasks.json restoration that re-applies all legitimate status changes
+# This is CRITICAL - agents often corrupt tasks.json despite being forbidden
+# Usage: restore_tasks_json [status_for_current_item]
+# If status_for_current_item is provided, sets CURRENT_PROCESSING_ID to that status
+# Always restores RESEARCH_ITEM_ID to "Researching" if parallel research is active
+restore_tasks_json() {
+    local status_for_current="${1:-$CURRENT_PROCESSING_STATUS}"
+
+    # Step 1: Restore from HEAD
+    git checkout HEAD -- "$TASKS_FILE" 2>/dev/null || true
+
+    # Step 2: Validate it's proper JSON
+    if ! jq empty "$TASKS_FILE" 2>/dev/null; then
+        print -P "%F{red}[PROTECT]%f CRITICAL: tasks.json corrupted even after restore from HEAD!"
+        print -P "%F{yellow}[PROTECT]%f Attempting to restore from last known good commit..."
+        # Try to find a good version in recent history
+        git log --oneline -20 -- "$TASKS_FILE" | while read commit msg; do
+            if git show "$commit:$TASKS_FILE" 2>/dev/null | jq empty 2>/dev/null; then
+                print -P "%F{green}[PROTECT]%f Found good version at $commit"
+                git show "$commit:$TASKS_FILE" > "$TASKS_FILE"
+                break
+            fi
+        done
+    fi
+
+    # Step 3: Re-apply current processing task's status
+    if [[ -n "$CURRENT_PROCESSING_ID" && -n "$status_for_current" ]]; then
+        print -P "%F{cyan}[PROTECT]%f Re-applying $CURRENT_PROCESSING_ID -> $status_for_current"
+        tsk -f "$TASKS_FILE" update "$CURRENT_PROCESSING_ID" "$status_for_current" 2>/dev/null || true
+    fi
+
+    # Step 4: Re-apply parallel research task's status if active
+    if [[ "$PARALLEL_RESEARCH" == "true" && -n "$RESEARCH_ITEM_ID" && -n "$RESEARCH_PID" ]]; then
+        # Only re-apply if the research process is still running
+        if kill -0 "$RESEARCH_PID" 2>/dev/null; then
+            print -P "%F{cyan}[PROTECT]%f Re-applying $RESEARCH_ITEM_ID -> Researching (parallel research active)"
+            tsk -f "$TASKS_FILE" update "$RESEARCH_ITEM_ID" Researching 2>/dev/null || true
+        fi
+    fi
+}
 
 # MCP server configuration for PRP creation (web search for research)
 # DISABLED 2026-01-25: Testing if MCP server causes research phase stalls
@@ -913,7 +955,9 @@ Be aware that the executing AI agent only receives:
 
 ## Research Process
 
-> During the research process, create clear tasks and spawn as many agents and subagents as needed using the batch tools. The deeper research we do here the better the PRP will be. We optimize for chance of success, not for speed.
+> **CRITICAL**: Research is a MEANS TO AN END, not the goal itself. Your PRIMARY deliverable is the PRP.md file.
+> Limit research to 3-5 subagent calls maximum. After gathering sufficient context, IMMEDIATELY write the PRP.md file using the Write tool.
+> DO NOT get stuck in endless research loops. If you've made more than 5 tool calls without writing the PRP, STOP and write it NOW.
 
 1. **Codebase Analysis in depth**
    - Create clear todos and spawn subagents to search the codebase for similar features/patterns. Think hard and plan your approach
@@ -1350,6 +1394,19 @@ bandit -r src/
 - ❌ Don't hardcode values that should be config
 - ❌ Don't catch all exceptions - be specific
 </PRP-TEMPLATE>
+
+## FINAL INSTRUCTION - READ THIS CAREFULLY
+
+**YOU MUST WRITE THE PRP.md FILE.** This is your PRIMARY and ONLY deliverable.
+
+After gathering context (limit: 3-5 subagent calls), IMMEDIATELY use the Write tool to create the PRP.md file at the path specified.
+
+DO NOT:
+- Spawn more than 5 subagents total
+- Make more than 10 tool calls without writing the PRP
+- End your response without having written the PRP.md file
+
+If you have not written the PRP.md file, YOU HAVE FAILED. Write it NOW.
 EOF
 
 
@@ -1480,10 +1537,12 @@ Clean up, organize files, and PREPARE FOR COMMIT. Check \`git diff\` for referen
 
 If you delete any of the above files, the entire pipeline will break. Do NOT delete them under any circumstances.
 
-## DO NOT DELETE OR MODIFY:
+## DO NOT DELETE, MOVE, OR MODIFY:
 1. The session directory structure: $SESSION_DIR/
 2. The '$TASKS_FILE' file (CRITICAL - this is the pipeline state)
 3. README.md and any readme-adjacent files (CONTRIBUTING.md, LICENSE, etc.)
+4. **PRP.md files** - NEVER move or delete these! They are Plan Research Protocol files used by the pipeline
+5. Any files in \`$SESSION_DIR/P*\` directories - these are task work directories
 
 ## DOCUMENTATION ORGANIZATION:
 First, ensure session docs directory exists: \`mkdir -p $SESSION_DIR/docs\`
@@ -1493,6 +1552,11 @@ Then, MOVE (not delete) any markdown documentation files you created during impl
 - Implementation notes or technical writeups
 - Reference documentation or guides
 - Any other .md files that are not core project files
+
+**EXCEPTIONS - DO NOT MOVE THESE**:
+- PRP.md files (pipeline control files - must stay in place)
+- Files already inside $SESSION_DIR/P* directories
+- README.md, PRD.md, or any tracked project files
 
 ## KEEP IN ROOT:
 Only these types of files should remain in the project root:
@@ -2452,9 +2516,19 @@ execute_item() {
 <item_title>$(get_item_title $phase_num $ms_num $task_num $subtask_num)</item_title>
 <item_description>$(get_item_description $phase_num $ms_num $task_num $subtask_num)</item_description>
 <plan_status>$(tsk_cmd status)</plan_status>" < /dev/null
+        # Check for interruption before marking as failed
+        if [[ "$SHUTDOWN_REQUESTED" == "true" ]]; then
+            print -P "%F{yellow}[INTERRUPTED]%f PRP creation interrupted - leaving in Researching state for resume"
+            return 130
+        fi
         if [[ ! -f "$dirname/PRP.md" ]]; then
             print -P "%F{yellow}[RETRY]%f PRP.md not found. Retrying..."
             $AGENT --continue -p "You didn't write the file. Make sure you write the file to $dirname/PRP.md" < /dev/null
+        fi
+        # Check again for interruption
+        if [[ "$SHUTDOWN_REQUESTED" == "true" ]]; then
+            print -P "%F{yellow}[INTERRUPTED]%f PRP creation interrupted - leaving in Researching state for resume"
+            return 130
         fi
         if [[ ! -f "$dirname/PRP.md" ]]; then
             print -P "%F{red}[FAILED]%f PRP creation failed for $id - marking as Failed and continuing"
@@ -2474,40 +2548,115 @@ execute_item() {
         fi
     fi
 
-    if ! run_with_retry $AGENT -p "$PRP_EXECUTE_PROMPT Execute the PRP for $(get_scope_name) $id. The PRP file is located at: $dirname/PRP.md. READ IT NOW." < /dev/null; then
-        print -P "%F{red}[FAILED]%f Agent execution failed for $id - marking as Failed and continuing"
-        # Restore tasks.json from HEAD to undo any unauthorized agent modifications
-        git checkout HEAD -- "$TASKS_FILE" 2>/dev/null || true
-        run_with_retry tsk_cmd update "$id" Failed
+    # Capture agent output to check for success/failure result
+    # Retry on transient errors (API connection issues) but not on actual failures
+    local agent_output_file=$(mktemp)
+    local agent_exit_status=1
+    local attempt=1
+    local delay=5
+
+    while true; do
+        # Check for shutdown before each attempt
+        if [[ "$SHUTDOWN_REQUESTED" == "true" ]]; then
+            print -P "%F{yellow}[INTERRUPTED]%f Agent interrupted for $id - leaving in Implementing state for resume"
+            restore_tasks_json "Implementing"
+            rm -f "$agent_output_file"
+            return 130
+        fi
+
+        # Clear output file for new attempt
+        > "$agent_output_file"
+
+        # Use pipefail to get the agent's exit status, not tee's
+        setopt pipefail
+        $AGENT -p "$PRP_EXECUTE_PROMPT Execute the PRP for $(get_scope_name) $id. The PRP file is located at: $dirname/PRP.md. READ IT NOW." < /dev/null 2>&1 | tee "$agent_output_file"
+        agent_exit_status=$?
+        unsetopt pipefail
+
+        # Success - break out of retry loop
+        if [[ $agent_exit_status -eq 0 ]]; then
+            break
+        fi
+
+        # Exit 130 = SIGINT (Ctrl+C) - don't retry, leave in Implementing state
+        if [[ $agent_exit_status -eq 130 ]] || [[ "$SHUTDOWN_REQUESTED" == "true" ]]; then
+            print -P "%F{yellow}[INTERRUPTED]%f Agent interrupted for $id - leaving in Implementing state for resume"
+            restore_tasks_json "Implementing"
+            rm -f "$agent_output_file"
+            return 130
+        fi
+
+        # Check if this is a transient error vs actual agent failure
+        # Detection methods:
+        # 1. Look for error patterns in output file
+        # 2. If output file is small (<500 bytes), likely transient (agent never really ran)
+        # 3. If output has substantial content, agent ran - check for result JSON
+        local output_size=$(wc -c < "$agent_output_file" 2>/dev/null || echo 0)
+        local has_error_pattern=false
+        local has_result_json=false
+
+        grep -qE '(Connection error|API Error|timeout|ECONNREFUSED|ETIMEDOUT|network|overloaded)' "$agent_output_file" 2>/dev/null && has_error_pattern=true
+        grep -q '"result"' "$agent_output_file" 2>/dev/null && has_result_json=true
+
+        # Retry if:
+        # - Output has error patterns (connection issues)
+        # - Output is very small (agent never started)
+        # - No result JSON found (agent didn't complete its work)
+        if [[ "$has_error_pattern" == "true" ]] || [[ "$output_size" -lt 500 ]] || [[ "$has_result_json" == "false" ]]; then
+            print -P "%F{yellow}[RETRY]%f Agent failed (exit $agent_exit_status, ${output_size}b output, attempt $attempt). Retrying in ${delay}s..."
+            sleep $delay
+            ((attempt++))
+            continue
+        fi
+
+        # Agent ran substantially but still failed - this is a real failure
+        print -P "%F{red}[FAILED]%f Agent execution failed for $id (exit $agent_exit_status, ${output_size}b output) - marking as Failed"
+        CURRENT_PROCESSING_STATUS="Failed"
+        restore_tasks_json "Failed"
+        rm -f "$agent_output_file"
         return 1
+    done
+
+    # Check if agent reported success in its JSON output
+    local agent_reported_success=false
+    if grep -q '"result"[[:space:]]*:[[:space:]]*"success"' "$agent_output_file" 2>/dev/null; then
+        agent_reported_success=true
     fi
+    rm -f "$agent_output_file"
 
     # CRITICAL: Restore tasks.json from HEAD to undo any unauthorized agent modifications
     # Agents sometimes ignore FORBIDDEN OPERATIONS and mark other tasks as Failed/Complete
     # The orchestrator is the ONLY authority on task status
     print -P "%F{cyan}[PROTECT]%f Restoring tasks.json to prevent unauthorized status changes..."
-    git checkout HEAD -- "$TASKS_FILE" 2>/dev/null || true
 
     # Now check for ACTUAL code changes (modified OR new untracked files, excluding tasks.json)
     # git diff HEAD only shows modified tracked files, so we also need to check for new untracked files
     local modified_files=$(git diff HEAD --name-only -- ':!**/tasks.json' 2>/dev/null)
-    local untracked_files=$(git ls-files --others --exclude-standard -- ':!**/tasks.json' ':!plan/**' 2>/dev/null)
+    local untracked_files=$(git ls-files --others --exclude-standard -- ':!**/tasks.json' 2>/dev/null)
 
     if [[ -z "$modified_files" && -z "$untracked_files" ]]; then
-        print -P "%F{red}[FAILED]%f No changes produced for $id - marking as Failed and continuing"
-        run_with_retry tsk_cmd update "$id" Failed
-        return 1
+        # No file changes - check if agent reported success (work was already done)
+        if [[ "$agent_reported_success" == "true" ]]; then
+            print -P "%F{green}[OK]%f Agent reported success for $id (work already complete, no changes needed)"
+            CURRENT_PROCESSING_STATUS="Complete"
+            restore_tasks_json "Complete"
+        else
+            print -P "%F{red}[FAILED]%f No changes produced for $id - marking as Failed and continuing"
+            CURRENT_PROCESSING_STATUS="Failed"
+            restore_tasks_json "Failed"
+            return 1
+        fi
+    else
+        # Changes exist - mark as complete
+        CURRENT_PROCESSING_STATUS="Complete"
+        restore_tasks_json "Complete"
     fi
-
-    run_with_retry tsk_cmd update "$id" Complete
 
     print -P "%F{blue}[CLEANUP]%f Cleaning up $id..."
     run_with_retry $AGENT -p "$CLEANUP_PROMPT" < /dev/null || print -P "%F{yellow}[WARN]%f Cleanup failed, proceeding to commit..."
 
     # Restore tasks.json again after cleanup (cleanup agent might also modify it)
-    git checkout HEAD -- "$TASKS_FILE" 2>/dev/null || true
-    # Re-apply the legitimate status update
-    run_with_retry tsk_cmd update "$id" Complete
+    restore_tasks_json "Complete"
 
     smart_commit
 
@@ -2547,10 +2696,21 @@ smart_commit() {
     print -P "%F{blue}[GIT]%f Staging changes..."
     git add -A
 
-    # Critical protection: If tasks.json was removed or mangled, restore it.
+    # Critical protection: If tasks.json was removed, is empty, or is invalid JSON, restore it
+    local needs_restore=false
     if [[ ! -f "$TASKS_FILE" ]]; then
         print -P "%F{yellow}[WARN]%f $TASKS_FILE missing! Restoring..."
-        git checkout HEAD -- "$TASKS_FILE"
+        needs_restore=true
+    elif [[ ! -s "$TASKS_FILE" ]]; then
+        print -P "%F{yellow}[WARN]%f $TASKS_FILE is empty! Restoring..."
+        needs_restore=true
+    elif ! jq empty "$TASKS_FILE" 2>/dev/null; then
+        print -P "%F{yellow}[WARN]%f $TASKS_FILE is invalid JSON! Restoring..."
+        needs_restore=true
+    fi
+
+    if [[ "$needs_restore" == "true" ]]; then
+        restore_tasks_json
         git add "$TASKS_FILE"
     fi
 
@@ -2564,13 +2724,9 @@ smart_commit() {
         # This catches cases where the agent marked many items as Failed/Complete
         print -P "%F{red}[PROTECT]%f WARNING: Detected $status_changes status changes in tasks.json!"
         print -P "%F{red}[PROTECT]%f This may indicate unauthorized agent modifications."
-        print -P "%F{yellow}[PROTECT]%f Restoring tasks.json from last commit and re-applying current item status..."
-        # Get the current item being processed (set by process_item)
-        if [[ -n "$CURRENT_PROCESSING_ID" ]]; then
-            git checkout HEAD -- "$TASKS_FILE"
-            tsk -f "$TASKS_FILE" update "$CURRENT_PROCESSING_ID" Complete 2>/dev/null || true
-            git add "$TASKS_FILE"
-        fi
+        print -P "%F{yellow}[PROTECT]%f Restoring tasks.json and re-applying legitimate status changes..."
+        restore_tasks_json
+        git add "$TASKS_FILE"
     fi
 
     # Unstage the next item's plan directory if parallel research is active
@@ -2579,7 +2735,12 @@ smart_commit() {
         git reset HEAD -- "$RESEARCH_DIRNAME" 2>/dev/null || true
     fi
 
-    run_with_retry git commit-claude
+    # Only commit if there are staged changes
+    if git diff --staged --quiet; then
+        print -P "%F{yellow}[GIT]%f No staged changes to commit."
+    else
+        run_with_retry git commit-claude
+    fi
 }
 
 # --- 5. Main Workflow ---
@@ -2725,13 +2886,31 @@ if [[ -z "$SESSION_DIR" ]]; then
     exit 1
 fi
 
-if ! jq empty "$TASKS_FILE" 2>/dev/null; then
-    print -P "%F{red}[ERROR]%f Tasks file is not valid JSON: $TASKS_FILE"
-    print -P "%F{yellow}[DEBUG]%f First 100 chars: $(head -c 100 "$TASKS_FILE")"
-    exit 1
+# Validate tasks.json - attempt recovery if corrupted
+if [[ ! -f "$TASKS_FILE" ]] || [[ ! -s "$TASKS_FILE" ]] || ! jq empty "$TASKS_FILE" 2>/dev/null; then
+    print -P "%F{yellow}[WARN]%f Tasks file missing, empty, or corrupted. Attempting recovery..."
+    print -P "%F{yellow}[DEBUG]%f Current state: $(head -c 100 "$TASKS_FILE" 2>/dev/null || echo 'FILE MISSING')"
+    restore_tasks_json
+    # Verify recovery worked
+    if ! jq empty "$TASKS_FILE" 2>/dev/null; then
+        print -P "%F{red}[ERROR]%f Tasks file recovery failed: $TASKS_FILE"
+        print -P "%F{yellow}[DEBUG]%f After recovery: $(head -c 100 "$TASKS_FILE" 2>/dev/null || echo 'STILL MISSING')"
+        exit 1
+    fi
+    print -P "%F{green}[OK]%f Tasks file recovered successfully"
 fi
 
-total_phases=$(jq '.backlog | length' "$TASKS_FILE")
+total_phases=$(jq '.backlog | length // 0' "$TASKS_FILE" 2>/dev/null)
+if [[ -z "$total_phases" || "$total_phases" == "null" ]]; then
+    total_phases=0
+fi
+
+if [[ "$total_phases" -eq 0 ]]; then
+    print -P "%F{yellow}[WARN]%f No phases found in tasks file. Nothing to execute."
+    print -P "%F{cyan}[DEBUG]%f TASKS_FILE=$TASKS_FILE"
+    print -P "%F{cyan}[DEBUG]%f Content: $(cat "$TASKS_FILE" 2>/dev/null | head -c 200)"
+    exit 0
+fi
 
 # Outer loop: Always iterate through phases
 for (( phase_idx=0; phase_idx<$total_phases; phase_idx++ )); do
