@@ -351,6 +351,85 @@ BUG_RESULTS_FILE="${BUG_RESULTS_FILE:-TEST_RESULTS.md}"
 BUGFIX_SCOPE="${BUGFIX_SCOPE:-subtask}"
 SKIP_BUG_FINDING="${SKIP_BUG_FINDING:-false}"
 
+# --- PRD Selector Functions (mdsel integration) ---
+
+# Check if mdsel is available (either as command or via node)
+mdsel_available() {
+    if command -v mdsel &>/dev/null; then
+        return 0
+    elif [[ -f "$HOME/projects/mdsel/dist/cli/index.js" ]]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Generate PRD index using mdsel
+# Returns the index of selectors for the PRD file, or empty if mdsel unavailable
+generate_prd_index() {
+    local prd_file=$1
+    if command -v mdsel &>/dev/null; then
+        mdsel "$prd_file" 2>/dev/null
+    elif [[ -f "$HOME/projects/mdsel/dist/cli/index.js" ]]; then
+        node "$HOME/projects/mdsel/dist/cli/index.js" "$prd_file" 2>/dev/null
+    else
+        # mdsel not available - return empty
+        return 0
+    fi
+}
+
+# Extract PRD sections using mdsel selectors
+# Usage: extract_prd_sections <prd_file> <selectors_json>
+# selectors_json is a JSON array like ["h2.1", "h3.0"]
+# Returns empty if mdsel unavailable (caller should fall back to full PRD)
+extract_prd_sections() {
+    local prd_file=$1
+    local selectors_json=$2
+    local selectors=$(echo "$selectors_json" | jq -r '.[]' 2>/dev/null | tr '\n' ' ')
+    [[ -z "$selectors" || "$selectors" == " " ]] && return 0
+
+    if command -v mdsel &>/dev/null; then
+        mdsel $selectors "$prd_file" 2>/dev/null
+    elif [[ -f "$HOME/projects/mdsel/dist/cli/index.js" ]]; then
+        node "$HOME/projects/mdsel/dist/cli/index.js" $selectors "$prd_file" 2>/dev/null
+    else
+        # mdsel not available - return empty (caller will fall back)
+        return 0
+    fi
+}
+
+# Get PRD selectors for a work item from tasks.json
+# Usage: get_item_prd_selectors <phase_num> <milestone_num> <task_num> <subtask_num>
+# Returns JSON array like ["h2.1", "h3.0"] or "[]" if not found
+get_item_prd_selectors() {
+    local phase_num=$1
+    local milestone_num=$2
+    local task_num=$3
+    local subtask_num=$4
+    local phase_idx=$(find_phase_idx $phase_num 2>/dev/null)
+    [[ -z "$phase_idx" || $phase_idx -lt 0 ]] && echo "[]" && return
+    local ms_idx=$((milestone_num - 1))
+    local task_idx=$((task_num - 1))
+    local subtask_idx=$((subtask_num - 1))
+
+    local selectors=""
+    case $SCOPE in
+        phase)
+            selectors=$(jq -c ".backlog[$phase_idx].prd_selectors // []" "$TASKS_FILE" 2>/dev/null)
+            ;;
+        milestone)
+            selectors=$(jq -c ".backlog[$phase_idx].milestones[$ms_idx].prd_selectors // []" "$TASKS_FILE" 2>/dev/null)
+            ;;
+        task)
+            selectors=$(jq -c ".backlog[$phase_idx].milestones[$ms_idx].tasks[$task_idx].prd_selectors // []" "$TASKS_FILE" 2>/dev/null)
+            ;;
+        subtask)
+            selectors=$(jq -c ".backlog[$phase_idx].milestones[$ms_idx].tasks[$task_idx].subtasks[$subtask_idx].prd_selectors // []" "$TASKS_FILE" 2>/dev/null)
+            ;;
+    esac
+    echo "${selectors:-[]}"
+}
+
 # --- Staged PRD Change Detection ---
 # Check if PRD.md has staged changes and classify them before proceeding
 check_staged_prd_changes() {
@@ -643,6 +722,16 @@ PRD_CONTENT=""
 TASKS_CONTENT=""
 [[ -f "$TASKS_FILE" ]] && TASKS_CONTENT=$(cat "$TASKS_FILE")
 
+# Generate PRD index for selector-based extraction (used by breakdown and PRP agents)
+PRD_INDEX=""
+if [[ -f "$PRD_FILE" && -n "$SESSION_DIR" ]]; then
+    PRD_INDEX=$(generate_prd_index "$PRD_FILE")
+    if [[ -n "$PRD_INDEX" ]]; then
+        mkdir -p "$SESSION_DIR"
+        echo "$PRD_INDEX" > "$SESSION_DIR/prd_index.txt"
+    fi
+fi
+
 # Wrapper for tsk command to always use the correct tasks file
 # Defined early so auto-resume can use it
 tsk_cmd() {
@@ -887,6 +976,7 @@ Use your file writing tools to create \`./$TASKS_FILE\` with this structure:
                   "status": "Planned",
                   "story_points": 1,
                   "dependencies": ["ID of prerequisite subtask"],
+                  "prd_selectors": ["h2.X", "h3.Y"],
                   "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: [Finding from $SESSION_DIR/architecture/ regarding this feature].\n2. INPUT: [Specific data structure/variable] from [Dependency ID].\n3. LOGIC: Implement [PRD Section X] logic. Mock [Service Y] for isolation.\n4. OUTPUT: Return [Result Object/Interface] for consumption by [Next Subtask ID]."
                 }
               ]
@@ -898,6 +988,23 @@ Use your file writing tools to create \`./$TASKS_FILE\` with this structure:
   ]
 }
 \`\`\`
+
+## PRD SELECTOR REFERENCES
+
+The \`prd_selectors\` field references specific PRD sections that will be extracted for downstream agents.
+
+### Guidelines:
+- **REFERENCE LIBERALLY:** Include ALL potentially relevant PRD sections in \`prd_selectors\`.
+- **USE THE INDEX:** Selectors like \`h2.0\`, \`h3.1\`, \`code.0\` reference specific PRD sections (see PRD STRUCTURE INDEX below).
+- **INCLUDE PARENTS:** If referencing \`h3.2\`, also include parent \`h2.X\` for context.
+- **ERR ON INCLUSION:** When uncertain, include more sections. Downstream agents only see selected sections.
+- **SYNTAX EXAMPLES:**
+  - \`h2.0\` - First h2 section
+  - \`h2.1-3\` - Range of h2 sections (1, 2, and 3)
+  - \`h2.0/h3.0\` - Nested: first h3 under first h2
+  - \`code.0\` - First code block
+  - \`para.0\` - First paragraph
+  - \`list.0\` - First list
 
 ## FORBIDDEN OPERATIONS - CRITICAL
 
@@ -920,12 +1027,21 @@ read -r -d '' TASK_BREAKDOWN_PROMPT <<EOF
 **INPUT DOCUMENTATION (PRD):**
 $PRD_CONTENT
 
+**PRD STRUCTURE INDEX:**
+Use these selectors in \`prd_selectors\` to reference specific sections for each subtask.
+Downstream PRP agents will only receive the selected sections, not the full PRD.
+
+\`\`\`
+$PRD_INDEX
+\`\`\`
+
 **INSTRUCTIONS:**
 1.  **Analyze** the PRD above.
 2.  **Spawn** subagents immediately to research the current codebase state and external documentation. validate that the PRD is feasible and identify architectural patterns to follow.
 3.  **Store** your high-level research findings in the \`$SESSION_DIR/architecture/\` directory. This is critical: the downstream PRP agents will rely on this documentation to generate implementation plans.
 4.  **Decompose** the project into the JSON Backlog format defined in the System Prompt. Ensure your breakdown is grounded in the reality of the research you just performed.
-5.  **CRITICAL: Write the JSON to \`./$TASKS_FILE\` (current working directory) using your file writing tools.** Do NOT output the JSON to the conversation. Do NOT search for or modify any existing tasks.json files in other directories. Create a NEW file at \`./$TASKS_FILE\`. The file MUST exist when you are done.
+5.  **Populate \`prd_selectors\`** for each subtask using selectors from the PRD STRUCTURE INDEX. Reference ALL relevant sections.
+6.  **CRITICAL: Write the JSON to \`./$TASKS_FILE\` (current working directory) using your file writing tools.** Do NOT output the JSON to the conversation. Do NOT search for or modify any existing tasks.json files in other directories. Create a NEW file at \`./$TASKS_FILE\`. The file MUST exist when you are done.
 EOF
 
 read -r -d '' PRP_CREATE_PROMPT <<EOF
@@ -937,6 +1053,18 @@ read -r -d '' PRP_CREATE_PROMPT <<EOF
 **ITEM DESCRIPTION**: <item_description>
 
 You are creating a PRP (Product Requirement Prompt) for this specific work item.
+
+## PRD Context
+
+The following PRD sections were selected as relevant during task breakdown:
+<selected_prd_content>
+
+**PRD Selectors Used**: <prd_selectors>
+
+If additional context is needed, reference the full PRD index to identify other sections:
+<prd_index>
+
+**Note**: If \`<prd_selectors>\` is empty or \`[]\`, \`<selected_prd_content>\` contains the FULL PRD (legacy task without selectors). When selectors are present, only those sections are included. You may also reference architecture/ directory for additional context.
 
 ## PRP Creation Mission
 
@@ -2033,6 +2161,7 @@ Create a SINGLE phase with ONE milestone containing ONE task per bug. Each bug =
                   "title": "Fix [specific issue]",
                   "status": "Planned",
                   "story_points": 1,
+                  "prd_selectors": ["h2.X", "h3.Y"],
                   "context_scope": "Fix: [brief description]. File: [file path]. Change: [what to change]."
                 }
               ]
@@ -2055,6 +2184,16 @@ Create a SINGLE phase with ONE milestone containing ONE task per bug. Each bug =
 6. **NO documentation tasks** - Just fix the bugs
 7. **Critical bugs first** - Order tasks by severity
 
+## BUG REPORT SELECTOR REFERENCES
+
+The \`prd_selectors\` field references specific bug report sections that will be extracted for downstream agents.
+
+### Guidelines:
+- **USE THE INDEX:** Selectors like \`h2.0\`, \`h3.1\` reference specific bug report sections (see BUG REPORT INDEX below).
+- **REFERENCE THE BUG:** Each subtask should reference the specific bug section it addresses.
+- **INCLUDE CONTEXT:** Include parent sections for context (e.g., if referencing \`h3.2\`, include \`h2.X\`).
+- **SYNTAX:** \`h2.0\` (first h2), \`h2.1-3\` (range), \`code.0\` (first code block).
+
 ## FORBIDDEN OPERATIONS - CRITICAL
 
 **You are a BUG FIX BREAKDOWN agent. You create a simple task list ONLY.**
@@ -2076,11 +2215,19 @@ read -r -d '' BUG_FIX_BREAKDOWN_PROMPT <<EOF
 **BUG REPORT:**
 \$(cat "\$PRD_FILE")
 
+**BUG REPORT INDEX:**
+Use these selectors in \`prd_selectors\` to reference specific bug sections for each subtask.
+
+\`\`\`
+\$PRD_INDEX
+\`\`\`
+
 **INSTRUCTIONS:**
 1. Read the bug report above
 2. Create ONE task per Critical/Major bug (ignore Minor issues)
 3. Each task should have 1-3 simple subtasks that directly fix the issue
-4. Write the JSON to \`./\$TASKS_FILE\`
+4. Populate \`prd_selectors\` for each subtask using selectors from the BUG REPORT INDEX
+5. Write the JSON to \`./\$TASKS_FILE\`
 
 Keep it SIMPLE. This is bug fixing, not a new project.
 EOF
@@ -2278,6 +2425,24 @@ The previous PRP defines what will exist when your item begins implementation.
 </parallel_execution_context>"
     fi
 
+    # Extract PRD selectors and selected content for this work item (before subshell)
+    # Falls back to full PRD if: no selectors, mdsel unavailable, or extraction fails
+    local prd_selectors=$(get_item_prd_selectors $phase_num $ms_num $task_num $subtask_num)
+    local selected_prd=""
+    local prd_snapshot="$SESSION_DIR/prd_snapshot.md"
+
+    if [[ -n "$prd_selectors" && "$prd_selectors" != "[]" && -f "$prd_snapshot" ]] && mdsel_available; then
+        selected_prd=$(extract_prd_sections "$prd_snapshot" "$prd_selectors")
+    fi
+
+    # Fallback to full PRD if selectors missing/empty or extraction failed
+    if [[ -z "$selected_prd" && -f "$prd_snapshot" ]]; then
+        selected_prd=$(cat "$prd_snapshot")
+    fi
+
+    local prd_index_content=""
+    [[ -f "$SESSION_DIR/prd_index.txt" ]] && prd_index_content=$(cat "$SESSION_DIR/prd_index.txt")
+
     # Run research in background subshell
     # Status: Researching (in progress) -> Ready (PRP created, ready to implement)
     # The orphan cleanup function handles cases where research fails before PRP is created
@@ -2293,6 +2458,13 @@ DO NOT write files to any other location. All research MUST go in $dirname/resea
 
 <item_title>$(get_item_title $phase_num $ms_num $task_num $subtask_num)</item_title>
 <item_description>$(get_item_description $phase_num $ms_num $task_num $subtask_num)</item_description>
+<prd_selectors>$prd_selectors</prd_selectors>
+<selected_prd_content>
+$selected_prd
+</selected_prd_content>
+<prd_index>
+$prd_index_content
+</prd_index>
 <plan_status>$(tsk -f "$TASKS_FILE" status)</plan_status>$prev_context" < /dev/null
         if [[ ! -f "$dirname/PRP.md" ]]; then
             print -P "%F{yellow}[PARALLEL]%f PRP.md not found for $id, retrying..."
@@ -2512,9 +2684,45 @@ execute_item() {
         run_with_retry tsk_cmd update "$id" Implementing
     else
         run_with_retry tsk_cmd update "$id" Researching
+
+        # Extract PRD selectors and selected content for this work item
+        # Falls back to full PRD if: no selectors, mdsel unavailable, or extraction fails
+        local prd_selectors=$(get_item_prd_selectors $phase_num $ms_num $task_num $subtask_num)
+        local selected_prd=""
+        local prd_snapshot="$SESSION_DIR/prd_snapshot.md"
+
+        if [[ -n "$prd_selectors" && "$prd_selectors" != "[]" && -f "$prd_snapshot" ]] && mdsel_available; then
+            selected_prd=$(extract_prd_sections "$prd_snapshot" "$prd_selectors")
+            if [[ -n "$selected_prd" ]]; then
+                print -P "%F{cyan}[PRD]%f Using selected PRD sections: $prd_selectors"
+            fi
+        fi
+
+        # Fallback to full PRD if selectors missing/empty or extraction failed
+        if [[ -z "$selected_prd" && -f "$prd_snapshot" ]]; then
+            if [[ "$prd_selectors" == "[]" || -z "$prd_selectors" ]]; then
+                print -P "%F{yellow}[PRD]%f No prd_selectors defined, using full PRD (legacy task)"
+            elif ! mdsel_available; then
+                print -P "%F{yellow}[PRD]%f mdsel not available, using full PRD"
+            else
+                print -P "%F{yellow}[PRD]%f Extraction failed for selectors: $prd_selectors, using full PRD"
+            fi
+            selected_prd=$(cat "$prd_snapshot")
+        fi
+
+        local prd_index_content=""
+        [[ -f "$SESSION_DIR/prd_index.txt" ]] && prd_index_content=$(cat "$SESSION_DIR/prd_index.txt")
+
         run_with_retry $AGENT $PRP_AGENT_MCP_ARGS -p "$PRP_CREATE_PROMPT Create a PRP for $(get_scope_name) $id of the PRD. Store it at $dirname/PRP.md.
 <item_title>$(get_item_title $phase_num $ms_num $task_num $subtask_num)</item_title>
 <item_description>$(get_item_description $phase_num $ms_num $task_num $subtask_num)</item_description>
+<prd_selectors>$prd_selectors</prd_selectors>
+<selected_prd_content>
+$selected_prd
+</selected_prd_content>
+<prd_index>
+$prd_index_content
+</prd_index>
 <plan_status>$(tsk_cmd status)</plan_status>" < /dev/null
         # Check for interruption before marking as failed
         if [[ "$SHUTDOWN_REQUESTED" == "true" ]]; then
