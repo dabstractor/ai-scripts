@@ -66,16 +66,20 @@ function createRequestHandler() {
         return;
       }
 
-      // Track if this is a streaming request - we need to handle response differently
-      let isStreaming = false;
+      // ALWAYS force non-streaming for /v1/messages (not count_tokens) so we can inspect responses
       let modifiedBody = body;
-      try {
-        const parsed = JSON.parse(bodyStr);
-        isStreaming = parsed.stream === true;
-        if (isStreaming) {
-          log(`[REQ#${reqId}] STREAMING request detected`);
-        }
-      } catch {}
+      if (endpoint.includes('/v1/messages') && !endpoint.includes('count_tokens')) {
+        try {
+          const parsed = JSON.parse(bodyStr);
+          // Force stream:false if it's true OR if it's missing (undefined/null)
+          if (parsed.stream !== false) {
+            const wasStream = parsed.stream;
+            parsed.stream = false;
+            modifiedBody = Buffer.from(JSON.stringify(parsed));
+            log(`[REQ#${reqId}] FORCED stream:false (was: ${wasStream})`);
+          }
+        } catch {}
+      }
 
       // Clean request headers - remove compression, fix host and content-length
       const cleanReqHeaders = { ...req.headers };
@@ -94,35 +98,7 @@ function createRequestHandler() {
 
       const startTime = Date.now();
       const proxyReq = https.request(options, proxyRes => {
-        // For streaming responses, pipe directly without buffering
-        if (isStreaming && proxyRes.statusCode === 200) {
-          log(`[RES#${reqId}] STREAMING response - piping directly`);
-          fs.writeFileSync(getLogPath(reqId, 'res_headers.json'), JSON.stringify(proxyRes.headers, null, 2));
-          fs.writeFileSync(getLogPath(reqId, 'res_status.txt'), `${proxyRes.statusCode}`);
-
-          // Forward headers as-is for SSE
-          const streamHeaders = { ...proxyRes.headers };
-          res.writeHead(proxyRes.statusCode, streamHeaders);
-
-          // Pipe the stream directly, logging chunks
-          let totalBytes = 0;
-          proxyRes.on('data', chunk => {
-            totalBytes += chunk.length;
-            res.write(chunk);
-          });
-          proxyRes.on('end', () => {
-            const duration = Date.now() - startTime;
-            log(`[RES#${reqId}] STREAMING complete (${duration}ms) ${totalBytes}b`);
-            res.end();
-          });
-          proxyRes.on('error', err => {
-            log(`[ERR#${reqId}] STREAMING error: ${err.message}`);
-            res.end();
-          });
-          return;
-        }
-
-        // Non-streaming: buffer the full response
+        // Buffer the full response so we can inspect and fix it
         let responseBody = [];
 
         proxyRes.on('data', chunk => responseBody.push(chunk));
@@ -135,60 +111,98 @@ function createRequestHandler() {
           fs.writeFileSync(getLogPath(reqId, 'res_body_raw.txt'), rawResponse.toString());
           fs.writeFileSync(getLogPath(reqId, 'res_status.txt'), `${proxyRes.statusCode}`);
 
-          // Normalize response - add missing fields and strip non-standard z.ai fields
+          // Validate and normalize ALL /v1/messages responses (not count_tokens)
           let finalResponse = rawResponse;
           let forceStatus = null;
-          if (proxyRes.statusCode === 200 && endpoint.includes('/v1/messages') && !endpoint.includes('count_tokens')) {
+          const isMessageEndpoint = endpoint.includes('/v1/messages') && !endpoint.includes('count_tokens');
+
+          if (isMessageEndpoint) {
             try {
               const json = JSON.parse(rawResponse.toString());
 
-              // CRITICAL: Empty content array crashes Claude SDK with "No messages returned"
-              // Transform to 429 so Claude retries instead of crashing
-              if (!json.content || (Array.isArray(json.content) && json.content.length === 0)) {
-                log(`[RES#${reqId}] EMPTY_CONTENT detected - transforming to 429`);
-                fs.writeFileSync(getLogPath(reqId, 'empty_content_transformed.txt'), rawResponse.toString());
-                forceStatus = 429;
-                finalResponse = Buffer.from(JSON.stringify({
-                  type: 'error',
-                  error: {
-                    type: 'rate_limit_error',
-                    message: 'Empty content array from upstream - retry'
+              // If this is an error response from z.ai, pass it through as-is
+              // The SDK knows how to handle error responses
+              if (json.error) {
+                log(`[RES#${reqId}] ERROR_RESPONSE: ${JSON.stringify(json.error).slice(0, 200)}`);
+                // Pass through - no modification needed
+              } else {
+                // This should be a message response - validate it has content
+                // CRITICAL: Empty/invalid content crashes Claude SDK with "No messages returned"
+                const hasValidContent = (() => {
+                  if (!json.content) return false;
+                  if (!Array.isArray(json.content)) return false;
+                  if (json.content.length === 0) return false;
+                  // Check if ANY content block has actual text or tool_use
+                  return json.content.some(block => {
+                    if (!block) return false;
+                    if (block.type === 'text' && block.text && block.text.trim().length > 0) return true;
+                    if (block.type === 'tool_use' && block.id) return true;
+                    if (block.type === 'thinking') return true; // Allow thinking blocks
+                    return false;
+                  });
+                })();
+
+                if (!hasValidContent) {
+                  // TRANSFORM to 429 so SDK retries
+                  log(`[RES#${reqId}] INVALID_CONTENT (status was ${proxyRes.statusCode}) - transforming to 429`);
+                  log(`[RES#${reqId}] Raw content was: ${JSON.stringify(json.content)}`);
+                  log(`[RES#${reqId}] Full response: ${rawResponse.toString().slice(0, 500)}`);
+                  fs.writeFileSync(getLogPath(reqId, 'invalid_content_transformed.txt'), rawResponse.toString());
+                  forceStatus = 429;
+                  finalResponse = Buffer.from(JSON.stringify({
+                    type: 'error',
+                    error: {
+                      type: 'rate_limit_error',
+                      message: 'Invalid/empty content from upstream - retry'
+                    }
+                  }));
+                } else {
+                  // Valid content - normalize the response structure
+                  let modified = false;
+                  const fixes = [];
+
+                  // Add missing required fields
+                  if (!json.id) { json.id = 'msg_' + Date.now() + Math.random().toString(36).slice(2,8); fixes.push('+id'); modified = true; }
+                  if (!json.type || json.type !== 'message') { json.type = 'message'; fixes.push('+type'); modified = true; }
+                  if (!json.role) { json.role = 'assistant'; fixes.push('+role'); modified = true; }
+                  if (!json.model) { json.model = 'claude-sonnet-4-20250514'; fixes.push('+model'); modified = true; }
+                  if (!json.stop_reason) { json.stop_reason = 'end_turn'; fixes.push('+stop_reason'); modified = true; }
+                  if (json.stop_sequence === undefined) { json.stop_sequence = null; fixes.push('+stop_sequence'); modified = true; }
+                  if (!json.usage) { json.usage = { input_tokens: 1, output_tokens: 1 }; fixes.push('+usage'); modified = true; }
+
+                  // Strip non-standard z.ai fields from usage that might confuse Claude SDK
+                  if (json.usage) {
+                    if (json.usage.cache_read_input_tokens !== undefined) { delete json.usage.cache_read_input_tokens; fixes.push('-cache_read'); modified = true; }
+                    if (json.usage.cache_creation_input_tokens !== undefined) { delete json.usage.cache_creation_input_tokens; fixes.push('-cache_create'); modified = true; }
+                    if (json.usage.server_tool_use !== undefined) { delete json.usage.server_tool_use; fixes.push('-server_tool'); modified = true; }
+                    if (json.usage.service_tier !== undefined) { delete json.usage.service_tier; fixes.push('-service_tier'); modified = true; }
                   }
-                }));
-              } else if (json.type !== 'error' && json.input_tokens === undefined) {
-                let modified = false;
-                const fixes = [];
 
-                // Add missing required fields
-                if (!json.id) { json.id = 'msg_' + Date.now() + Math.random().toString(36).slice(2,8); fixes.push('+id'); modified = true; }
-                if (!json.type || json.type !== 'message') { json.type = 'message'; fixes.push('+type'); modified = true; }
-                if (!json.role) { json.role = 'assistant'; fixes.push('+role'); modified = true; }
-                if (!json.model) { json.model = 'claude-sonnet-4-20250514'; fixes.push('+model'); modified = true; }
-                if (!json.stop_reason) { json.stop_reason = 'end_turn'; fixes.push('+stop_reason'); modified = true; }
-                if (json.stop_sequence === undefined) { json.stop_sequence = null; fixes.push('+stop_sequence'); modified = true; }
-                if (!json.usage) { json.usage = { input_tokens: 1, output_tokens: 1 }; fixes.push('+usage'); modified = true; }
-
-                // Strip non-standard z.ai fields from usage that might confuse Claude SDK
-                if (json.usage) {
-                  if (json.usage.cache_read_input_tokens !== undefined) { delete json.usage.cache_read_input_tokens; fixes.push('-cache_read'); modified = true; }
-                  if (json.usage.cache_creation_input_tokens !== undefined) { delete json.usage.cache_creation_input_tokens; fixes.push('-cache_create'); modified = true; }
-                  if (json.usage.server_tool_use !== undefined) { delete json.usage.server_tool_use; fixes.push('-server_tool'); modified = true; }
-                  if (json.usage.service_tier !== undefined) { delete json.usage.service_tier; fixes.push('-service_tier'); modified = true; }
-                }
-
-                if (modified) {
-                  log(`[RES#${reqId}] NORMALIZED: ${fixes.join(',')}`);
-                  finalResponse = Buffer.from(JSON.stringify(json));
-                  fs.writeFileSync(getLogPath(reqId, 'res_body_normalized.txt'), finalResponse.toString());
+                  if (modified) {
+                    log(`[RES#${reqId}] NORMALIZED: ${fixes.join(',')}`);
+                    finalResponse = Buffer.from(JSON.stringify(json));
+                    fs.writeFileSync(getLogPath(reqId, 'res_body_normalized.txt'), finalResponse.toString());
+                  }
                 }
               }
             } catch (e) {
-              log(`[RES#${reqId}] NORMALIZE_FAIL: ${e.message}`);
+              // JSON parse failed - this is a malformed response, transform to 429
+              log(`[RES#${reqId}] PARSE_FAIL (status ${proxyRes.statusCode}): ${e.message}`);
+              log(`[RES#${reqId}] Raw body: ${rawResponse.toString().slice(0, 500)}`);
+              fs.writeFileSync(getLogPath(reqId, 'parse_fail.txt'), rawResponse.toString());
+              forceStatus = 429;
+              finalResponse = Buffer.from(JSON.stringify({
+                type: 'error',
+                error: {
+                  type: 'rate_limit_error',
+                  message: 'Malformed response from upstream - retry'
+                }
+              }));
             }
           }
 
           const actualStatus = forceStatus || proxyRes.statusCode;
-          log(`[RES#${reqId}] ${actualStatus}${forceStatus ? ' (was 200->429 EMPTY_CONTENT)' : ''} (${duration}ms) ${finalResponse.length}b`);
+          log(`[RES#${reqId}] ${actualStatus}${forceStatus ? ' (was 200->429 INVALID_CONTENT)' : ''} (${duration}ms) ${finalResponse.length}b`);
 
           // Sanitize headers and forward
           const cleanHeaders = { ...proxyRes.headers };
@@ -207,8 +221,21 @@ function createRequestHandler() {
         log(`[ERR#${reqId}] ${err.message} (${duration}ms)`);
         fs.writeFileSync(getLogPath(reqId, 'error.txt'), `${err.message}\n${err.stack}`);
         if (!res.headersSent) {
-          res.writeHead(502);
-          res.end(`Proxy error: ${err.message}`);
+          // CRITICAL: Return proper JSON error so SDK can parse and retry
+          // Using 429 (rate_limit_error) triggers SDK's built-in retry logic
+          const errorResponse = JSON.stringify({
+            type: 'error',
+            error: {
+              type: 'rate_limit_error',
+              message: `Upstream connection error: ${err.message} - retry`
+            }
+          });
+          log(`[ERR#${reqId}] Returning 429 JSON error for SDK retry`);
+          res.writeHead(429, {
+            'content-type': 'application/json',
+            'content-length': errorResponse.length
+          });
+          res.end(errorResponse);
         }
       });
 
