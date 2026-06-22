@@ -706,3 +706,57 @@ The current format stores everything within `bugfix/NNN_hash/` subdirectories:
 | `a73950e` | fix(prd): enhance nested execution guards and bug fix mode safeguards |
 | `5b01ab7` | fix(prd): add nested execution guard and agent operational boundaries |
 | `ebc7157` | fix(prd): harden nested execution guards and remove legacy bug hunt artifacts |
+
+---
+
+## Changes Since Commit ebc7157 (pi.dev Migration + Pipeline Hardening)
+
+**Base commit:** `ebc7157`
+**Latest commit:** `2b812db` (plus uncommitted staged work on `run-prd.sh`)
+**Theme:** Migration from claude-code to pi.dev as the agent runtime, plus several pipeline behavior improvements surfaced while bootstrapping this script into a larger framework.
+
+### Migration Note: pi.dev Runtime
+
+Switched the agent runtime from `claude-code` to `pi.dev`. Agent identifiers changed (`pglp`/`clp` → `piz`/`pizt`/`pizc`), `--continue` became `--session-id` for deterministic resume, and `git commit-claude` became `git commit-pi`. These are structural adapters to the new runtime and do not change pipeline semantics — they are NOT detailed below. The functional changes that *do* affect how the pipeline behaves are:
+
+### A. Selective PRD Section Extraction (`prd_selectors` + mdsel) — `4285ba0`, `2b812db`
+
+Subtasks now carry a `prd_selectors` field (e.g. `["h2.1", "h3.0"]`) computed from a generated PRD section index. Downstream PRP agents receive only the referenced sections instead of the full PRD document, keeping their context windows focused on relevant requirements. Selectors are resolved via `mdsel`. Falls back to the full PRD when selectors are absent or extraction fails.
+
+### B. Tasks.json Protection & Smart Recovery — `bdaf91a`, `59f515c`
+
+`restore_tasks_json()` re-applies legitimate status changes after every agent run (agents routinely corrupt `tasks.json` despite being forbidden). On corruption it walks commit history to find the last valid JSON version. Interrupted/implementing items get their status re-applied, and background-research statuses (`Researching`/`Ready`) are preserved across restores rather than being dropped. This is the mechanism that makes the pipeline survivable across crashes and misbehaving agents.
+
+### C. Planner / Implementation Model Split — staged
+
+Separate model roles so cost/speed can be tuned per phase of the pipeline:
+- `AGENT` — planning, research, PRP creation (default glm-5.2)
+- `IMPL_AGENT` — code-writing steps: PRP execution and post-validation fix (default glm-5-turbo, faster codegen)
+
+Previously one model did everything; now heavy reasoning and fast codegen are independently configurable.
+
+### D. Depth-2 Chained Background Research — staged
+
+Replaced single-slot prefetch with a supervisor that researches a *chain* of up to `RESEARCH_DEPTH` (default 2) items ahead while the current item is implemented. Collapses both failure modes of the single-slot design: "fast impl → stall waiting for N+1" and "slow impl → wasted idle capacity." Tracked via `RESEARCH_DIRNAMES` associative array (item_id → dirname); `wait_for_background_research()` consumes items one at a time while the supervisor keeps prefetching the rest.
+
+### E. Issue-Driven Re-planning Loop — staged
+
+Agents can report `"result": "issue"` (in addition to `success`/`fail`) to signal a *recoverable* planning gap rather than a hard failure. The pipeline:
+1. Saves the issue message to `issue_feedback.md`
+2. Deletes the stale PRP
+3. Resets the item to `Planned`
+4. Re-runs research with `<issue_feedback>` injected into the PRP prompt
+
+Retries up to `ISSUE_RETRY_MAX` (default 3) times before hard-failing. Turns planning gaps into self-correcting retries instead of dead items.
+
+### F. Classifier Transient-Failure Handling — staged
+
+The COSMETIC/SUBSTANTIVE and CLEAN/DIRTY binary classifiers now retry up to 4 times and **distinguish transient API failures** (empty output, connection errors, rate limits, overloaded) from invalid model responses. Previously a single empty reply silently fell through to "Could not classify" and the pipeline proceeded *unprotected* through a SUBSTANTIVE PRD change.
+
+### G. Documentation Sync in Task Breakdown — staged
+
+`TASK_BREAKDOWN_SYSTEM_PROMPT` now enforces a two-mode documentation rule, mirroring the existing "tests ride with the work" TDD rule:
+- **Mode A (doc-with-work):** docs a subtask directly touches (config, API, CLI, env vars, exported types) are updated inside that subtask's `context_scope` — declared via a new `DOCS:` line. Never a standalone subtask.
+- **Mode B (changeset-level):** cross-cutting docs that only make sense once the whole change lands (`README.md`, feature overviews, architecture summaries) become a **final "Sync changeset-level documentation" task** depending on all implementing subtasks.
+
+Mirrored in `DELTA_PRD_GENERATION_PROMPT` (step 3, SCOPE DELTA) so delta PRDs declare doc impact at authoring time. Prevents coherent changesets from shipping with stale READMEs — the exact failure that motivated this rule.

@@ -140,8 +140,22 @@ case $SCOPE in
 esac
 
 # --- 3. Configuration ---
-AGENT="${AGENT:-pglp}"
-BREAKDOWN_AGENT="${BREAKDOWN_AGENT:-clp}"
+# Pipeline agents: pi (pi.dev) headless wrappers defined in ~/.config/zsh/functions.zsh
+#   piz  = pi + z.ai, print mode, default model glm-5.2 (override via PI_MODEL)
+#   pizt = forced glm-5-turbo (faster; use for implementation via IMPL_AGENT)
+AGENT="${AGENT:-piz}"
+BREAKDOWN_AGENT="${BREAKDOWN_AGENT:-piz}"
+# Implementation agent: WRITES CODE - the per-task/subtask PRP-execute step, plus
+# the post-validation Fix step. Defaults to pizt = glm-5-turbo (faster codegen).
+# To run implementation on the same model as planning: IMPL_AGENT=$AGENT ...
+IMPL_AGENT="${IMPL_AGENT:-pizt}"
+# Binary classifier (no tools, no session) for COSMETIC/SUBSTANTIVE & CLEAN/DIRTY.
+# MUST be a single-token function name (pizc), not a multi-word string: zsh does
+# not word-split `$VAR` in command position, so "pi -p ..." would be treated as
+# one literal command name and fail with "command not found". glm-5-turbo =
+# cheap/fast one-word answers. Retries are fresh calls (--no-session leaves
+# nothing to resume).
+CLASSIFIER_AGENT="${CLASSIFIER_AGENT:-pizc}"
 TASKS_FILE="${TASKS_FILE:-tasks.json}"
 PRD_FILE="${PRD_FILE:-PRD.md}"
 PLAN_DIR="${PLAN_DIR:-plan}"
@@ -152,7 +166,8 @@ CURRENT_PROCESSING_STATUS=""  # The status to apply to current item after restor
 # This is CRITICAL - agents often corrupt tasks.json despite being forbidden
 # Usage: restore_tasks_json [status_for_current_item]
 # If status_for_current_item is provided, sets CURRENT_PROCESSING_ID to that status
-# Always restores RESEARCH_ITEM_ID to "Researching" if parallel research is active
+# Always restores "Researching"/"Ready" for items the background research
+# supervisor is actively working on (see RESEARCH_DIRNAMES plan).
 restore_tasks_json() {
     local status_for_current="${1:-$CURRENT_PROCESSING_STATUS}"
 
@@ -179,13 +194,23 @@ restore_tasks_json() {
         tsk -f "$TASKS_FILE" update "$CURRENT_PROCESSING_ID" "$status_for_current" 2>/dev/null || true
     fi
 
-    # Step 4: Re-apply parallel research task's status if active
-    if [[ "$PARALLEL_RESEARCH" == "true" && -n "$RESEARCH_ITEM_ID" && -n "$RESEARCH_PID" ]]; then
-        # Only re-apply if the research process is still running
-        if kill -0 "$RESEARCH_PID" 2>/dev/null; then
-            print -P "%F{cyan}[PROTECT]%f Re-applying $RESEARCH_ITEM_ID -> Researching (parallel research active)"
-            tsk -f "$TASKS_FILE" update "$RESEARCH_ITEM_ID" Researching 2>/dev/null || true
-        fi
+    # Step 4: Preserve background-research statuses across restore.
+    # The supervisor may have several items queued: ones whose PRP already exists
+    # are "Ready"; ones still being researched are "Researching". Re-apply both so
+    # restore-from-HEAD (which reverts the supervisor's legitimate writes) doesn't
+    # drop them. Skip the currently-implementing item (handled in step 3).
+    if [[ "$PARALLEL_RESEARCH" == "true" && ${#RESEARCH_DIRNAMES} -gt 0 ]]; then
+        local _rid
+        for _rid in "${(@k)RESEARCH_DIRNAMES}"; do
+            [[ "$_rid" == "$CURRENT_PROCESSING_ID" ]] && continue
+            local _rdir="${RESEARCH_DIRNAMES["$_rid"]}"
+            if [[ -f "$_rdir/PRP.md" ]]; then
+                tsk -f "$TASKS_FILE" update "$_rid" Ready 2>/dev/null || true
+            elif [[ -n "$RESEARCH_PID" ]] && kill -0 "$RESEARCH_PID" 2>/dev/null; then
+                print -P "%F{cyan}[PROTECT]%f Re-applying $_rid -> Researching (parallel research active)"
+                tsk -f "$TASKS_FILE" update "$_rid" Researching 2>/dev/null || true
+            fi
+        done
     fi
 }
 
@@ -346,10 +371,14 @@ determine_session_state() {
 }
 
 # Bug finding configuration
-BUG_FINDER_AGENT="${BUG_FINDER_AGENT:-pglp}"
+BUG_FINDER_AGENT="${BUG_FINDER_AGENT:-piz}"
 BUG_RESULTS_FILE="${BUG_RESULTS_FILE:-TEST_RESULTS.md}"
 BUGFIX_SCOPE="${BUGFIX_SCOPE:-subtask}"
 SKIP_BUG_FINDING="${SKIP_BUG_FINDING:-false}"
+
+# Issue retry configuration
+# When an agent returns "result": "issue", we retry with feedback up to this many times
+ISSUE_RETRY_MAX="${ISSUE_RETRY_MAX:-3}"
 
 # --- PRD Selector Functions (mdsel integration) ---
 
@@ -464,15 +493,34 @@ CLASSIFICATION RULES:
 
 Output ONLY one word: COSMETIC or SUBSTANTIVE"
 
-    local RESULT=$(claude --print --allowed-tools "" --system-prompt "You are a binary classifier for PRD changes. Output only COSMETIC or SUBSTANTIVE." "$CLASSIFY_PROMPT" < /dev/null 2>/dev/null)
-    local CLEAN_RESULT=$(echo "$RESULT" | tr -d '[:space:]')
+    local RESULT=""
+    local CLEAN_RESULT=""
+    local classify_attempt=0
+    local classify_max=4
+    local user_prompt="$CLASSIFY_PROMPT"
 
-    # Retry if invalid response
-    if [[ "$CLEAN_RESULT" != "COSMETIC" && "$CLEAN_RESULT" != "SUBSTANTIVE" ]]; then
-        print -P "%F{yellow}[RETRY]%f Invalid response: '$RESULT'. Retrying..."
-        RESULT=$(claude --print --continue --allowed-tools "" "ERROR: You replied with '$RESULT'. Output exactly one word: COSMETIC or SUBSTANTIVE." < /dev/null 2>/dev/null)
+    # Retry loop: handles BOTH invalid responses AND transient failures (empty
+    # output, connection errors, z.ai hiccups). Previously a single empty reply
+    # silently fell through to "Could not classify" and proceeded unprotected.
+    while [[ $classify_attempt -lt $classify_max ]]; do
+        ((classify_attempt++))
+        RESULT=$($CLASSIFIER_AGENT --system-prompt "You are a binary classifier for PRD changes. Output only COSMETIC or SUBSTANTIVE." "$user_prompt" < /dev/null 2>/dev/null)
         CLEAN_RESULT=$(echo "$RESULT" | tr -d '[:space:]')
-    fi
+
+        if [[ "$CLEAN_RESULT" == "COSMETIC" || "$CLEAN_RESULT" == "SUBSTANTIVE" ]]; then
+            break  # Valid response
+        fi
+
+        # Distinguish transient failure (empty/error) from a real-but-invalid model reply
+        if [[ -z "$RESULT" ]] || echo "$RESULT" | grep -qE '(Connection error|API Error|API error|API request failed|fetch failed|network error|timeout|timed out|ETIMEDOUT|ECONNREFUSED|ECONNRESET|EAI_AGAIN|socket hang up|stream error|overloaded|rate limit|429|503|502|service unavailable|aborted|disposed)'; then
+            print -P "%F{yellow}[RETRY]%f Classifier transient failure (attempt $classify_attempt/$classify_max). Retrying in 3s..."
+            sleep 3
+        else
+            print -P "%F{yellow}[RETRY]%f Invalid response: '$RESULT'. Retrying..."
+            user_prompt="ERROR: You replied with '$RESULT'. Output exactly one word: COSMETIC or SUBSTANTIVE."
+            sleep 1
+        fi
+    done
 
     print -P "%F{cyan}[PRD CHECK]%f Classification: $CLEAN_RESULT"
 
@@ -921,6 +969,15 @@ For every Subtask, the \`context_scope\` must be a **strict set of instructions*
 *   **OUTPUT:** What exact interface does this subtask expose?
 *   **MOCKING:** What external services must be mocked to keep this subtask isolated?
 
+### 5. DOCUMENTATION SYNC (TWO MODES — BOTH MANDATORY)
+Documentation drift is the #1 cause of stale README/feature overviews. Every breakdown MUST handle docs in exactly one of two ways:
+
+*   **MODE A — DOC-WITH-WORK (default):** If a subtask changes user-facing behavior, configuration surface, CLI flags, env vars, public API, or exported types, the docs that this specific change touches (e.g. \`docs/CONFIGURATION.md\`, \`docs/*.md\`, JSDoc on the exported symbol) MUST be updated **as part of that same subtask** — declared explicitly in its \`context_scope\` DOCS line. Do NOT spin up a separate subtask for per-feature docs; they ride with the implementing subtask, exactly like tests do under §3.
+*   **MODE B — CHANGESET-LEVEL DOCS (final to-do):** If the changeset has documentation implications that are **cross-cutting** — i.e. they only make sense once the whole change is in place, such as \`README.md\` feature blurbs, top-level capability lists, architecture overviews, or a new section that summarizes the entire delta — add a **FINAL Task** at the very end of the breakdown titled \"Sync changeset-level documentation\" (id: last Task id in the last Milestone). Its subtasks enumerate each changeset-level doc file to update and must declare \`dependencies\` on **every** implementing subtask they summarize, so it runs last. This is the catch-all that prevents a coherent delta from shipping with a stale README.
+
+*   **DECISION RULE:** Per-file/touched docs → Mode A (with the work). Whole-feature/overview docs → Mode B (final task). When in doubt, use BOTH — a subtask updates the doc it directly touches (A), and a final task sweeps the README/overview (B).
+*   **EXAMPLE:** A PRD delta adding a new env var \`PRP_AGENT_HARNESS\` → the implementing config subtask updates \`docs/CONFIGURATION.md\` (Mode A), AND the final \"Sync changeset-level documentation\" task updates \`README.md\`'s features/env-var sections to surface the new capability (Mode B).
+
 ---
 
 ## PROCESS
@@ -934,6 +991,7 @@ ULTRATHINK & PLAN
     *   **Store** findings in \`$SESSION_DIR/architecture/\` (e.g., \`system_context.md\`, \`external_deps.md\`).
 3.  **DETERMINE** the highest level of scope (Phase, Milestone, or Task).
 4.  **DECOMPOSE** strictly downwards to the Subtask level, using your research to populate the \`context_scope\`.
+5.  **PLAN DOCUMENTATION (per §5):** For every subtask, decide Mode A vs Mode B. Add a DOCS line to each subtask's \`context_scope\`. Then append a **final Task** (\"Sync changeset-level documentation\") covering README.md and any overview docs that span the whole changeset, with dependencies on all implementing subtasks. Do NOT skip this final task even if you think the change is small — let the implementing agent decide whether the README needs a touch.
 
 ---
 
@@ -977,7 +1035,7 @@ Use your file writing tools to create \`./$TASKS_FILE\` with this structure:
                   "story_points": 1,
                   "dependencies": ["ID of prerequisite subtask"],
                   "prd_selectors": ["h2.X", "h3.Y"],
-                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: [Finding from $SESSION_DIR/architecture/ regarding this feature].\n2. INPUT: [Specific data structure/variable] from [Dependency ID].\n3. LOGIC: Implement [PRD Section X] logic. Mock [Service Y] for isolation.\n4. OUTPUT: Return [Result Object/Interface] for consumption by [Next Subtask ID]."
+                  "context_scope": "CONTRACT DEFINITION:\n1. RESEARCH NOTE: [Finding from $SESSION_DIR/architecture/ regarding this feature].\n2. INPUT: [Specific data structure/variable] from [Dependency ID].\n3. LOGIC: Implement [PRD Section X] logic. Mock [Service Y] for isolation.\n4. OUTPUT: Return [Result Object/Interface] for consumption by [Next Subtask ID].\n5. DOCS: [Mode A] Update <docs/CONFIGURATION.md §X / JSDoc on fn Y> to reflect this change, OR 'none — no user-facing/config/API surface change'. This rides WITH the work, do not create a separate docs subtask."
                 }
               ]
             }
@@ -1066,6 +1124,18 @@ If additional context is needed, reference the full PRD index to identify other 
 
 **Note**: If \`<prd_selectors>\` is empty or \`[]\`, \`<selected_prd_content>\` contains the FULL PRD (legacy task without selectors). When selectors are present, only those sections are included. You may also reference architecture/ directory for additional context.
 
+## Issue Feedback (Re-planning)
+
+If \`<issue_feedback>\` contains content, this is a **re-planning attempt** after a previous implementation failed with an issue.
+
+**CRITICAL**: You MUST address the feedback in your revised PRP:
+1. Read the issue details carefully - understand WHY the previous attempt failed
+2. Create a revised PRP that avoids or works around the identified problem
+3. If the issue is **fundamentally impossible** to resolve (e.g., contradictory requirements, missing dependencies that can't be added), output \`"result": "fail"\` with a clear explanation
+4. Do NOT simply repeat the same approach - the implementation WILL fail again
+
+<issue_feedback>
+
 ## PRP Creation Mission
 
 Create a comprehensive PRP that enables **one-pass implementation success** through systematic research and context curation.
@@ -1084,7 +1154,7 @@ Be aware that the executing AI agent only receives:
 ## Research Process
 
 > **CRITICAL**: Research is a MEANS TO AN END, not the goal itself. Your PRIMARY deliverable is the PRP.md file.
-> Limit research to 3-5 subagent calls maximum. After gathering sufficient context, IMMEDIATELY write the PRP.md file using the Write tool.
+> Limit research to 3-5 subagent calls maximum. After gathering sufficient context, IMMEDIATELY write the PRP.md file using the write tool.
 > DO NOT get stuck in endless research loops. If you've made more than 5 tool calls without writing the PRP, STOP and write it NOW.
 
 1. **Codebase Analysis in depth**
@@ -1092,7 +1162,7 @@ Be aware that the executing AI agent only receives:
    - Identify all the necessary files to reference in the PRP
    - Note all existing conventions to follow
    - Check existing test patterns for validation approach, if none are found plan to find a new one
-   - Use the batch tools to spawn subagents to search the codebase for similar features/patterns
+   - Use the subagent tool to search the codebase for similar features/patterns
 
 2. **Internal Research at scale**
    - Use relevant research and plan information in the plan/architecture directory
@@ -1107,7 +1177,7 @@ Be aware that the executing AI agent only receives:
    - Implementation examples (GitHub/StackOverflow/blogs)
    - New validation approach none found in existing codebase and user confirms they would like one added
    - Best practices and common pitfalls found during research
-   - Use the batch tools to spawn subagents to search for similar features/patterns online and include urls to documentation and examples
+   - Use the subagent tool to search for similar features/patterns online and include urls to documentation and examples
 
 4. **User Clarification**
    - Ask for clarification if you need it
@@ -1145,7 +1215,7 @@ Ensure every reference is **specific and actionable**:
 
 ### Step 5: ULTRATHINK Before Writing
 
-After research completion, create comprehensive PRP writing plan using TodoWrite tool:
+After research completion, create a comprehensive PRP writing plan (track it as a step-by-step checklist):
 
 - Plan how to structure each template section with your research findings
 - Identify gaps that need additional research
@@ -1527,7 +1597,7 @@ bandit -r src/
 
 **YOU MUST WRITE THE PRP.md FILE.** This is your PRIMARY and ONLY deliverable.
 
-After gathering context (limit: 3-5 subagent calls), IMMEDIATELY use the Write tool to create the PRP.md file at the path specified.
+After gathering context (limit: 3-5 subagent calls), IMMEDIATELY use the write tool to create the PRP.md file at the path specified.
 
 DO NOT:
 - Spawn more than 5 subagents total
@@ -1557,7 +1627,7 @@ PRPs enable working code on the first attempt through:
 ## Execution Process
 
 1. **Load PRP (CRITICAL FIRST STEP)**
-   - **ACTION**: Use the \`Read\` tool to read the PRP file at the path provided in the instructions below.
+   - **ACTION**: Use the \`read\` tool to read the PRP file at the path provided in the instructions below.
    - You MUST read this file before doing anything else. It contains your instructions.
    - Absorb all context, patterns, requirements and gather codebase intelligence
    - Use the provided documentation references and file patterns, consume the right documentation before the appropriate todo/task
@@ -1566,7 +1636,7 @@ PRPs enable working code on the first attempt through:
 
 2. **ULTRATHINK & Plan**
    - Create comprehensive implementation plan following the PRP's task order
-   - Break down into clear todos using TodoWrite tool
+   - Break down into a clear step-by-step plan
    - Use subagents for parallel work when beneficial (always create prp inspired prompts for subagents when used)
    - Follow the patterns referenced in the PRP
    - Use specific file paths, class names, and method signatures from PRP context
@@ -1775,6 +1845,10 @@ Check $PREV_SESSION_DIR/architecture/ for existing research that may still apply
    - New features/requirements added
    - Modified requirements (note what changed from original)
    - Removed requirements (note for awareness, but don't create tasks)
+   - **DOCUMENTATION IMPACT (two modes, mirror the breakdown agent):**
+     - **Mode A — doc-with-work:** For each new/modified requirement, name the specific doc file(s) it touches (e.g. \`docs/CONFIGURATION.md\`, JSDoc on the exported symbol). These updates ride WITH the implementing work — note them as a sub-bullet under the requirement, do NOT make them standalone tasks.
+     - **Mode B — changeset-level docs:** If the delta has cross-cutting doc implications (e.g. \`README.md\` feature blurbs, top-level capability lists, architecture overviews that only make sense once the whole change is in place), call this out explicitly as a final "Sync changeset-level documentation" requirement depending on all the above. The breakdown agent will turn it into a final Task.
+     - **Do NOT silently omit docs.** Even if a change looks small, state the Mode A docs it touches (or explicitly \"none\") and decide whether Mode B applies. A delta that ships coherent code with a stale README has failed.
 4. **REFERENCE COMPLETED WORK**: The previous session implemented the original PRD.
    - Reference existing implementations rather than re-implementing
    - If a modification affects completed work, note which files/functions need updates
@@ -2240,9 +2314,28 @@ EOF
 # Returns: The status string (Planned, Researching, Implementing, Complete, Failed) or empty if not found
 get_item_status() {
     local id=$1
-    # Get status as JSON and extract the status for this specific item
-    # Suppress jq errors in case tsk returns non-JSON output
-    tsk_cmd status -s "$SCOPE" 2>/dev/null | jq -r --arg iid "$id" '.[] | select(.id == $iid) | .status // empty' 2>/dev/null
+    local item_status=""
+
+    # Method 1: Try tsk command
+    local tsk_output
+    tsk_output=$(tsk_cmd status -s "$SCOPE" 2>&1)
+    if [[ $? -eq 0 ]] && echo "$tsk_output" | jq empty 2>/dev/null; then
+        item_status=$(echo "$tsk_output" | jq -r --arg iid "$id" '.[] | select(.id == $iid) | .status // empty' 2>/dev/null)
+    fi
+
+    # Method 2: Fallback to direct tasks.json query using recursive ID search
+    if [[ -z "$item_status" && -f "$TASKS_FILE" ]]; then
+        # Use jq recursive descent to find item by ID - works regardless of array indices
+        item_status=$(jq -r --arg iid "$id" '.. | objects | select(.id? == $iid) | .status // empty' "$TASKS_FILE" 2>/dev/null | head -1)
+    fi
+
+    # Log warning if we still couldn't get status (but don't spam during normal operation)
+    if [[ -z "$item_status" && "${GET_STATUS_WARNED:-}" != "$id" ]]; then
+        print -P "%F{yellow}[WARN]%f Could not get status for $id" >&2
+        GET_STATUS_WARNED="$id"
+    fi
+
+    echo "$item_status"
 }
 
 # Generate ID based on scope
@@ -2375,12 +2468,143 @@ get_scope_article() {
 }
 
 # --- Parallel Research Helpers ---
+# Depth-2 chained prefetch: when research for item N+1 finishes early (while N
+# is still being implemented), the supervisor immediately starts research for
+# N+2 instead of idling. This collapses the "fast impl -> stall" and
+# "slow impl -> wasted capacity" stalls seen with a single prefetch slot.
+# RESEARCH_PID      = the supervisor subshell PID (handles a chain of items)
+# RESEARCH_DIRNAMES  = assoc item_id -> dirname, for items queued/active in the
+#                      current supervisor. Used by wait_for, restore, smart_commit.
 RESEARCH_PID=""
-RESEARCH_ITEM_ID=""
-RESEARCH_DIRNAME=""
+typeset -A RESEARCH_DIRNAMES
+# Remove an item from the research plan. zsh associative arrays need a
+# quoted subscript for keys containing dots (e.g. "P1.M1.T1.S2"); encapsulated
+# here so call sites stay readable.
+rd_unset() { unset "RESEARCH_DIRNAMES[\"$1\"]"; }
+# How many items ahead the supervisor researches (1 = legacy single-slot).
+RESEARCH_DEPTH="${RESEARCH_DEPTH:-2}"
+# Scratch arrays filled by build_research_chain, consumed by run_research_supervisor.
+typeset -a CHAIN_IDS CHAIN_DIRNAMES CHAIN_COORDS
+# Build a chain of up to RESEARCH_DEPTH item records starting at the given coords.
+# Fills parallel arrays CHAIN_IDS / CHAIN_DIRNAMES / CHAIN_COORDS.
+# CHAIN_COORDS entries are "phase ms task subtask" strings.
+# Usage: build_research_chain <phase> <ms> <task> <subtask>
+build_research_chain() {
+    local p=$1 m=$2 t=$3 s=$4
+    local depth=0
+    CHAIN_IDS=()
+    CHAIN_DIRNAMES=()
+    CHAIN_COORDS=()
+    while (( depth < RESEARCH_DEPTH )); do
+        local cid=$(generate_id $p $m $t $s)
+        [[ -z "$cid" ]] && break
+        CHAIN_IDS+=("$cid")
+        CHAIN_DIRNAMES+=("$SESSION_DIR/$(generate_dirname $p $m $t $s)")
+        CHAIN_COORDS+=("$p $m $t $s")
+        ((depth++))
+        get_next_item $p $m $t $s || break
+        p=$NEXT_PHASE; m=$NEXT_MS; t=$NEXT_TASK; s=$NEXT_SUBTASK
+    done
+}
 
-# Start research for an item in the background
-# Usage: start_background_research <id> <dirname> <phase_num> <ms_num> <task_num> <subtask_num> <prev_id> <prev_dirname>
+# The background supervisor body. Runs in a subshell `( run_research_supervisor ... ) &`.
+# Sequentially researches each item in the chain; each item after the first treats
+# the PRIOR item's PRP as a contract (same model as the legacy single prefetch,
+# which already assumed N+1 could rely on N's PRP). Stops the chain on failure.
+# Usage (inside subshell): run_research_supervisor <prev_id> <prev_dirname>
+run_research_supervisor() {
+    local prev_id=$1
+    local prev_dirname=$2
+    local i
+    for ((i=1; i<=${#CHAIN_IDS}; i++)); do
+        local cid="${CHAIN_IDS[$i]}"
+        local cdir="${CHAIN_DIRNAMES[$i]}"
+        local coords="${CHAIN_COORDS[$i]}"
+        local cp=(${=coords})
+        local ph=${cp[1]} ms=${cp[2]} tk=${cp[3]} st=${cp[4]}
+
+        # Already has a PRP (e.g. resumed) - nothing to research; still becomes contract for next.
+        if [[ -f "$cdir/PRP.md" ]]; then
+            prev_id="$cid"; prev_dirname="$cdir"
+            continue
+        fi
+
+        mkdir -p "$cdir/research"
+        tsk -f "$TASKS_FILE" update "$cid" Researching
+
+        # Contract context from the previous item (passed in for item 1, prior chain item thereafter)
+        local prev_context=""
+        if [[ -n "$prev_id" && -f "$prev_dirname/PRP.md" ]]; then
+            prev_context="
+<parallel_execution_context>
+IMPORTANT: This research is running IN PARALLEL while $prev_id is being implemented.
+
+The previous work item ($prev_id) is currently being implemented. You MUST:
+1. Read the previous item's PRP at $prev_dirname/PRP.md to understand what it produces
+2. Treat that PRP as a CONTRACT - assume it will be implemented exactly as specified
+3. Design your PRP to consume/build upon the outputs defined in the previous PRP
+4. Do NOT duplicate or conflict with work specified in the previous PRP
+5. Reference specific interfaces, files, or outputs from the previous PRP in your context_scope
+
+The previous PRP defines what will exist when your item begins implementation.
+</parallel_execution_context>"
+        fi
+
+        # Per-item prompt data (computed in the supervisor; helpers are inherited)
+        local prd_selectors=$(get_item_prd_selectors $ph $ms $tk $st)
+        local selected_prd=""
+        local prd_snapshot="$SESSION_DIR/prd_snapshot.md"
+        if [[ -n "$prd_selectors" && "$prd_selectors" != "[]" && -f "$prd_snapshot" ]] && mdsel_available; then
+            selected_prd=$(extract_prd_sections "$prd_snapshot" "$prd_selectors")
+        fi
+        if [[ -z "$selected_prd" && -f "$prd_snapshot" ]]; then
+            selected_prd=$(cat "$prd_snapshot")
+        fi
+        local prd_index_content=""
+        [[ -f "$SESSION_DIR/prd_index.txt" ]] && prd_index_content=$(cat "$SESSION_DIR/prd_index.txt")
+        local issue_feedback=""
+        [[ -f "$cdir/issue_feedback.md" ]] && issue_feedback=$(cat "$cdir/issue_feedback.md")
+
+        # Pin a deterministic session id per item so the retry below resumes THIS item.
+        local research_sid="prd-research-$(basename "$cdir")"
+        $AGENT --session-id "$research_sid" $PRP_AGENT_MCP_ARGS -p "$PRP_CREATE_PROMPT Create a PRP for $(get_scope_name) $cid of the PRD.
+
+CRITICAL OUTPUT PATHS (use these EXACT paths):
+- PRP file: $cdir/PRP.md
+- Research files: $cdir/research/
+
+DO NOT write files to any other location. All research MUST go in $cdir/research/ and the final PRP MUST be at $cdir/PRP.md.
+
+<item_title>$(get_item_title $ph $ms $tk $st)</item_title>
+<item_description>$(get_item_description $ph $ms $tk $st)</item_description>
+<prd_selectors>$prd_selectors</prd_selectors>
+<selected_prd_content>
+$selected_prd
+</selected_prd_content>
+<prd_index>
+$prd_index_content
+</prd_index>
+<issue_feedback>
+$issue_feedback
+</issue_feedback>
+<plan_status>$(tsk -f "$TASKS_FILE" status)</plan_status>$prev_context" < /dev/null
+
+        if [[ ! -f "$cdir/PRP.md" ]]; then
+            print -P "%F{yellow}[PARALLEL]%f PRP.md not found for $cid, retrying..."
+            $AGENT --session-id "$research_sid" -p "You didn't write the file. Make sure you write the file to $cdir/PRP.md" < /dev/null
+        fi
+        if [[ ! -f "$cdir/PRP.md" ]]; then
+            print -P "%F{red}[PARALLEL]%f Background research FAILED for $cid - no PRP created"
+            exit 1
+        fi
+        tsk -f "$TASKS_FILE" update "$cid" Ready
+        # This item's PRP becomes the contract for the next item in the chain.
+        prev_id="$cid"; prev_dirname="$cdir"
+    done
+}
+
+# Start research for an item in the background, chaining ahead up to RESEARCH_DEPTH.
+# Usage: start_background_research <id> <dirname> <phase> <ms> <task> <subtask> <prev_id> <prev_dirname>
 start_background_research() {
     local id=$1
     local dirname=$2
@@ -2404,144 +2628,86 @@ start_background_research() {
         return 0
     fi
 
-    print -P "%F{cyan}[PARALLEL]%f Starting background research for $id..."
-    mkdir -p "$dirname/research"
-
-    # Build context about the previous item being implemented
-    local prev_context=""
-    if [[ -n "$prev_id" && -f "$prev_dirname/PRP.md" ]]; then
-        prev_context="
-<parallel_execution_context>
-IMPORTANT: This research is running IN PARALLEL while $prev_id is being implemented.
-
-The previous work item ($prev_id) is currently being implemented. You MUST:
-1. Read the previous item's PRP at $prev_dirname/PRP.md to understand what it produces
-2. Treat that PRP as a CONTRACT - assume it will be implemented exactly as specified
-3. Design your PRP to consume/build upon the outputs defined in the previous PRP
-4. Do NOT duplicate or conflict with work specified in the previous PRP
-5. Reference specific interfaces, files, or outputs from the previous PRP in your context_scope
-
-The previous PRP defines what will exist when your item begins implementation.
-</parallel_execution_context>"
+    # Skip if an active supervisor already has this item queued/active (prevents
+    # duplicate launches when execute_item races ahead of a still-running chain).
+    if [[ -n "$RESEARCH_PID" ]] && kill -0 "$RESEARCH_PID" 2>/dev/null && [[ -n "${RESEARCH_DIRNAMES["$id"]}" ]]; then
+        print -P "%F{cyan}[PARALLEL]%f $id already queued in background research (PID $RESEARCH_PID), not relaunching"
+        return 0
     fi
 
-    # Extract PRD selectors and selected content for this work item (before subshell)
-    # Falls back to full PRD if: no selectors, mdsel unavailable, or extraction fails
-    local prd_selectors=$(get_item_prd_selectors $phase_num $ms_num $task_num $subtask_num)
-    local selected_prd=""
-    local prd_snapshot="$SESSION_DIR/prd_snapshot.md"
+    # Build the chain and register the plan
+    build_research_chain $phase_num $ms_num $task_num $subtask_num
+    [[ ${#CHAIN_IDS[@]} -eq 0 ]] && return 0
 
-    if [[ -n "$prd_selectors" && "$prd_selectors" != "[]" && -f "$prd_snapshot" ]] && mdsel_available; then
-        selected_prd=$(extract_prd_sections "$prd_snapshot" "$prd_selectors")
-    fi
+    RESEARCH_DIRNAMES=()
+    local i
+    for ((i=1; i<=${#CHAIN_IDS}; i++)); do
+        local _cid="${CHAIN_IDS[$i]}"
+        RESEARCH_DIRNAMES["$_cid"]="${CHAIN_DIRNAMES[$i]}"
+    done
 
-    # Fallback to full PRD if selectors missing/empty or extraction failed
-    if [[ -z "$selected_prd" && -f "$prd_snapshot" ]]; then
-        selected_prd=$(cat "$prd_snapshot")
-    fi
+    print -P "%F{cyan}[PARALLEL]%f Starting background research for $id (depth ${#CHAIN_IDS[@]}: ${CHAIN_IDS[*]})..."
 
-    local prd_index_content=""
-    [[ -f "$SESSION_DIR/prd_index.txt" ]] && prd_index_content=$(cat "$SESSION_DIR/prd_index.txt")
-
-    # Run research in background subshell
-    # Status: Researching (in progress) -> Ready (PRP created, ready to implement)
-    # The orphan cleanup function handles cases where research fails before PRP is created
-    (
-        tsk -f "$TASKS_FILE" update "$id" Researching
-        $AGENT $PRP_AGENT_MCP_ARGS -p "$PRP_CREATE_PROMPT Create a PRP for $(get_scope_name) $id of the PRD.
-
-CRITICAL OUTPUT PATHS (use these EXACT paths):
-- PRP file: $dirname/PRP.md
-- Research files: $dirname/research/
-
-DO NOT write files to any other location. All research MUST go in $dirname/research/ and the final PRP MUST be at $dirname/PRP.md.
-
-<item_title>$(get_item_title $phase_num $ms_num $task_num $subtask_num)</item_title>
-<item_description>$(get_item_description $phase_num $ms_num $task_num $subtask_num)</item_description>
-<prd_selectors>$prd_selectors</prd_selectors>
-<selected_prd_content>
-$selected_prd
-</selected_prd_content>
-<prd_index>
-$prd_index_content
-</prd_index>
-<plan_status>$(tsk -f "$TASKS_FILE" status)</plan_status>$prev_context" < /dev/null
-        if [[ ! -f "$dirname/PRP.md" ]]; then
-            print -P "%F{yellow}[PARALLEL]%f PRP.md not found for $id, retrying..."
-            $AGENT --continue -p "You didn't write the file. Make sure you write the file to $dirname/PRP.md" < /dev/null
-        fi
-        # Mark as Ready when PRP is successfully created, or exit with error
-        if [[ -f "$dirname/PRP.md" ]]; then
-            tsk -f "$TASKS_FILE" update "$id" Ready
-        else
-            print -P "%F{red}[PARALLEL]%f Background research FAILED for $id - no PRP created"
-            exit 1
-        fi
-    ) &
-
+    # Launch the supervisor subshell. RESEARCH_PID tracks the whole chain.
+    ( run_research_supervisor "$prev_id" "$prev_dirname" ) &
     RESEARCH_PID=$!
-    RESEARCH_ITEM_ID=$id
-    RESEARCH_DIRNAME=$dirname
-    print -P "%F{cyan}[PARALLEL]%f Background research started (PID: $RESEARCH_PID)"
+    print -P "%F{cyan}[PARALLEL]%f Background research started (PID: $RESEARCH_PID, items: ${CHAIN_IDS[*]})"
 }
 
-# Wait for background research to complete if it matches the given item
-# Handles: PRP ready, process died, process HUNG (alive but stuck)
+# Wait for background research to produce item <id>'s PRP.
+# Polls the PRP file (5s granularity) and uses the supervisor PID for liveness.
+# Items not in the active plan return immediately (execute_item will start them).
+# On success/failure the item is consumed (removed from RESEARCH_DIRNAMES) but the
+# supervisor keeps running to prefetch the rest of the chain.
 # Usage: wait_for_background_research <id>
 wait_for_background_research() {
     local id=$1
     local elapsed=0
     local max_wait=${RESEARCH_TIMEOUT:-600}  # 10 min max for hung processes
+    local dirname="${RESEARCH_DIRNAMES["$id"]}"
 
-    if [[ -n "$RESEARCH_PID" && "$RESEARCH_ITEM_ID" == "$id" ]]; then
-        print -P "%F{cyan}[PARALLEL]%f Waiting for $id (PID $RESEARCH_PID, max ${max_wait}s)..."
+    # Not queued in any active supervisor - nothing to wait for.
+    if [[ -z "$dirname" ]]; then
+        return 0
+    fi
 
-        while true; do
-            # 1. Check if PRP exists - success
-            if [[ -f "$RESEARCH_DIRNAME/PRP.md" ]]; then
-                print -P "%F{green}[PARALLEL]%f PRP ready (${elapsed}s)"
-                RESEARCH_PID=""
-                RESEARCH_ITEM_ID=""
-                RESEARCH_DIRNAME=""
+    print -P "%F{cyan}[PARALLEL]%f Waiting for $id (PID $RESEARCH_PID, max ${max_wait}s)..."
+
+    while true; do
+        # 1. PRP exists -> success
+        if [[ -f "$dirname/PRP.md" ]]; then
+            print -P "%F{green}[PARALLEL]%f PRP ready for $id (${elapsed}s)"
+            rd_unset "$id"
+            return 0
+        fi
+
+        # 2. Supervisor died before producing this PRP
+        if [[ -z "$RESEARCH_PID" ]] || ! kill -0 "$RESEARCH_PID" 2>/dev/null; then
+            wait "$RESEARCH_PID" 2>/dev/null
+            if [[ -f "$dirname/PRP.md" ]]; then
+                print -P "%F{green}[PARALLEL]%f PRP ready for $id (${elapsed}s, supervisor exited)"
+                rd_unset "$id"
                 return 0
             fi
+            print -P "%F{red}[PARALLEL]%f FAILED for $id - supervisor exited with no PRP (${elapsed}s) - will retry sync"
+            rd_unset "$id"
+            return 1
+        fi
 
-            # 2. Check if process died
-            if ! kill -0 $RESEARCH_PID 2>/dev/null; then
-                wait $RESEARCH_PID 2>/dev/null
-                local exit_code=$?
-                local saved_dirname="$RESEARCH_DIRNAME"
-                RESEARCH_PID=""
-                RESEARCH_ITEM_ID=""
-                RESEARCH_DIRNAME=""
+        # 3. Hung supervisor
+        if (( elapsed >= max_wait )); then
+            print -P "%F{red}[PARALLEL]%f HUNG! No PRP for $id after ${elapsed}s - killing supervisor $RESEARCH_PID"
+            kill -9 "$RESEARCH_PID" 2>/dev/null
+            wait "$RESEARCH_PID" 2>/dev/null
+            rd_unset "$id"
+            return 1
+        fi
 
-                if [[ -f "$saved_dirname/PRP.md" ]]; then
-                    print -P "%F{green}[PARALLEL]%f Done (${elapsed}s)"
-                    return 0
-                else
-                    print -P "%F{red}[PARALLEL]%f FAILED (exit $exit_code, ${elapsed}s) - retrying sync"
-                    return 1
-                fi
-            fi
-
-            # 3. Process alive - check timeout for HUNG processes
-            if (( elapsed >= max_wait )); then
-                print -P "%F{red}[PARALLEL]%f HUNG! PID $RESEARCH_PID alive but no PRP after ${elapsed}s - killing"
-                kill -9 $RESEARCH_PID 2>/dev/null
-                wait $RESEARCH_PID 2>/dev/null
-                RESEARCH_PID=""
-                RESEARCH_ITEM_ID=""
-                RESEARCH_DIRNAME=""
-                return 1
-            fi
-
-            # 4. Still waiting
-            sleep 5
-            elapsed=$((elapsed + 5))
-            (( elapsed % 60 == 0 )) && print -P "%F{cyan}[PARALLEL]%f PID $RESEARCH_PID alive, ${elapsed}s/${max_wait}s..."
-        done
-    fi
-    return 0
+        # 4. Still waiting
+        sleep 5
+        elapsed=$((elapsed + 5))
+        (( elapsed % 60 == 0 )) && print -P "%F{cyan}[PARALLEL]%f PID $RESEARCH_PID alive, ${elapsed}s/${max_wait}s (waiting for $id)..."
+    done
 }
 
 # Get the next item coordinates based on current position and scope
@@ -2713,7 +2879,15 @@ execute_item() {
         local prd_index_content=""
         [[ -f "$SESSION_DIR/prd_index.txt" ]] && prd_index_content=$(cat "$SESSION_DIR/prd_index.txt")
 
-        run_with_retry $AGENT $PRP_AGENT_MCP_ARGS -p "$PRP_CREATE_PROMPT Create a PRP for $(get_scope_name) $id of the PRD. Store it at $dirname/PRP.md.
+        # Check for issue feedback from previous implementation attempt
+        local issue_feedback=""
+        local feedback_file="$dirname/issue_feedback.md"
+        if [[ -f "$feedback_file" ]]; then
+            issue_feedback=$(cat "$feedback_file")
+            print -P "%F{yellow}[ISSUE RETRY]%f Including feedback from previous implementation attempt"
+        fi
+
+        run_with_retry $AGENT --session-id "prd-prp-$(basename "$dirname")" $PRP_AGENT_MCP_ARGS -p "$PRP_CREATE_PROMPT Create a PRP for $(get_scope_name) $id of the PRD. Store it at $dirname/PRP.md.
 <item_title>$(get_item_title $phase_num $ms_num $task_num $subtask_num)</item_title>
 <item_description>$(get_item_description $phase_num $ms_num $task_num $subtask_num)</item_description>
 <prd_selectors>$prd_selectors</prd_selectors>
@@ -2723,6 +2897,9 @@ $selected_prd
 <prd_index>
 $prd_index_content
 </prd_index>
+<issue_feedback>
+$issue_feedback
+</issue_feedback>
 <plan_status>$(tsk_cmd status)</plan_status>" < /dev/null
         # Check for interruption before marking as failed
         if [[ "$SHUTDOWN_REQUESTED" == "true" ]]; then
@@ -2731,7 +2908,7 @@ $prd_index_content
         fi
         if [[ ! -f "$dirname/PRP.md" ]]; then
             print -P "%F{yellow}[RETRY]%f PRP.md not found. Retrying..."
-            $AGENT --continue -p "You didn't write the file. Make sure you write the file to $dirname/PRP.md" < /dev/null
+            $AGENT --session-id "prd-prp-$(basename "$dirname")" -p "You didn't write the file. Make sure you write the file to $dirname/PRP.md" < /dev/null
         fi
         # Check again for interruption
         if [[ "$SHUTDOWN_REQUESTED" == "true" ]]; then
@@ -2777,7 +2954,7 @@ $prd_index_content
 
         # Use pipefail to get the agent's exit status, not tee's
         setopt pipefail
-        $AGENT -p "$PRP_EXECUTE_PROMPT Execute the PRP for $(get_scope_name) $id. The PRP file is located at: $dirname/PRP.md. READ IT NOW." < /dev/null 2>&1 | tee "$agent_output_file"
+        $IMPL_AGENT -p "$PRP_EXECUTE_PROMPT Execute the PRP for $(get_scope_name) $id. The PRP file is located at: $dirname/PRP.md. READ IT NOW." < /dev/null 2>&1 | tee "$agent_output_file"
         agent_exit_status=$?
         unsetopt pipefail
 
@@ -2803,7 +2980,7 @@ $prd_index_content
         local has_error_pattern=false
         local has_result_json=false
 
-        grep -qE '(Connection error|API Error|timeout|ECONNREFUSED|ETIMEDOUT|network|overloaded)' "$agent_output_file" 2>/dev/null && has_error_pattern=true
+        grep -qE '(Connection error|Connection Error|API Error|API error|API request failed|fetch failed|Failed to fetch|network error|timeout|timed out|ETIMEDOUT|ECONNREFUSED|ECONNRESET|EAI_AGAIN|ENOTFOUND|socket hang up|stream error|overloaded|rate limit|Rate limit|429|503|502|Internal Server Error|service unavailable|aborted|disposed|Invalid API Response)' "$agent_output_file" 2>/dev/null && has_error_pattern=true
         grep -q '"result"' "$agent_output_file" 2>/dev/null && has_result_json=true
 
         # Retry if:
@@ -2825,11 +3002,81 @@ $prd_index_content
         return 1
     done
 
-    # Check if agent reported success in its JSON output
+    # Check agent result in JSON output
     local agent_reported_success=false
+    local agent_reported_issue=false
+    local issue_message=""
+
     if grep -q '"result"[[:space:]]*:[[:space:]]*"success"' "$agent_output_file" 2>/dev/null; then
         agent_reported_success=true
+    elif grep -q '"result"[[:space:]]*:[[:space:]]*"issue"' "$agent_output_file" 2>/dev/null; then
+        agent_reported_issue=true
+        # Extract the issue message for feedback
+        issue_message=$(grep -oP '"message"[[:space:]]*:[[:space:]]*"\K[^"]+' "$agent_output_file" 2>/dev/null | head -1)
+        # If message is too long or has escape sequences, try to get the full JSON block
+        if [[ -z "$issue_message" ]]; then
+            issue_message=$(sed -n '/"result"[[:space:]]*:[[:space:]]*"issue"/,/}/p' "$agent_output_file" 2>/dev/null)
+        fi
     fi
+
+    # Handle "issue" result - retry with feedback
+    if [[ "$agent_reported_issue" == "true" ]]; then
+        print -P "%F{yellow}[ISSUE]%f Agent reported an issue for $id"
+
+        # Track retry count
+        local retry_file="$dirname/.issue_retry_count"
+        local retry_count=0
+        [[ -f "$retry_file" ]] && retry_count=$(cat "$retry_file")
+        ((retry_count++))
+
+        if (( retry_count > ISSUE_RETRY_MAX )); then
+            print -P "%F{red}[FAILED]%f Issue retry limit ($ISSUE_RETRY_MAX) exceeded for $id - marking as Failed"
+            rm -f "$retry_file" "$agent_output_file"
+            CURRENT_PROCESSING_STATUS="Failed"
+            restore_tasks_json "Failed"
+            return 1
+        fi
+
+        print -P "%F{yellow}[ISSUE]%f Retry $retry_count/$ISSUE_RETRY_MAX - sending back to research with feedback"
+        echo "$retry_count" > "$retry_file"
+
+        # Save the issue feedback for the PRP agent
+        local feedback_file="$dirname/issue_feedback.md"
+        cat > "$feedback_file" <<FEEDBACK_EOF
+# Implementation Issue Feedback (Attempt $retry_count/$ISSUE_RETRY_MAX)
+
+The previous implementation attempt encountered an issue that requires re-planning.
+
+## Issue Details
+
+$issue_message
+
+## Full Agent Output
+
+$(cat "$agent_output_file")
+
+## Instructions
+
+Review this feedback and create a revised PRP that addresses the issue.
+If the issue is fundamentally impossible to resolve, output \`"result": "fail"\` with an explanation.
+FEEDBACK_EOF
+
+        rm -f "$agent_output_file"
+
+        # Delete the existing PRP so research runs again
+        rm -f "$dirname/PRP.md"
+
+        # Reset status to Planned so next iteration picks it up for research
+        CURRENT_PROCESSING_STATUS="Planned"
+        restore_tasks_json "Planned"
+
+        print -P "%F{cyan}[ISSUE]%f Feedback saved to $feedback_file"
+        print -P "%F{cyan}[ISSUE]%f PRP deleted - will re-research on next iteration"
+
+        # Return special code to signal issue-retry (not failure, not success)
+        return 2
+    fi
+
     rm -f "$agent_output_file"
 
     # Restore tasks.json from HEAD to undo any agent modifications to it
@@ -2847,6 +3094,8 @@ $prd_index_content
             print -P "%F{green}[OK]%f Agent reported success for $id (work already complete, no changes needed)"
             CURRENT_PROCESSING_STATUS="Complete"
             restore_tasks_json "Complete"
+            # Clean up issue tracking files on success
+            rm -f "$dirname/.issue_retry_count" "$dirname/issue_feedback.md"
         else
             print -P "%F{red}[FAILED]%f No changes produced for $id - marking as Failed and continuing"
             CURRENT_PROCESSING_STATUS="Failed"
@@ -2857,6 +3106,8 @@ $prd_index_content
         # Changes exist - mark as complete
         CURRENT_PROCESSING_STATUS="Complete"
         restore_tasks_json "Complete"
+        # Clean up issue tracking files on success
+        rm -f "$dirname/.issue_retry_count" "$dirname/issue_feedback.md"
     fi
 
     print -P "%F{blue}[CLEANUP]%f Cleaning up $id..."
@@ -2925,17 +3176,21 @@ smart_commit() {
     # Protection against agent corruption is handled by restore_tasks_json after agent execution,
     # not by blocking status commits.
 
-    # Unstage the next item's plan directory if parallel research is active
-    if [[ "$PARALLEL_RESEARCH" == "true" && -n "$RESEARCH_DIRNAME" ]]; then
-        print -P "%F{cyan}[GIT]%f Unstaging next item's directory: $RESEARCH_DIRNAME"
-        git reset HEAD -- "$RESEARCH_DIRNAME" 2>/dev/null || true
+    # Unstage ALL active research directories (the supervisor may have several
+    # items queued ahead); their research/PRP files belong to future commits.
+    if [[ "$PARALLEL_RESEARCH" == "true" && ${#RESEARCH_DIRNAMES} -gt 0 ]]; then
+        local _rdir
+        for _rdir in "${(@v)RESEARCH_DIRNAMES}"; do
+            print -P "%F{cyan}[GIT]%f Unstaging research directory: $_rdir"
+            git reset HEAD -- "$_rdir" 2>/dev/null || true
+        done
     fi
 
     # Only commit if there are staged changes
     if git diff --staged --quiet; then
         print -P "%F{yellow}[GIT]%f No staged changes to commit."
     else
-        run_with_retry git commit-claude
+        run_with_retry git commit-pi
     fi
 }
 
@@ -2995,14 +3250,14 @@ Previous session directory: $PREV_SESSION_DIR
 "
 
     # Run delta PRD generation
-    run_with_retry $BREAKDOWN_AGENT -p "$DELTA_PRD_GENERATION_PROMPT
+    run_with_retry $BREAKDOWN_AGENT --session-id "prd-delta-$(basename "$SESSION_DIR")" -p "$DELTA_PRD_GENERATION_PROMPT
 
 $PREVIOUS_SESSION_CONTEXT_PROMPT" < /dev/null
 
     # Retry if delta PRD wasn't created
     if [[ ! -f "$SESSION_DIR/delta_prd.md" ]]; then
         print -P "%F{yellow}[DELTA]%f delta_prd.md not found. Demanding agent write it..."
-        run_with_retry $BREAKDOWN_AGENT --continue -p "You did NOT write the delta PRD file. You MUST write it to $SESSION_DIR/delta_prd.md immediately. This file is REQUIRED before we can proceed." < /dev/null
+        run_with_retry $BREAKDOWN_AGENT --session-id "prd-delta-$(basename "$SESSION_DIR")" -p "You did NOT write the delta PRD file. You MUST write it to $SESSION_DIR/delta_prd.md immediately. This file is REQUIRED before we can proceed." < /dev/null
     fi
 
     # Final validation - FAIL if delta PRD is still missing
@@ -3034,12 +3289,12 @@ fi
 if [[ ! -f "$TASKS_FILE" ]]; then
     print -P "%F{magenta}[PHASE 0]%f Generating breakdown..."
     mkdir -p "$SESSION_DIR/architecture"
-    run_with_retry $BREAKDOWN_AGENT --system-prompt="$TASK_BREAKDOWN_SYSTEM_PROMPT" -p "$TASK_BREAKDOWN_PROMPT" < /dev/null
+    run_with_retry $BREAKDOWN_AGENT --session-id "prd-breakdown-$(basename "$SESSION_DIR")" --system-prompt "$TASK_BREAKDOWN_SYSTEM_PROMPT" -p "$TASK_BREAKDOWN_PROMPT" < /dev/null
 
     # If file still doesn't exist, demand the agent write it
     if [[ ! -f "$TASKS_FILE" ]]; then
         print -P "%F{yellow}[PHASE 0]%f $TASKS_FILE not found. Demanding agent write it..."
-        run_with_retry $BREAKDOWN_AGENT --continue -p "You did NOT write the tasks file. You MUST write the JSON breakdown to \`./$TASKS_FILE\` (CURRENT WORKING DIRECTORY) immediately. Do NOT search for tasks.json in other directories. Create a NEW file at exactly \`./$TASKS_FILE\`. Use your file writing tools NOW." < /dev/null
+        run_with_retry $BREAKDOWN_AGENT --session-id "prd-breakdown-$(basename "$SESSION_DIR")" --system-prompt "$TASK_BREAKDOWN_SYSTEM_PROMPT" -p "You did NOT write the tasks file. You MUST write the JSON breakdown to \`./$TASKS_FILE\` (CURRENT WORKING DIRECTORY) immediately. Do NOT search for tasks.json in other directories. Create a NEW file at exactly \`./$TASKS_FILE\`. Use your file writing tools NOW." < /dev/null
     fi
 
     if [[ -f "$TASKS_FILE" ]]; then
@@ -3062,7 +3317,8 @@ fi
 # Print current scope configuration
 print -P "%F{cyan}[CONFIG]%f Scope: %F{yellow}$SCOPE%f (Default: task)"
 [[ $BREAKDOWN_AGENT != "$AGENT" ]] && print -P "%F{cyan}[CONFIG]%f Breakdown agent: %F{yellow}$BREAKDOWN_AGENT%f"
-print -P "%F{cyan}[CONFIG]%f Execution agent: %F{yellow}$AGENT%f"
+print -P "%F{cyan}[CONFIG]%f Planning agent (glm-5.2): %F{yellow}$AGENT%f"
+print -P "%F{cyan}[CONFIG]%f Implementation agent (turbo): %F{yellow}$IMPL_AGENT%f"
 [[ "$PARALLEL_RESEARCH" == "true" ]] && print -P "%F{cyan}[CONFIG]%f Parallel research: %F{green}enabled%f"
 [[ "$SKIP_BUG_FINDING" == "true" ]] && print -P "%F{cyan}[CONFIG]%f Bug finding: %F{yellow}skipped%f" || print -P "%F{cyan}[CONFIG]%f Bug finder agent: %F{yellow}$BUG_FINDER_AGENT%f"
 print -P "%F{cyan}[CONFIG]%f Starting positions: Phase=$START_PHASE"
@@ -3227,7 +3483,7 @@ if [[ -f "validation_report.md" ]]; then
     REPORT_CONTENT=$(cat validation_report.md)
 
     # Check if report requires action using a restricted agent
-    # We use 'claude' directly to ensure we can disable tools
+    # Classifier agent disables tools and sessions (see CLASSIFIER_AGENT above)
     CHECK_PROMPT="Here is the validation report.
 
     CONTENT:
@@ -3238,16 +3494,32 @@ if [[ -f "validation_report.md" ]]; then
     - If the report shows passing status and no issues: output CLEAN
     - Output ONLY the single word."
 
-    # First attempt
-    RESULT=$(claude --print --allowed-tools "" --system-prompt "You are a binary classifier. Output only CLEAN or DIRTY." "$CHECK_PROMPT" < /dev/null)
-    CLEAN_RESULT=$(echo "$RESULT" | tr -d '[:space:]')
+    local RESULT=""
+    local CLEAN_RESULT=""
+    local classify_attempt=0
+    local classify_max=4
+    local user_prompt="$CHECK_PROMPT"
 
-    # Validate response and retry if necessary
-    if [[ "$CLEAN_RESULT" != "CLEAN" && "$CLEAN_RESULT" != "DIRTY" ]]; then
-        print -P "%F{yellow}[RETRY]%f Invalid checker output: '$RESULT'. Retrying..."
-        RESULT=$(claude --print --continue --allowed-tools "" "ERROR: You replied with '$RESULT'. You MUST output exactly one word: CLEAN or DIRTY." < /dev/null)
+    # Retry loop: handles invalid responses AND transient failures (mirrors the
+    # PRD-change classifier above; prevents silent empty-reply fallthrough).
+    while [[ $classify_attempt -lt $classify_max ]]; do
+        ((classify_attempt++))
+        RESULT=$($CLASSIFIER_AGENT --system-prompt "You are a binary classifier. Output only CLEAN or DIRTY." "$user_prompt" < /dev/null)
         CLEAN_RESULT=$(echo "$RESULT" | tr -d '[:space:]')
-    fi
+
+        if [[ "$CLEAN_RESULT" == "CLEAN" || "$CLEAN_RESULT" == "DIRTY" ]]; then
+            break
+        fi
+
+        if [[ -z "$RESULT" ]] || echo "$RESULT" | grep -qE '(Connection error|API Error|API error|API request failed|fetch failed|network error|timeout|timed out|ETIMEDOUT|ECONNREFUSED|ECONNRESET|EAI_AGAIN|socket hang up|stream error|overloaded|rate limit|429|503|502|service unavailable|aborted|disposed)'; then
+            print -P "%F{yellow}[RETRY]%f Checker transient failure (attempt $classify_attempt/$classify_max). Retrying in 3s..."
+            sleep 3
+        else
+            print -P "%F{yellow}[RETRY]%f Invalid checker output: '$RESULT'. Retrying..."
+            user_prompt="ERROR: You replied with '$RESULT'. You MUST output exactly one word: CLEAN or DIRTY."
+            sleep 1
+        fi
+    done
 
     print -P "%F{cyan}[STATUS]%f Report status: $CLEAN_RESULT"
 
@@ -3263,7 +3535,7 @@ if [[ -f "validation_report.md" ]]; then
         2. Fix the code to resolve these issues.
         3. Verify your fixes."
 
-        run_with_retry $AGENT -p "$FIX_PROMPT" < /dev/null
+        run_with_retry $IMPL_AGENT -p "$FIX_PROMPT" < /dev/null
         print -P "%F{green}[FIX]%f Fixes applied."
     fi
 fi
