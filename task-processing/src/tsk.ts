@@ -90,7 +90,8 @@ const SubtaskSchema = z.object({
   status: StatusSchema,
   story_points: z.number(),
   dependencies: z.array(z.string()),
-  context_scope: z.string().optional()
+  context_scope: z.string().optional(),
+  prd_selectors: z.array(z.string()).optional()
 });
 
 const TaskSchema = z.object({
