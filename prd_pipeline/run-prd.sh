@@ -15,6 +15,13 @@ fi
 # Export for nesting detection - but DON'T export SKIP_BUG_FINDING (it's only for legitimate recursive calls)
 export PRP_PIPELINE_RUNNING=$$
 
+# Sweep stale prompt temp files from prior runs that were hard-killed
+# (SIGTERM/SIGKILL/power loss) before run_with_retry_stdin/run_agent_stdin
+# could clean them up. Normal Ctrl+C hits the graceful-shutdown path which
+# removes its own temp file; this catches the rest. See those helpers for why
+# prompts go through temp-file-backed stdin (MAX_ARG_STRLEN).
+rm -f -- /tmp/prd-prompt.*(N) 2>/dev/null
+
 # --- 1. Environment Handling ---
 unalias() { builtin unalias "$@" 2>/dev/null || true }
 
@@ -2567,7 +2574,7 @@ The previous PRP defines what will exist when your item begins implementation.
 
         # Pin a deterministic session id per item so the retry below resumes THIS item.
         local research_sid="prd-research-$(basename "$cdir")"
-        $AGENT --session-id "$research_sid" $PRP_AGENT_MCP_ARGS -p "$PRP_CREATE_PROMPT Create a PRP for $(get_scope_name) $cid of the PRD.
+        run_agent_stdin "$PRP_CREATE_PROMPT Create a PRP for $(get_scope_name) $cid of the PRD.
 
 CRITICAL OUTPUT PATHS (use these EXACT paths):
 - PRP file: $cdir/PRP.md
@@ -2587,7 +2594,7 @@ $prd_index_content
 <issue_feedback>
 $issue_feedback
 </issue_feedback>
-<plan_status>$(tsk -f "$TASKS_FILE" status)</plan_status>$prev_context" < /dev/null
+<plan_status>$(tsk -f "$TASKS_FILE" status)</plan_status>$prev_context" $AGENT --session-id "$research_sid" $PRP_AGENT_MCP_ARGS
 
         if [[ ! -f "$cdir/PRP.md" ]]; then
             print -P "%F{yellow}[PARALLEL]%f PRP.md not found for $cid, retrying..."
@@ -2887,7 +2894,7 @@ execute_item() {
             print -P "%F{yellow}[ISSUE RETRY]%f Including feedback from previous implementation attempt"
         fi
 
-        run_with_retry $AGENT --session-id "prd-prp-$(basename "$dirname")" $PRP_AGENT_MCP_ARGS -p "$PRP_CREATE_PROMPT Create a PRP for $(get_scope_name) $id of the PRD. Store it at $dirname/PRP.md.
+        run_with_retry_stdin "$PRP_CREATE_PROMPT Create a PRP for $(get_scope_name) $id of the PRD. Store it at $dirname/PRP.md.
 <item_title>$(get_item_title $phase_num $ms_num $task_num $subtask_num)</item_title>
 <item_description>$(get_item_description $phase_num $ms_num $task_num $subtask_num)</item_description>
 <prd_selectors>$prd_selectors</prd_selectors>
@@ -2900,7 +2907,7 @@ $prd_index_content
 <issue_feedback>
 $issue_feedback
 </issue_feedback>
-<plan_status>$(tsk_cmd status)</plan_status>" < /dev/null
+<plan_status>$(tsk_cmd status)</plan_status>" $AGENT --session-id "prd-prp-$(basename "$dirname")" $PRP_AGENT_MCP_ARGS
         # Check for interruption before marking as failed
         if [[ "$SHUTDOWN_REQUESTED" == "true" ]]; then
             print -P "%F{yellow}[INTERRUPTED]%f PRP creation interrupted - leaving in Researching state for resume"
@@ -3149,6 +3156,52 @@ run_with_retry() {
     done
 }
 
+# Like run_with_retry, but feeds the agent's prompt via STDIN instead of as a
+# `pi -p "$prompt"` argv string. This is REQUIRED for large prompts: the Linux
+# kernel caps a single argv string at MAX_ARG_STRLEN = 131072 bytes (128KB),
+# independent of ARG_MAX. A PRD embedded in `-p "$TASK_BREAKDOWN_PROMPT"` can
+# easily exceed that (a 133KB PRD produced `argument list too long: pi` here),
+# and the failure is a hard E2BIG from execve() that no amount of wrapper
+# trimming fixes. The agent wrappers (piz/pizt = `pi ... -p "$@"`) enable print
+# mode via -p; with no positional prompt, pi reads the prompt from stdin.
+#
+# The prompt is written to a temp file once and re-fed on every retry attempt
+# (a pipe would be consumed by the first attempt, starving retries).
+#
+# Usage: run_with_retry_stdin <prompt_text> <agent> [agent-args...]
+#   (do NOT pass -p or < /dev/null; the helper handles stdin)
+run_with_retry_stdin() {
+    local prompt_text="$1"; shift
+    local tmp
+    tmp=$(mktemp -t prd-prompt.XXXXXX) || { print -P "%F{red}[ERROR]%f mktemp failed"; return 1; }
+    print -r -- "$prompt_text" > "$tmp"
+    local n=1 delay=5
+    while true; do
+        if [[ "$SHUTDOWN_REQUESTED" == "true" ]]; then rm -f "$tmp"; return 130; fi
+        eval "${(q)@}" < "$tmp"
+        local exit_status=$?
+        if [[ $exit_status -eq 0 ]]; then rm -f "$tmp"; return 0; fi
+        print -P "%F{yellow}[RETRY]%f Command failed (exit $exit_status). Attempt $n. Retrying in ${delay}s..."
+        sleep $delay
+        ((n++))
+    done
+}
+
+# Single-shot version of run_with_retry_stdin (no retry loop). For call sites
+# that manage their own recovery/retry logic (e.g. the background research
+# supervisor). Same MAX_ARG_STRLEN rationale: feed the prompt via stdin, not argv.
+# Usage: run_agent_stdin <prompt_text> <agent> [agent-args...]
+run_agent_stdin() {
+    local prompt_text="$1"; shift
+    local tmp
+    tmp=$(mktemp -t prd-prompt.XXXXXX) || return 1
+    print -r -- "$prompt_text" > "$tmp"
+    eval "${(q)@}" < "$tmp"
+    local _s=$?
+    rm -f "$tmp"
+    return $_s
+}
+
 # Protects tasks.json and the plan directory from AI "cleanup"
 smart_commit() {
     print -P "%F{blue}[GIT]%f Staging changes..."
@@ -3289,12 +3342,12 @@ fi
 if [[ ! -f "$TASKS_FILE" ]]; then
     print -P "%F{magenta}[PHASE 0]%f Generating breakdown..."
     mkdir -p "$SESSION_DIR/architecture"
-    run_with_retry $BREAKDOWN_AGENT --session-id "prd-breakdown-$(basename "$SESSION_DIR")" --system-prompt "$TASK_BREAKDOWN_SYSTEM_PROMPT" -p "$TASK_BREAKDOWN_PROMPT" < /dev/null
+    run_with_retry_stdin "$TASK_BREAKDOWN_PROMPT" $BREAKDOWN_AGENT --session-id "prd-breakdown-$(basename "$SESSION_DIR")" --system-prompt "$TASK_BREAKDOWN_SYSTEM_PROMPT"
 
     # If file still doesn't exist, demand the agent write it
     if [[ ! -f "$TASKS_FILE" ]]; then
         print -P "%F{yellow}[PHASE 0]%f $TASKS_FILE not found. Demanding agent write it..."
-        run_with_retry $BREAKDOWN_AGENT --session-id "prd-breakdown-$(basename "$SESSION_DIR")" --system-prompt "$TASK_BREAKDOWN_SYSTEM_PROMPT" -p "You did NOT write the tasks file. You MUST write the JSON breakdown to \`./$TASKS_FILE\` (CURRENT WORKING DIRECTORY) immediately. Do NOT search for tasks.json in other directories. Create a NEW file at exactly \`./$TASKS_FILE\`. Use your file writing tools NOW." < /dev/null
+        run_with_retry_stdin "You did NOT write the tasks file. You MUST write the JSON breakdown to \`./$TASKS_FILE\` (CURRENT WORKING DIRECTORY) immediately. Do NOT search for tasks.json in other directories. Create a NEW file at exactly \`./$TASKS_FILE\`. Use your file writing tools NOW." $BREAKDOWN_AGENT --session-id "prd-breakdown-$(basename "$SESSION_DIR")" --system-prompt "$TASK_BREAKDOWN_SYSTEM_PROMPT"
     fi
 
     if [[ -f "$TASKS_FILE" ]]; then
@@ -3535,7 +3588,7 @@ if [[ -f "validation_report.md" ]]; then
         2. Fix the code to resolve these issues.
         3. Verify your fixes."
 
-        run_with_retry $IMPL_AGENT -p "$FIX_PROMPT" < /dev/null
+        run_with_retry_stdin "$FIX_PROMPT" $IMPL_AGENT
         print -P "%F{green}[FIX]%f Fixes applied."
     fi
 fi
@@ -3678,7 +3731,7 @@ Please include these in your bug report if they represent real issues.
 ${EXPANDED_BUG_PROMPT}"
         fi
 
-        run_with_retry $BUG_FINDER_AGENT -p "$EXPANDED_BUG_PROMPT" < /dev/null
+        run_with_retry_stdin "$EXPANDED_BUG_PROMPT" $BUG_FINDER_AGENT
     fi
 
     # If no file was created, no bugs were found - we're done!
