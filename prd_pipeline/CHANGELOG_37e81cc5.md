@@ -760,3 +760,94 @@ The COSMETIC/SUBSTANTIVE and CLEAN/DIRTY binary classifiers now retry up to 4 ti
 - **Mode B (changeset-level):** cross-cutting docs that only make sense once the whole change lands (`README.md`, feature overviews, architecture summaries) become a **final "Sync changeset-level documentation" task** depending on all implementing subtasks.
 
 Mirrored in `DELTA_PRD_GENERATION_PROMPT` (step 3, SCOPE DELTA) so delta PRDs declare doc impact at authoring time. Prevents coherent changesets from shipping with stale READMEs — the exact failure that motivated this rule.
+
+---
+
+## Changes Since Commit e546e77 (Runtime & Concurrency Hardening)
+
+**Base commit:** `e546e77` — "feat(prd): migrate to pi.dev runtime and add depth-2 research chaining with issue retry loop"
+**Commits:** `9f526eff` (prompt-via-stdin) and `185cb24` (research-status snapshot + zsh arg splitting)
+**Files changed:** `run-prd.sh` (+113 lines, -27 lines)
+
+These are follow-on stability fixes to the pi.dev migration: one removes a hard `execve()` size ceiling that broke large-prompt runs, the other closes a race that could silently drop parallel-research statuses, plus a correctness fix to selector extraction.
+
+### H. Prompts Routed via stdin (argv-Size Limit Bypass) — `9f526eff`
+
+**Problem Solved:** Large prompts passed as `pi -p "$prompt"` hit the Linux kernel's `MAX_ARG_STRLEN = 131072` bytes (128KB) cap on a *single* argv string — independent of `ARG_MAX`. A PRD embedded in `-p "$TASK_BREAKDOWN_PROMPT"` easily exceeds this (a 133KB PRD produced `argument list too long: pi` here), and the failure is a hard `E2BIG` from `execve()` that no amount of wrapper trimming can fix.
+
+**Solution:** Two new helpers feed the prompt through a temp-file-backed **stdin** instead of an argv string. With no positional prompt, `pi` reads it from stdin. The prompt is written to the temp file **once** and re-fed on every retry (a pipe would be consumed by the first attempt, starving retries).
+
+**Implementation:**
+```bash
+# Retry-loop version (PRP creation, task breakdown, fix prompt, bug finder)
+run_with_retry_stdin() {
+    local prompt_text="$1"; shift
+    local tmp
+    tmp=$(mktemp -t prd-prompt.XXXXXX) || { print -P "%F{red}[ERROR]%f mktemp failed"; return 1; }
+    print -r -- "$prompt_text" > "$tmp"
+    local n=1 delay=5
+    while true; do
+        if [[ "$SHUTDOWN_REQUESTED" == "true" ]]; then rm -f "$tmp"; return 130; fi
+        eval "${(q)@}" < "$tmp"
+        local exit_status=$?
+        if [[ $exit_status -eq 0 ]]; then rm -f "$tmp"; return 0; fi
+        print -P "%F{yellow}[RETRY]%f Command failed (exit $exit_status). Attempt $n. Retrying in ${delay}s..."
+        sleep $delay
+        ((n++))
+    done
+}
+
+# Single-shot version (background research supervisor manages its own recovery)
+run_agent_stdin() { ... }  # same temp-file/stdin pattern, no retry loop
+```
+
+**Usage convention:** `<prompt_text> <agent> [agent-args...]` — callers must NOT pass `-p` or `< /dev/null`; the helper owns stdin.
+
+**Migrated call sites:** PRP creation (both the background-research supervisor's single-shot path and `execute_item`'s retry path), task breakdown + the "demand write" retry, the post-validation `FIX_PROMPT`, and the bug-finder prompt.
+
+**Stale-temp-file sweep:** Added at script entry to clean up temp files left behind by runs hard-killed (SIGTERM/SIGKILL/power loss) before the helpers' cleanup ran. Normal Ctrl+C already hits the graceful-shutdown path, which removes its own temp file:
+```bash
+rm -f -- /tmp/prd-prompt.*(N) 2>/dev/null
+```
+
+### I. Authoritative Research-Status Snapshot Pre-Revert — `185cb24`
+
+**Problem Solved:** `restore_tasks_json()` reverts `tasks.json` to HEAD after every agent run to undo agent corruption. The background-research supervisor's legitimate `Researching`/`Ready` writes were being re-applied *after* the revert using the `RESEARCH_DIRNAMES` associative array and a `RESEARCH_PID` liveness check. That array could drift out of sync with the live supervisor — e.g. after `start_background_research` reset `RESEARCH_DIRNAMES`, or when the PID check raced the supervisor — silently dropping statuses and leaving items stuck.
+
+**Solution:** Snapshot the supervisor's status writes from the **working tree before the revert** (authoritative — it captures exactly what the supervisor wrote), then re-apply them afterward using **filesystem evidence** as proof of legitimacy.
+
+**Implementation:**
+```bash
+# Step 0: snapshot BEFORE the revert
+local _snap_researching="" _snap_ready=""
+if [[ "$PARALLEL_RESEARCH" == "true" && -f "$TASKS_FILE" ]] && jq empty "$TASKS_FILE" 2>/dev/null; then
+    _snap_researching=$(jq -r '.. | objects | select(.status? == "Researching") | .id // empty' "$TASKS_FILE" 2>/dev/null)
+    _snap_ready=$(jq -r '.. | objects | select(.status? == "Ready") | .id // empty' "$TASKS_FILE" 2>/dev/null)
+fi
+
+# ... git checkout HEAD -- "$TASKS_FILE" (the revert) ...
+
+# Step 4: re-apply, gated on filesystem evidence
+for _id in ${(f)_snap_ready}; do        # PRP.md exists  -> Ready
+    _dir="$SESSION_DIR/${_id//./}"
+    [[ -f "$_dir/PRP.md" ]] && tsk -f "$TASKS_FILE" update "$_id" Ready 2>/dev/null || true
+done
+for _id in ${(f)_snap_researching}; do   # research/ dir exists -> Researching
+    _dir="$SESSION_DIR/${_id//./}"
+    [[ -d "$_dir/research" ]] && tsk -f "$TASKS_FILE" update "$_id" Researching 2>/dev/null || true
+done
+```
+
+**Impact:** Replaces the `RESEARCH_DIRNAMES`/`RESEARCH_PID` re-apply path. Status preservation no longer depends on the in-memory assoc array staying in sync with the live supervisor, so parallel-research statuses survive `restore_tasks_json()` reliably.
+
+### J. zsh Array Arg-Splitting for mdsel + Max-Thinking Breakdowns — `185cb24`
+
+Two smaller fixes bundled into the same commit:
+
+1. **`extract_prd_sections()` selector splitting (relates to item A):** Selectors were built as a space-separated string and passed unquoted (`mdsel $selectors "$prd_file"`). zsh, unlike bash, does **not** word-split unquoted `$var`, so every selector arrived as a single argument and mdsel rejected it. Now parsed into a real zsh array and expanded with `${selectors[@]}`:
+   ```bash
+   local -a selectors=(${(f)"$(echo "$selectors_json" | jq -r '.[]' 2>/dev/null)"})
+   mdsel "${selectors[@]}" "$prd_file" 2>/dev/null
+   ```
+
+2. **Max-thinking breakdowns:** Task breakdown (initial + the "demand write" retry) now runs with `--thinking xhigh`. Decomposition + research synthesis into Phase→Milestone→Task→Subtask needs the deepest reasoning, so the highest reasoning budget is pinned unconditionally.
