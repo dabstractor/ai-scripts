@@ -178,6 +178,25 @@ CURRENT_PROCESSING_STATUS=""  # The status to apply to current item after restor
 restore_tasks_json() {
     local status_for_current="${1:-$CURRENT_PROCESSING_STATUS}"
 
+    # Step 0: Snapshot legitimate supervisor status writes BEFORE reverting.
+    #
+    # The background research supervisor marks items "Researching"/"Ready" in
+    # tasks.json. These are ORCHESTRATOR writes (not agent corruption) and MUST
+    # survive the git checkout below. We snapshot them from the working tree
+    # now, and re-apply after the revert using FILESYSTEM EVIDENCE as proof of
+    # legitimacy (PRP.md exists -> Ready; research/ dir exists -> Researching).
+    #
+    # This replaces the old RESEARCH_DIRNAMES/RESEARCH_PID approach which could
+    # lose statuses when the assoc array was out of sync with the live
+    # supervisor (e.g. after start_background_research reset RESEARCH_DIRNAMES,
+    # or when the supervisor PID check raced). Snapshot-from-working-tree is
+    # authoritative: it captures exactly what the supervisor wrote.
+    local _snap_researching="" _snap_ready=""
+    if [[ "$PARALLEL_RESEARCH" == "true" && -f "$TASKS_FILE" ]] && jq empty "$TASKS_FILE" 2>/dev/null; then
+        _snap_researching=$(jq -r '.. | objects | select(.status? == "Researching") | .id // empty' "$TASKS_FILE" 2>/dev/null)
+        _snap_ready=$(jq -r '.. | objects | select(.status? == "Ready") | .id // empty' "$TASKS_FILE" 2>/dev/null)
+    fi
+
     # Step 1: Restore from HEAD
     git checkout HEAD -- "$TASKS_FILE" 2>/dev/null || true
 
@@ -202,20 +221,26 @@ restore_tasks_json() {
     fi
 
     # Step 4: Preserve background-research statuses across restore.
-    # The supervisor may have several items queued: ones whose PRP already exists
-    # are "Ready"; ones still being researched are "Researching". Re-apply both so
-    # restore-from-HEAD (which reverts the supervisor's legitimate writes) doesn't
-    # drop them. Skip the currently-implementing item (handled in step 3).
-    if [[ "$PARALLEL_RESEARCH" == "true" && ${#RESEARCH_DIRNAMES} -gt 0 ]]; then
-        local _rid
-        for _rid in "${(@k)RESEARCH_DIRNAMES}"; do
-            [[ "$_rid" == "$CURRENT_PROCESSING_ID" ]] && continue
-            local _rdir="${RESEARCH_DIRNAMES["$_rid"]}"
-            if [[ -f "$_rdir/PRP.md" ]]; then
-                tsk -f "$TASKS_FILE" update "$_rid" Ready 2>/dev/null || true
-            elif [[ -n "$RESEARCH_PID" ]] && kill -0 "$RESEARCH_PID" 2>/dev/null; then
-                print -P "%F{cyan}[PROTECT]%f Re-applying $_rid -> Researching (parallel research active)"
-                tsk -f "$TASKS_FILE" update "$_rid" Researching 2>/dev/null || true
+    # Re-apply from the pre-revert snapshot (authoritative: these were the live
+    # statuses the supervisor wrote before we reverted). Use filesystem evidence
+    # to confirm each is legitimate, and skip the currently-implementing item
+    # (handled in step 3).
+    if [[ "$PARALLEL_RESEARCH" == "true" ]]; then
+        local _id _dir
+        # Re-apply Ready (PRP.md exists = research complete)
+        for _id in ${(f)_snap_ready}; do
+            [[ -z "$_id" || "$_id" == "$CURRENT_PROCESSING_ID" ]] && continue
+            _dir="$SESSION_DIR/${_id//./}"
+            if [[ -f "$_dir/PRP.md" ]]; then
+                tsk -f "$TASKS_FILE" update "$_id" Ready 2>/dev/null || true
+            fi
+        done
+        # Re-apply Researching (research dir exists = actively researched)
+        for _id in ${(f)_snap_researching}; do
+            [[ -z "$_id" || "$_id" == "$CURRENT_PROCESSING_ID" ]] && continue
+            _dir="$SESSION_DIR/${_id//./}"
+            if [[ -d "$_dir/research" ]]; then
+                tsk -f "$TASKS_FILE" update "$_id" Researching 2>/dev/null || true
             fi
         done
     fi
@@ -421,13 +446,17 @@ generate_prd_index() {
 extract_prd_sections() {
     local prd_file=$1
     local selectors_json=$2
-    local selectors=$(echo "$selectors_json" | jq -r '.[]' 2>/dev/null | tr '\n' ' ')
-    [[ -z "$selectors" || "$selectors" == " " ]] && return 0
+    # Parse JSON array into a zsh array. MUST use an array, not a space-
+    # separated string: zsh does NOT word-split unquoted $var by default
+    # (unlike bash), so `mdsel $selectors file` would pass all selectors as
+    # ONE argument and mdsel would reject it as an invalid selector.
+    local -a selectors=(${(f)"$(echo "$selectors_json" | jq -r '.[]' 2>/dev/null)"})
+    [[ ${#selectors[@]} -eq 0 ]] && return 0
 
     if command -v mdsel &>/dev/null; then
-        mdsel $selectors "$prd_file" 2>/dev/null
+        mdsel "${selectors[@]}" "$prd_file" 2>/dev/null
     elif [[ -f "$HOME/projects/mdsel/dist/cli/index.js" ]]; then
-        node "$HOME/projects/mdsel/dist/cli/index.js" $selectors "$prd_file" 2>/dev/null
+        node "$HOME/projects/mdsel/dist/cli/index.js" "${selectors[@]}" "$prd_file" 2>/dev/null
     else
         # mdsel not available - return empty (caller will fall back)
         return 0
@@ -3342,12 +3371,14 @@ fi
 if [[ ! -f "$TASKS_FILE" ]]; then
     print -P "%F{magenta}[PHASE 0]%f Generating breakdown..."
     mkdir -p "$SESSION_DIR/architecture"
-    run_with_retry_stdin "$TASK_BREAKDOWN_PROMPT" $BREAKDOWN_AGENT --session-id "prd-breakdown-$(basename "$SESSION_DIR")" --system-prompt "$TASK_BREAKDOWN_SYSTEM_PROMPT"
+    # Always max thinking (xhigh) for breakdowns: decomposition + research
+    # synthesis into Phase>Milestone>Task>Subtask needs the deepest reasoning.
+    run_with_retry_stdin "$TASK_BREAKDOWN_PROMPT" $BREAKDOWN_AGENT --thinking xhigh --session-id "prd-breakdown-$(basename "$SESSION_DIR")" --system-prompt "$TASK_BREAKDOWN_SYSTEM_PROMPT"
 
     # If file still doesn't exist, demand the agent write it
     if [[ ! -f "$TASKS_FILE" ]]; then
         print -P "%F{yellow}[PHASE 0]%f $TASKS_FILE not found. Demanding agent write it..."
-        run_with_retry_stdin "You did NOT write the tasks file. You MUST write the JSON breakdown to \`./$TASKS_FILE\` (CURRENT WORKING DIRECTORY) immediately. Do NOT search for tasks.json in other directories. Create a NEW file at exactly \`./$TASKS_FILE\`. Use your file writing tools NOW." $BREAKDOWN_AGENT --session-id "prd-breakdown-$(basename "$SESSION_DIR")" --system-prompt "$TASK_BREAKDOWN_SYSTEM_PROMPT"
+        run_with_retry_stdin "You did NOT write the tasks file. You MUST write the JSON breakdown to \`./$TASKS_FILE\` (CURRENT WORKING DIRECTORY) immediately. Do NOT search for tasks.json in other directories. Create a NEW file at exactly \`./$TASKS_FILE\`. Use your file writing tools NOW." $BREAKDOWN_AGENT --thinking xhigh --session-id "prd-breakdown-$(basename "$SESSION_DIR")" --system-prompt "$TASK_BREAKDOWN_SYSTEM_PROMPT"
     fi
 
     if [[ -f "$TASKS_FILE" ]]; then
