@@ -5,6 +5,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import chalk from 'chalk';
 import { z } from 'zod';
+import pkg from '../package.json';
 import { Backlog, Status, Subtask, Task, Milestone, Phase, NextTaskContext, ContextNode } from './types';
 
 // Zod schemas for validation
@@ -656,17 +657,54 @@ class TaskManager {
 // Module exports for programmatic use
 export { TaskManager, Status };
 
+// Reference text appended to the top-level `tsk --help` output.
+const HELP_REFERENCE = `
+OVERVIEW
+  Manages a hierarchical backlog (Phase → Milestone → Task → Subtask)
+  through a status lifecycle: Planned → Researching → Ready →
+  Implementing → Complete. Failed tasks can be retried via next-failed.
+
+VALID STATUSES  (fuzzy-matched by update; e.g. "comp" → Complete)
+  Planned    Researching    Ready    Implementing    Complete    Failed
+
+TASK FILE RESOLUTION  (highest precedence first)
+  -f, --file <path>     explicit override
+  <json-file>           positional argument (default: tasks.json)
+  $TASKS_FILE           environment variable
+  tasks.json            built-in default
+
+GLOBAL OPTIONS  (-v, -s, -f) apply to every command. Scope levels:
+  phase | milestone | task | subtask
+
+TASK IDS  are normalized; these are all equivalent:
+  P1.M1.T1.S1   p1m1t1s1   1.1.1.1
+
+EXAMPLES
+  Status summary of the whole backlog      $ tsk
+  Next actionable subtask, as JSON          $ tsk next
+  Just the next task's phase ID             $ tsk -s phase
+  Read status from an explicit file         $ tsk -f my.json status
+  Mark a task Complete (fuzzy status)       $ tsk update P1.M1.T1.S1 comp
+  Find & reset the next failed task         $ tsk next-failed --retry
+  Scaffold a sample tasks file              $ tsk init sample.json
+`;
+
 // CLI functionality
 function main(): void {
   const program = new Command();
 
   program
     .name('tsk')
-    .description('Task processing utility for Agentic TDD environments')
+    .version(pkg.version, '-V, --version', 'output the version number')
+    .description('Task processing utility for Agentic TDD — manage backlog status & next-task selection')
     .argument('[json-file]', 'JSON file containing tasks (default: tasks.json)')
-    .option('-v, --verbose', 'Enable verbose output')
-    .option('-s, --scope <level>', 'Scope to specific level (phase, milestone, task, subtask)')
-    .option('-f, --file <path>', 'Path to tasks JSON file (overrides positional argument and TASKS_FILE env var)');
+    .option('-v, --verbose', 'enable verbose output')
+    .option('-s, --scope <level>', 'scope output to a level: phase, milestone, task, subtask')
+    .option('-f, --file <path>', 'path to tasks JSON file (overrides positional arg and $TASKS_FILE)')
+    // Surface options defined on the root program inside every subcommand's --help
+    // (Commander hides these by default), so the menu is complete in every view.
+    .configureHelp({ showGlobalOptions: true })
+    .addHelpText('after', HELP_REFERENCE);
 
   // Helper to resolve target file: -f option > positional arg > TASKS_FILE env > default
   const resolveTargetFile = (jsonFile: string | undefined, options: any): string => {
@@ -734,14 +772,14 @@ function main(): void {
   // next command
   program
     .command('next')
-    .description('Get next actionable subtask as JSON')
+    .description('Print the next actionable subtask as JSON')
     .argument('[json-file]', 'JSON file containing tasks (default: tasks.json)')
     .action(handleNextCommand);
 
   // tsk command (alias for next)
   program
     .command('tsk')
-    .description('Alias for next command')
+    .description('Shortcut for next — print the next actionable subtask')
     .argument('[json-file]', 'JSON file containing tasks (default: tasks.json)')
     .action(handleNextCommand);
 
@@ -810,7 +848,7 @@ function main(): void {
 
   program
     .command('next-failed')
-    .description('Get next failed subtask as JSON (for retry)')
+    .description('Print the next failed subtask as JSON (add --retry to reset it to Planned)')
     .argument('[json-file]', 'JSON file containing tasks (default: tasks.json)')
     .option('--retry', 'Reset the failed task to Planned status for retry')
     .action(handleNextFailedCommand);
@@ -818,7 +856,7 @@ function main(): void {
   // status command
   program
     .command('status')
-    .description('Show current status of all tasks')
+    .description('Show a status summary of all tasks')
     .argument('[json-file]', 'JSON file containing tasks (default: tasks.json)')
     .option('--full', 'Show hierarchical tree view with details')
     .action((jsonFile, options, cmd) => {
@@ -837,7 +875,7 @@ function main(): void {
   // update command
   program
     .command('update')
-    .description('Update task status')
+    .description("Update a task's status (the ID and status are both fuzzy-matched)")
     .argument('<task-id>', 'Task ID (e.g., P1.M1.T1.S1 or p1m1t1s1)')
     .argument('<status>', 'New status (fuzzy matched, e.g., "comp" -> Complete)')
     .argument('[json-file]', 'JSON file containing tasks (default: tasks.json)')
@@ -860,7 +898,7 @@ function main(): void {
   // init command
   program
     .command('init')
-    .description('Create sample tasks.json file')
+    .description('Create a sample tasks.json file')
     .argument('[json-file]', 'JSON file name (default: tasks.json)')
     .action((jsonFile = 'tasks.json') => {
       try {
