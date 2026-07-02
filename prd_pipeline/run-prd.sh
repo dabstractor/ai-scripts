@@ -3403,7 +3403,11 @@ print -P "%F{cyan}[CONFIG]%f Scope: %F{yellow}$SCOPE%f (Default: task)"
 [[ $BREAKDOWN_AGENT != "$AGENT" ]] && print -P "%F{cyan}[CONFIG]%f Breakdown agent: %F{yellow}$BREAKDOWN_AGENT%f"
 print -P "%F{cyan}[CONFIG]%f Planning agent (glm-5.2): %F{yellow}$AGENT%f"
 print -P "%F{cyan}[CONFIG]%f Implementation agent (turbo): %F{yellow}$IMPL_AGENT%f"
-[[ "$PARALLEL_RESEARCH" == "true" ]] && print -P "%F{cyan}[CONFIG]%f Parallel research: %F{green}enabled%f"
+if [[ "$PARALLEL_RESEARCH" == "true" ]]; then
+    print -P "%F{cyan}[CONFIG]%f Parallel research: %F{green}enabled%f"
+else
+    print -P "%F{cyan}[CONFIG]%f Parallel research: %F{yellow}disabled%f"
+fi
 [[ "$SKIP_BUG_FINDING" == "true" ]] && print -P "%F{cyan}[CONFIG]%f Bug finding: %F{yellow}skipped%f" || print -P "%F{cyan}[CONFIG]%f Bug finder agent: %F{yellow}$BUG_FINDER_AGENT%f"
 print -P "%F{cyan}[CONFIG]%f Starting positions: Phase=$START_PHASE"
 [[ $SCOPE != "phase" ]] && print -P "%F{cyan}[CONFIG]%f Starting positions: Milestone=$START_MS"
@@ -3783,11 +3787,17 @@ ${EXPANDED_BUG_PROMPT}"
         git commit -m "Add bug report: $(basename "$CURRENT_BUGFIX_SESSION")" &>/dev/null || true
 
         # Re-run the pipeline with bug fixes - session dir IS the bugfix session
+        # Forward parallel-research settings: PARALLEL_RESEARCH and RESEARCH_DEPTH
+        # are plain shell vars (NOT exported), so without this the child process
+        # would default PARALLEL_RESEARCH to "false" and silently disable all
+        # background prefetch for the bugfix run. -r must survive the recursion.
         SKIP_BUG_FINDING=true \
         PRD_FILE="$BUG_RESULTS_FILE" \
         SCOPE="$BUGFIX_SCOPE" \
         AGENT="$AGENT" \
         PLAN_DIR="$CURRENT_BUGFIX_SESSION" \
+        PARALLEL_RESEARCH="$PARALLEL_RESEARCH" \
+        RESEARCH_DEPTH="$RESEARCH_DEPTH" \
         "$0"
 
         # Check if bugfix pipeline succeeded

@@ -851,3 +851,36 @@ Two smaller fixes bundled into the same commit:
    ```
 
 2. **Max-thinking breakdowns:** Task breakdown (initial + the "demand write" retry) now runs with `--thinking xhigh`. Decomposition + research synthesis into Phase→Milestone→Task→Subtask needs the deepest reasoning, so the highest reasoning budget is pinned unconditionally.
+
+### K. Parallel Research Flag (`-r`) Propagation to Bugfix Sub-Runs — fix
+
+**Problem Solved:** `prd -r` silently did nothing whenever the run entered the bugfix phase. Users observed every bugfix item (e.g. `P1.M3.T2.S1`) researching synchronously inline — no `[PARALLEL]` prefetch lines, items arriving `Planned` instead of `Ready` — even though `-r` had been passed at the top level.
+
+**Root Cause:** `PARALLEL_RESEARCH` is set by `-r`/`--parallel-research` as a **plain shell variable that is never `export`ed** (only assignments at the arg-parse block; no `export`). When bug-finding finds bugs, the pipeline recurses into a *child* process:
+```bash
+SKIP_BUG_FINDING=true \
+PRD_FILE="$BUG_RESULTS_FILE" \
+SCOPE="$BUGFIX_SCOPE" \
+AGENT="$AGENT" \
+PLAN_DIR="$CURRENT_BUGFIX_SESSION" \
+"$0"
+```
+This forwards a curated env block but **omits `PARALLEL_RESEARCH` and `-r`**. Because the var was never exported, the child hits `PARALLEL_RESEARCH="${PARALLEL_RESEARCH:-false}"` and defaults to `false`. All actual item execution happens in that bugfix child (the top-level main loop sees the main PRD's items already Complete and hands off), so background prefetch was disabled for the entire phase where it mattered. The failure was invisible because the `[CONFIG] Parallel research:` line only printed when enabled (no `else`).
+
+Contrast: the queued-delta re-exec uses `exec "$0" "$@"`, which *does* forward `-r` via `$@` — so only the bugfix recursion was broken.
+
+**Solution:**
+1. Forward the settings into the bugfix child explicitly (matches the existing env-var convention in that block), including the companion `RESEARCH_DEPTH` which had the identical non-exported flaw:
+```bash
+SKIP_BUG_FINDING=true \
+PRD_FILE="$BUG_RESULTS_FILE" \
+SCOPE="$BUGFIX_SCOPE" \
+AGENT="$AGENT" \
+PLAN_DIR="$CURRENT_BUGFIX_SESSION" \
+PARALLEL_RESEARCH="$PARALLEL_RESEARCH" \
+RESEARCH_DEPTH="$RESEARCH_DEPTH" \
+"$0"
+```
+2. Make the disablement visible so this class of regression can't fail silently again — the `[CONFIG]` line now prints `disabled` in the `else` branch.
+
+**Why not `export`:** The explicit per-call forwarding is preferred here because it mirrors how `SCOPE`/`AGENT`/`PLAN_DIR` are already threaded through this exact recursion boundary, keeping the contract ("the bugfix child inherits a deliberate, curated environment") locally readable rather than relying on process-wide export state.
