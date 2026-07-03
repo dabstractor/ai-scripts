@@ -2,14 +2,14 @@
 
 ```
 ┌────────────┐     ┌─────────────┐
-│   Valid     │────▶│   Corrupted │
-│   Box       │     │   �nput    │
+│   Valid    │────▶│   Corrupted │
+│   Box      │     │   �nput     │
 └────────────┘     └─────────────┘
         │                   │
         ▼                   ▼
 ┌────────────┐     ┌─────────────┐
-│   Data      │     │   Output    │
-│   Stream    │     │   Handler   │
+│   Data     │     │   Output    │
+│   Stream   │     │   Handler   │
 └────────────┘     └─────────────┘
 ```
 

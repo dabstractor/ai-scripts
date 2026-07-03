@@ -2,7 +2,7 @@
 
 ```
 ┌─────────┐────▶┌─────────────┐────▶┌──────────────┐
-│   App   │     │  Service   │     │  Database    │
-│ Server  │     │  Layer     │     │   Server     │
+│   App   │     │  Service    │     │  Database    │
+│ Server  │     │  Layer      │     │   Server     │
 └─────────┘     └─────────────┘     └──────────────┘
 ```

@@ -9,7 +9,7 @@ Large diagram with many boxes:
         │                                                    │
         ▼                                                    ▼
 ┌─────────────────────┐     ┌─────────────────────────────────────┐
-│    Cache Manager    │────▶│        Database Connection Pool      │
+│    Cache Manager    │────▶│        Database Connection Pool     │
 │    Redis Cluster    │     │         PostgreSQL Master           │
 └─────────────────────┘     └─────────────────────────────────────┘
         │                                                    │

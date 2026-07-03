@@ -2,8 +2,8 @@
 
 ```
 ┌──────────────────┐
-│ First line      │
-│ Second line     │
-│ Third line      │
+│ First line       │
+│ Second line      │
+│ Third line       │
 └──────────────────┘
 ```

@@ -4,22 +4,22 @@ Large content section (repeated multiple times for size):
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                    Service Layer 1                           │
-│                 High Performance Module                      │
+│                    Service Layer 1                          │
+│                 High Performance Module                     │
 │                Large Data Processing Unit                   │
 └─────────────────────────────────────────────────────────────┘
         │                                                        │
         ▼                                                        ▼
 ┌─────────────────────────┐     ┌───────────────────────────────────┐
-│    Cache Manager        │────▶│        Database Connection Pool    │
+│    Cache Manager        │────▶│        Database Connection Pool   │
 │    Redis Cluster        │     │         PostgreSQL Master         │
-│    Large Cache Store    │     │        Enterprise Database       │
+│    Large Cache Store    │     │        Enterprise Database        │
 └─────────────────────────┘     └───────────────────────────────────┘
         │                                                        │
         ▼                                                        ▼
 ┌─────────────────────────┐     ┌───────────────────────────────────┐
 │    Message Queue        │────▶│         Background Workers        │
-│    RabbitMQ Cluster     │     │           Celery Tasks             │
+│    RabbitMQ Cluster     │     │           Celery Tasks            │
 │    High Throughput      │     │        Distributed Processing     │
 └─────────────────────────┘     └───────────────────────────────────┘
 ```

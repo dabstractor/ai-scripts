@@ -4,13 +4,13 @@
 // System Architecture
 /*
 ┌─────────────────────────────────────────┐
-│              Frontend Layer              │
+│              Frontend Layer             │
 │         React + TypeScript              │
 └─────────────────────────────────────────┘
                      │
                      ▼
 ┌─────────────────────────────────────────┐
-│               API Gateway                │
+│               API Gateway               │
 │           Express.js + CORS             │
 └─────────────────────────────────────────┘
 */

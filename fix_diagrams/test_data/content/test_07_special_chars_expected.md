@@ -2,8 +2,8 @@
 
 ```
 ┌─────────────────────────────┐
-│ This box contains: │─┌┐└┘ │
+│ This box contains: │─┌┐└┘   │
 │ Special Unicode box chars   │
-│ Like these: ┌─┐ └─┘        │
+│ Like these: ┌─┐ └─┘         │
 └─────────────────────────────┘
 ```

@@ -2,7 +2,7 @@
 
 ```
 ┌─────────────┐◀──▶┌─────────────┐
-│  Service A  │     │  Service B  │
-│  Processing │     │  Processing │
-└─────────────┘     └─────────────┘
+│  Service A  │    │  Service B  │
+│  Processing │    │  Processing │
+└─────────────┘    └─────────────┘
 ```
