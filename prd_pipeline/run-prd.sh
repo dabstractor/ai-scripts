@@ -726,9 +726,12 @@ elif [[ -f "$PRD_FILE" ]]; then
                 1)
                     INTEGRATE_CHANGES=true
                     print -P "%F{cyan}[SESSION]%f Will integrate changes into current session..."
-                    # Update snapshot to reflect new PRD
-                    cp "$PRD_FILE" "$CURRENT_SESSION_DIR/prd_snapshot.md"
-                    print -P "%F{cyan}[SESSION]%f Updated prd_snapshot.md with current PRD"
+                    # NOTE: do NOT overwrite prd_snapshot.md here. The integration agent needs
+                    # the ORIGINAL session-start snapshot to diff against the current PRD, and
+                    # PRD-change detection hashes prd_snapshot.md as the baseline. Refreshing
+                    # the snapshot now would (a) erase the diff the agent needs to see and
+                    # (b) silently swallow the change if integration fails to apply anything.
+                    # The snapshot is refreshed only after integration succeeds (see main loop).
                     ;;
                 2)
                     QUEUE_DELTA=true
@@ -1863,13 +1866,13 @@ You are analyzing changes between two versions of a PRD to create a focused delt
 Count the actual lines/words changed. Match your output complexity to input complexity.
 
 ## Previous PRD (Completed Session):
-\$(cat "$PREV_SESSION_DIR/prd_snapshot.md")
+$(cat "$PREV_SESSION_DIR/prd_snapshot.md" 2>/dev/null)
 
 ## Current PRD:
-\$(cat "$PRD_FILE")
+$(cat "$PRD_FILE" 2>/dev/null)
 
 ## Previous Session's Completed Tasks:
-\$(cat "$PREV_SESSION_DIR/tasks.json")
+$(cat "$PREV_SESSION_DIR/tasks.json" 2>/dev/null)
 
 ## Previous Session's Architecture Research:
 Check $PREV_SESSION_DIR/architecture/ for existing research that may still apply.
@@ -1902,13 +1905,13 @@ The PRD has changed while implementation is in progress. You need to update the 
 to incorporate these changes without losing progress on work already completed.
 
 ## Original PRD Snapshot (from session start):
-\$(cat "$SESSION_DIR/prd_snapshot.md")
+$(cat "$SESSION_DIR/prd_snapshot.md")
 
 ## Updated PRD (current):
-\$(cat "$PRD_FILE")
+$(cat "$PRD_FILE")
 
 ## Current Tasks State:
-\$(cat "$TASKS_FILE")
+$(cat "$TASKS_FILE")
 
 ## Instructions:
 
@@ -1999,8 +2002,8 @@ read -r -d '' VALIDATION_PROMPT <<EOF
 Analyze this codebase deeply, create a validation script, and report any issues found.
 
 **INPUTS:**
-- PRD: \$(cat "$PRD_FILE")
-- Tasks: \$(cat "$TASKS_FILE")
+- PRD: $(cat "$PRD_FILE" 2>/dev/null)
+- Tasks: $(cat "$TASKS_FILE" 2>/dev/null)
 
 ## Step 0: Discover Real User Workflows
 
@@ -2124,10 +2127,10 @@ You are a creative QA engineer and bug hunter. Your mission is to rigorously tes
 ## Inputs
 
 **Original PRD:**
-\$(cat "$PRD_FILE")
+$(cat "$PRD_FILE" 2>/dev/null)
 
 **Completed Tasks:**
-\$(cat "$TASKS_FILE")
+$(cat "$TASKS_FILE" 2>/dev/null)
 
 ## Your Mission
 
@@ -3332,9 +3335,9 @@ Previous session directory: $PREV_SESSION_DIR
 "
 
     # Run delta PRD generation
-    run_with_retry $BREAKDOWN_AGENT --session-id "prd-delta-$(basename "$SESSION_DIR")" -p "$DELTA_PRD_GENERATION_PROMPT
+    run_with_retry_stdin "$DELTA_PRD_GENERATION_PROMPT
 
-$PREVIOUS_SESSION_CONTEXT_PROMPT" < /dev/null
+$PREVIOUS_SESSION_CONTEXT_PROMPT" $BREAKDOWN_AGENT --session-id "prd-delta-$(basename "$SESSION_DIR")"
 
     # Retry if delta PRD wasn't created
     if [[ ! -f "$SESSION_DIR/delta_prd.md" ]]; then
@@ -3358,13 +3361,20 @@ fi
 if [[ "$INTEGRATE_CHANGES" == "true" && -f "$TASKS_FILE" ]]; then
     print -P "%F{magenta}[UPDATE]%f Integrating PRD changes into existing tasks..."
 
-    run_with_retry $AGENT -p "$TASK_UPDATE_PROMPT" < /dev/null
+    run_with_retry_stdin "$TASK_UPDATE_PROMPT" $AGENT
 
     print -P "%F{green}[UPDATE]%f Task hierarchy updated with PRD changes."
 
     # Commit the updated tasks
     git add "$TASKS_FILE" 2>/dev/null
     git commit -m "Update tasks for PRD changes (mid-session integration)" &>/dev/null || true
+
+    # Now that the task hierarchy reflects the new PRD, refresh prd_snapshot.md so future
+    # runs treat the current PRD as the baseline (PRD-change detection hashes this file).
+    # This is done AFTER integration so the agent had the original snapshot to diff against.
+    cp "$PRD_FILE" "$SESSION_DIR/prd_snapshot.md"
+    git add "$SESSION_DIR/prd_snapshot.md" 2>/dev/null
+    git commit -m "Refresh prd_snapshot after mid-session integration" &>/dev/null || true
 fi
 
 # A. Task Breakdown (Only run if tasks.json is missing)
@@ -3562,7 +3572,7 @@ fi
 # Final Validation Step (skip if bug-hunt only mode)
 if [[ "$ONLY_BUG_HUNT" != "true" ]]; then
 print -P "\n%F{magenta}[VALIDATION]%f Starting final validation..."
-run_with_retry $AGENT -p "$VALIDATION_PROMPT" < /dev/null
+run_with_retry_stdin "$VALIDATION_PROMPT" $AGENT
 print -P "\n%F{magenta}[VALIDATION]%f Validation complete. Check validation_report.md."
 
 if [[ -f "validation_report.md" ]]; then
