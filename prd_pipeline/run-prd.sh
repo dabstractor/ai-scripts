@@ -151,7 +151,7 @@ esac
 #   piz  = pi + z.ai, print mode, default model glm-5.2 (override via PI_MODEL)
 #   pizt = forced glm-5-turbo (faster; use for implementation via IMPL_AGENT)
 AGENT="${AGENT:-piz}"
-BREAKDOWN_AGENT="${BREAKDOWN_AGENT:-piz}"
+BREAKDOWN_AGENT="${BREAKDOWN_AGENT:-pizr}"
 # Implementation agent: WRITES CODE - the per-task/subtask PRP-execute step, plus
 # the post-validation Fix step. Defaults to pizt = glm-5-turbo (faster codegen).
 # To run implementation on the same model as planning: IMPL_AGENT=$AGENT ...
@@ -403,7 +403,7 @@ determine_session_state() {
 }
 
 # Bug finding configuration
-BUG_FINDER_AGENT="${BUG_FINDER_AGENT:-piz}"
+BUG_FINDER_AGENT="${BUG_FINDER_AGENT:-pizr}"
 BUG_RESULTS_FILE="${BUG_RESULTS_FILE:-TEST_RESULTS.md}"
 BUGFIX_SCOPE="${BUGFIX_SCOPE:-subtask}"
 SKIP_BUG_FINDING="${SKIP_BUG_FINDING:-false}"
