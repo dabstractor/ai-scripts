@@ -34,6 +34,9 @@ setopt aliases
 
 # --- 2. Subcommands ---
 
+# Alias 'status' -> 'task' for git muscle memory (git status / prd status)
+[[ "$1" == "status" ]] && set -- task "${@:2}"
+
 # Handle 'task' subcommand: prd task [args...] -> tsk -f <current_tasks_file> [args...]
 if [[ "$1" == "task" ]]; then
     shift  # Remove 'task' from arguments
@@ -1196,11 +1199,27 @@ Be aware that the executing AI agent only receives:
 
 **Therefore**: Your research and context curation directly determines implementation success. Incomplete context = implementation failure.
 
+## MULTI-PRP BATCHING POLICY - READ THIS BEFORE WRITING MORE THAN ONE PRP
+
+**Default: write exactly ONE PRP - the one you were asked for, at the exact path given.** Do not write PRPs for other work items "to be helpful" or to save tokens. Each item normally gets its own dedicated research session, and that is the expected, high-quality path.
+
+Writing several PRPs in a single session is **allowed only as an optimization for tightly-coupled items that genuinely share one body of research** - and only when you hold yourself to a HIGHER bar, not a lower one. Saving tokens by producing thin PRPs is a failure: an under-researched PRP costs more in failed implementations than the research it skipped. The goal is fewer redundant planning *stages*, not shallower planning per item.
+
+### HARD GATE - clear ALL of this before writing a second PRP
+Before writing any PRP beyond the one you were asked for, verify EVERY item you intend to batch against ALL of these:
+
+1. **Full situational awareness.** You have read the COMPLETE task tree (\`<plan_status>\` was provided) and the FULL PRD - not just the selectors for the first item. You know every sibling task, its status, and how the items depend on each other.
+2. **Per-item research, as thorough as an independent agent.** Each batched item gets its OWN 3-5 subagent research calls, its own codebase + external analysis, and its own notes in its own \`research/\` directory. The 3-5 call budget is PER PRP - a 3-PRP batch needs ~3x the research of a single PRP, not a third of it.
+3. **Per-item "No Prior Knowledge" pass.** Each PRP independently clears the Context Completeness Check and the "No Prior Knowledge" test below. If ANY item would be thin, guess-y, or copy-pasted from a sibling, you have NOT met the bar.
+4. **Explicit batch declaration.** Before writing, list every item you are batching, state why each shares this research session, and confirm each one clears the gates above.
+
+If you cannot clear these gates for ALL items, write ONLY the PRP you were asked for and leave the rest to their own sessions. **When in doubt, write one.**
+
 ## Research Process
 
 > **CRITICAL**: Research is a MEANS TO AN END, not the goal itself. Your PRIMARY deliverable is the PRP.md file.
-> Limit research to 3-5 subagent calls maximum. After gathering sufficient context, IMMEDIATELY write the PRP.md file using the write tool.
-> DO NOT get stuck in endless research loops. If you've made more than 5 tool calls without writing the PRP, STOP and write it NOW.
+> Budget research at 3-5 subagent calls PER PRP. A batch of N PRPs needs roughly N times that research, never less - shallow batched PRPs fail at implementation. After gathering sufficient context for an item, IMMEDIATELY write that PRP.md file using the write tool.
+> DO NOT get stuck in endless research loops. If you've made more than 5 tool calls on a single PRP without writing it, STOP and write it NOW.
 
 1. **Codebase Analysis in depth**
    - Create clear todos and spawn subagents to search the codebase for similar features/patterns. Think hard and plan your approach
@@ -1311,7 +1330,8 @@ Store the PRP and documentation at the path specified in your instructions.
 - Any source code files - you are researching, not implementing
 
 ### YOUR OUTPUT:
-You write ONLY to the PRP.md file path specified in your instructions.
+You write ONLY to the PRP.md file path specified in your instructions - by default that is ONE PRP.
+Writing PRPs for any other item in this same session is only permitted under the MULTI-PRP BATCHING POLICY above (full task tree + full PRD + thorough per-item research for every PRP). When in doubt, write one.
 You may also write research notes to the research/ subdirectory of the work item.
 Nothing else. Do not modify any other files.
 
@@ -2634,6 +2654,8 @@ CRITICAL OUTPUT PATHS (use these EXACT paths):
 
 DO NOT write files to any other location. All research MUST go in $cdir/research/ and the final PRP MUST be at $cdir/PRP.md.
 
+SCOPE: Write ONLY this item's PRP ($cid). You were asked for ONE PRP. Writing PRPs for other items in this session is allowed ONLY after you clear the MULTI-PRP BATCHING POLICY in the prompt (full task tree + full PRD + thorough per-item research for EVERY PRP you write). When in doubt, write one.
+
 <item_title>$(get_item_title $ph $ms $tk $st)</item_title>
 <item_description>$(get_item_description $ph $ms $tk $st)</item_description>
 <prd_selectors>$prd_selectors</prd_selectors>
@@ -2947,6 +2969,8 @@ execute_item() {
         fi
 
         run_with_retry_stdin "$PRP_CREATE_PROMPT Create a PRP for $(get_scope_name) $id of the PRD. Store it at $dirname/PRP.md.
+
+SCOPE: Write ONLY this item's PRP ($id). You were asked for ONE PRP. Writing PRPs for other items in this session is allowed ONLY after you clear the MULTI-PRP BATCHING POLICY in the prompt (full task tree + full PRD + thorough per-item research for EVERY PRP you write). When in doubt, write one.
 <item_title>$(get_item_title $phase_num $ms_num $task_num $subtask_num)</item_title>
 <item_description>$(get_item_description $phase_num $ms_num $task_num $subtask_num)</item_description>
 <prd_selectors>$prd_selectors</prd_selectors>
