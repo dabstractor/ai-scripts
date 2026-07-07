@@ -722,6 +722,12 @@ elif [[ -f "$PRD_FILE" ]]; then
             print "  3) Ignore changes (cosmetic/unrelated edits - update hash only)"
             read -r "choice?Select [1/2/3]: "
 
+            # Trim stray whitespace/CR so basic mistypes (e.g. "2 " or a trailing
+            # space/carriage-return from a paste) are still accepted.
+            choice="${choice//$'\r'/}"
+            choice="${choice#"${choice%%[![:space:]]*}"}"
+            choice="${choice%"${choice##*[![:space:]]}"}"
+
             case "$choice" in
                 1)
                     INTEGRATE_CHANGES=true
