@@ -1721,6 +1721,8 @@ The following files and directories are managed by the orchestration pipeline an
 - \`**/PRP.md\` - The PRP files in plan directories (you READ them, never WRITE them)
 - \`**/TEST_RESULTS.md\` - Bug hunt results (owned by QA agent)
 
+**NEVER run \`rm\`, \`git rm\`, \`git clean\`, or \`mv\` against PRD.md, any PRP.md, or anything under plan/.** These are human/orchestrator-owned. Deleting them destroys pipeline state.
+
 ### NEVER ADD TO .gitignore:
 - \`plan/\` or any subdirectory
 - \`PRD.md\`
@@ -1809,10 +1811,10 @@ Only delete files that are untracked AND clearly temporary/scratch files.
 ## DELETE OR GITIGNORE:
 We are preparing to commit. Ensure the repo is clean.
 
-1. **Delete**:
+1. **Delete** (ONLY untracked, temporary scratch files YOU created this session):
    - Temporary files clearly marked as temp or scratch
-   - Duplicate files
-   - Files that serve no ongoing purpose
+   - Duplicate files YOU created
+   - **NEVER delete PRD.md, any PRP.md, anything under plan/, tasks.json, prd_snapshot.md, or TEST_RESULTS.md.** These are never "temporary" and never "serve no purpose" - they are pipeline state owned by humans / the orchestrator.
 
 2. **Gitignore** - ONLY add these standard entries if they're missing:
    - Build artifacts (dist/, build/)
@@ -1825,11 +1827,14 @@ We are preparing to commit. Ensure the repo is clean.
 **You are a CLEANUP agent. You organize files. You do NOT modify pipeline state.**
 
 ### NEVER MODIFY OR DELETE:
-- \`PRD.md\` - The product requirements document (NEVER TOUCH)
-- \`plan/\` - NEVER create, delete, or modify plan directories
+- \`PRD.md\` - The product requirements document in the project root (NEVER DELETE, MOVE, OR TOUCH). Owned by humans.
+- \`**/PRP.md\` - Plan Research Protocol files. NEVER delete, move, or overwrite. They are pipeline control files, NOT scratch files.
+- \`plan/\` - NEVER create, delete, or modify plan directories or anything inside them
 - \`**/tasks.json\` - NEVER touch any tasks.json file
 - \`**/prd_snapshot.md\` - NEVER touch any prd_snapshot.md file
 - \`**/TEST_RESULTS.md\` - NEVER touch bug report files
+
+**NEVER run \`rm\`, \`git rm\`, \`git clean\`, or \`mv\` against PRD.md, any PRP.md, or anything under plan/.** These are NOT "scratch" or "temporary" files and they are never "unused" - they are pipeline state. Do not delete them under any circumstances. The pipeline auto-restores them, so a deletion will not stick - but do not attempt it.
 
 ### NEVER ADD TO .gitignore:
 - \`plan/\` or any subdirectory of plan
@@ -2224,16 +2229,20 @@ This is imperative. The presence or absence of the bug report file controls the 
 
 **You are a BUG HUNTER agent. You test and report bugs. You do NOT fix code or modify the pipeline.**
 
-### NEVER MODIFY:
-- \`PRD.md\` - The product requirements document (READ-ONLY)
-- \`plan/\` - The entire plan directory and all contents
+### NEVER DELETE, MOVE, OR MODIFY:
+- \`PRD.md\` - The product requirements document (READ-ONLY, owned by humans). NEVER delete or move it.
+- \`**/PRP.md\` - Plan Research Protocol files. NEVER delete, move, or overwrite them.
+- \`plan/\` - The entire plan directory and all contents (sessions, PRPs, snapshots)
+- \`**/TEST_RESULTS.md\` - Bug report files
 - \`**/tasks.json\` - Any tasks.json file anywhere
 - \`.gitignore\` - Never add plan/, PRD.md, or task files to gitignore
 - Source code files - you are hunting bugs, not fixing them
 
+**NEVER run \`rm\`, \`git rm\`, \`git clean\`, or \`mv\` against PRD.md, any PRP.md, or anything under plan/.** These files are owned by humans and the orchestrator. Deleting them destroys pipeline state. The pipeline auto-restores them, so a deletion will not stick - but do not attempt it.
+
 ### YOUR OUTPUT:
 You write ONLY to \`\$BUG_RESULTS_FILE\` (if bugs are found).
-Nothing else. Do not modify any other files.
+Nothing else. Do not modify, move, or delete any other files.
 EOF
 
 # Bug Fix Task Breakdown - SIMPLE flat structure for bug fixes
@@ -2311,11 +2320,16 @@ The \`prd_selectors\` field references specific bug report sections that will be
 
 **You are a BUG FIX BREAKDOWN agent. You create a simple task list ONLY.**
 
-### NEVER MODIFY:
-- `PRD.md` - The product requirements document (READ-ONLY)
+### NEVER DELETE, MOVE, OR MODIFY:
+- `PRD.md` - The product requirements document (READ-ONLY, owned by humans). NEVER delete or move it.
+- `**/PRP.md` - Plan Research Protocol files. NEVER delete, move, or overwrite them.
+- `plan/` - The entire plan directory and all contents.
+- `**/TEST_RESULTS.md` - Bug report files.
 - `.gitignore` - Never modify gitignore
 - Source code files - you are planning, not implementing
 - Any files except the tasks.json you are creating
+
+**NEVER run `rm`, `git rm`, `git clean`, or `mv` against PRD.md, any PRP.md, or anything under plan/.** These files are owned by humans and the orchestrator. The pipeline auto-restores them, so a deletion will not stick - but do not attempt it.
 
 ### YOUR OUTPUT:
 You write ONLY to the tasks.json file path specified.
@@ -3234,10 +3248,46 @@ run_agent_stdin() {
     return $_s
 }
 
+# Protects PRD.md and **/PRP.md from AI deletion.
+# The autonomous bug finder, the validation fixer, and especially the cleanup
+# agent sometimes delete these critical files. Because smart_commit runs
+# `git add -A`, any such deletion would otherwise be staged and committed
+# permanently by `git commit-pi` (stagehand) - silently wiping the real PRD
+# and every PRP on every bug-fix run. This mirrors restore_tasks_json: it
+# detects PRD.md / PRP.md staged for deletion and restores them from HEAD.
+# PRD.md and all PRP.md files are owned by humans / the orchestrator and MUST
+# survive every commit.
+restore_critical_files() {
+    [[ ! -d ".git" ]] && return 0
+
+    # PRD.md / PRP.md currently staged for deletion (git add -A already ran).
+    local deleted
+    deleted=$(git diff --cached --name-only --diff-filter=D 2>/dev/null \
+        | grep -E '(^|/)PRD\.md$|(^|/)PRP\.md$')
+    [[ -z "$deleted" ]] && return 0
+
+    local f
+    for f in "${(@f)deleted}"; do
+        [[ -z "$f" ]] && continue
+        if git cat-file -e "HEAD:$f" 2>/dev/null; then
+            git checkout HEAD -- "$f" 2>/dev/null \
+                && print -P "%F{red}[PROTECT]%f Restored deleted critical file from HEAD: $f"
+        else
+            # Not in HEAD (created and deleted within the same run). Unstage the
+            # deletion so this commit does not record the removal.
+            git reset -q HEAD -- "$f" 2>/dev/null
+            print -P "%F{yellow}[PROTECT]%f Cannot restore (not in HEAD); unstaged deletion of: $f"
+        fi
+    done
+}
+
 # Protects tasks.json and the plan directory from AI "cleanup"
 smart_commit() {
     print -P "%F{blue}[GIT]%f Staging changes..."
     git add -A
+
+    # Restore PRD.md / PRP.md if an agent deleted them (see restore_critical_files)
+    restore_critical_files
 
     # Critical protection: If tasks.json was removed, is empty, or is invalid JSON, restore it
     local needs_restore=false
@@ -3631,7 +3681,9 @@ if [[ -f "validation_report.md" ]]; then
         INSTRUCTIONS:
         1. Analyze the issues listed in the report.
         2. Fix the code to resolve these issues.
-        3. Verify your fixes."
+        3. Verify your fixes.
+
+        FORBIDDEN: Only edit source files to fix the reported issues. NEVER delete or move PRD.md, any PRP.md, anything under plan/, tasks.json, prd_snapshot.md, or TEST_RESULTS.md - these are pipeline state owned by humans / the orchestrator."
 
         run_with_retry_stdin "$FIX_PROMPT" $IMPL_AGENT
         print -P "%F{green}[FIX]%f Fixes applied."
