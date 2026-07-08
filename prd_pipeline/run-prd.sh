@@ -3864,10 +3864,34 @@ ${EXPANDED_BUG_PROMPT}"
     # If no file was created, no bugs were found - we're done!
     if [[ ! -f "$BUG_RESULTS_FILE" ]]; then
         print -P "%F{green}[BUG HUNT]%f No bugs found. Quality looks good!"
+
+        # Leave an indicator so the user knows bugfix already ran clean on
+        # this task set and need not be re-run. Records the tasks hash so a
+        # stale marker is easy to spot once the task set changes.
+        NI_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+        NI_SESSION=$(basename "$SESSION_DIR")
+        NI_HASH="none"
+        [[ -f "$SESSION_DIR/tasks.json" ]] && NI_HASH=$(hash_prd_content "$SESSION_DIR/tasks.json")
+        {
+            print -r "No Issues Found"
+            print -r ""
+            print -r "Bug hunt ran on $NI_TS and found no Critical/Major bugs."
+            print -r ""
+            print -r "  Session tested:    $NI_SESSION"
+            print -r "  Tasks hash:        $NI_HASH  (tasks.json, sha256 first 12)"
+            print -r "  Bug finder agent:  $BUG_FINDER_AGENT"
+            print -r ""
+            print -r "Delete this file to force a re-run of bug hunting."
+        } > "$BUGFIX_DIR/NO_ISSUES_FOUND.md"
+        print -P "%F{cyan}[BUG HUNT]%f No-issues marker: $BUGFIX_DIR/NO_ISSUES_FOUND.md"
+
         # Clean up empty session
         rmdir "$CURRENT_BUGFIX_SESSION" 2>/dev/null
     else
         # Bug report exists - run the fix pipeline
+        # A previous "no issues" marker is now stale; clear it so the bugfix
+        # directory reflects that bugs were found this round.
+        rm -f "$BUGFIX_DIR/NO_ISSUES_FOUND.md"
         print -P "%F{cyan}[BUG HUNT]%f Bug report generated: $BUG_RESULTS_FILE"
         print -P "\n%F{yellow}[BUG FIX]%f Bugs found! Starting bug fix pipeline..."
         print -P "%F{yellow}[BUG FIX]%f PRD: $BUG_RESULTS_FILE"
