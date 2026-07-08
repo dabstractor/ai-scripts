@@ -3282,7 +3282,7 @@ run_agent_stdin() {
 # The autonomous bug finder, the validation fixer, and especially the cleanup
 # agent sometimes delete these critical files. Because smart_commit runs
 # `git add -A`, any such deletion would otherwise be staged and committed
-# permanently by `git commit-pi` (stagehand) - silently wiping the real PRD
+# permanently by `stagecoach` - silently wiping the real PRD
 # and every PRP on every bug-fix run. This mirrors restore_tasks_json: it
 # detects PRD.md / PRP.md staged for deletion and restores them from HEAD.
 # PRD.md and all PRP.md files are owned by humans / the orchestrator and MUST
@@ -3355,7 +3355,7 @@ smart_commit() {
     if git diff --staged --quiet; then
         print -P "%F{yellow}[GIT]%f No staged changes to commit."
     else
-        run_with_retry git commit-pi
+        run_with_retry stagecoach
     fi
 }
 
