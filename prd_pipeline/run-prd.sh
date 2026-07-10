@@ -105,6 +105,11 @@ ONLY_VALIDATE="${ONLY_VALIDATE:-false}" # Run only the validation step
 ONLY_BUG_HUNT="${ONLY_BUG_HUNT:-false}" # Run only the bug finding step
 SINGLE_SESSION="${SINGLE_SESSION:-false}" # Disable auto-flow between sessions
 TARGET_SESSION="${TARGET_SESSION:-}"       # Manual session selection
+# Accept PRD edits as the new baseline WITHOUT generating a delta session.
+# Use when PRD.md was edited (docs/refinements/reflecting finished work) but the
+# work is already complete and validated, so you want the next run to stay
+# idempotent instead of spawning a delta. Refreshes prd_snapshot.md only.
+ACCEPT_PRD_CHANGES="${ACCEPT_PRD_CHANGES:-false}"
 MANUAL_START=false
 
 while getopts "s:p:m:t:u:rv-:" opt; do
@@ -134,12 +139,13 @@ while getopts "s:p:m:t:u:rv-:" opt; do
         skip-bug-finding) SKIP_BUG_FINDING=true ;;
         single-session) SINGLE_SESSION=true ;;
         no-auto-flow)   SINGLE_SESSION=true ;;
+        accept-prd-changes) ACCEPT_PRD_CHANGES=true ;;
         session)        TARGET_SESSION="${!OPTIND}"; OPTIND=$(( OPTIND + 1 )) ;;
         session=*)      TARGET_SESSION="${OPTARG#*=}" ;;
-        *) print "Usage: $0 [--scope=...] [--phase=N] [--milestone=N] [--task=N] [--subtask=N] [--parallel-research] [--validate] [--bug-hunt] [--skip-bug-finding] [--single-session] [--session=N]"; exit 1 ;;
+        *) print "Usage: $0 [--scope=...] [--phase=N] [--milestone=N] [--task=N] [--subtask=N] [--parallel-research] [--validate] [--bug-hunt] [--skip-bug-finding] [--single-session] [--session=N] [--accept-prd-changes]"; exit 1 ;;
       esac ;;
     *) print "Usage: $0 [-s phase|milestone|task|subtask] [-p N] [-m N] [-t N] [-u N] [-r] [-v]
-   Or: $0 [--scope=...] [--phase=N] [--milestone=N] [--task=N] [--subtask=N] [--parallel-research] [--validate] [--bug-hunt] [--skip-bug-finding] [--single-session] [--session=N]"; exit 1 ;;
+   Or: $0 [--scope=...] [--phase=N] [--milestone=N] [--task=N] [--subtask=N] [--parallel-research] [--validate] [--bug-hunt] [--skip-bug-finding] [--single-session] [--session=N] [--accept-prd-changes]"; exit 1 ;;
   esac
 done
 
@@ -166,6 +172,10 @@ IMPL_AGENT="${IMPL_AGENT:-piznt}"
 # cheap/fast one-word answers. Retries are fresh calls (--no-session leaves
 # nothing to resume).
 CLASSIFIER_AGENT="${CLASSIFIER_AGENT:-pizc}"
+# Validation agent: reads the codebase, writes validate.sh + validation_report.md,
+# and pokes at the implementation. Wants strong reasoning, so defaults to pizr
+# (pi + --thinking xhigh), matching BREAKDOWN_AGENT/BUG_FINDER_AGENT.
+VALIDATION_AGENT="${VALIDATION_AGENT:-pizr}"
 TASKS_FILE="${TASKS_FILE:-tasks.json}"
 PRD_FILE="${PRD_FILE:-PRD.md}"
 PLAN_DIR="${PLAN_DIR:-plan}"
@@ -410,6 +420,11 @@ BUG_FINDER_AGENT="${BUG_FINDER_AGENT:-pizr}"
 BUG_RESULTS_FILE="${BUG_RESULTS_FILE:-TEST_RESULTS.md}"
 BUGFIX_SCOPE="${BUGFIX_SCOPE:-subtask}"
 SKIP_BUG_FINDING="${SKIP_BUG_FINDING:-false}"
+
+# Validation can legitimately run ~2 h (full test suites, deep analysis), so it
+# gets its own watchdog budget - overriding PI_AGENT_TIMEOUT for the validation
+# call only. Bump via the env var if a particular validation needs even longer.
+VALIDATION_TIMEOUT="${VALIDATION_TIMEOUT:-7200}"
 
 # Issue retry configuration
 # When an agent returns "result": "issue", we retry with feedback up to this many times
@@ -683,6 +698,18 @@ elif [[ -f "$PRD_FILE" ]]; then
                 fi
             fi
             # Check for queued delta from previous run
+            if [[ "$ACCEPT_PRD_CHANGES" == "true" ]]; then
+                # Even if a delta was previously queued, the user has declared the
+                # work already finished/validated. Cancel the queue and sync the
+                # baseline so this run (and the next) stays idempotent.
+                if [[ -f "$CURRENT_SESSION_DIR/.pending_delta_hash" ]]; then
+                    print -P "%F{cyan}[SESSION]%f --accept-prd-changes: cancelling previously queued delta and refreshing baseline."
+                    rm -f "$CURRENT_SESSION_DIR/.pending_delta_hash"
+                fi
+                cp "$PRD_FILE" "$CURRENT_SESSION_DIR/prd_snapshot.md"
+                print -P "%F{green}[SESSION]%f Baseline synced for $(basename "$CURRENT_SESSION_DIR"). Nothing to execute."
+                exit 0
+            fi
             if [[ -f "$CURRENT_SESSION_DIR/.pending_delta_hash" ]]; then
                 PENDING_HASH=$(cat "$CURRENT_SESSION_DIR/.pending_delta_hash")
                 CURRENT_HASH=$(hash_prd_content "$PRD_FILE")
@@ -719,6 +746,13 @@ elif [[ -f "$PRD_FILE" ]]; then
 
         PRD_CHANGED_SESSION_INCOMPLETE)
             print -P "%F{yellow}[SESSION]%f PRD has changed but session $(basename "$CURRENT_SESSION_DIR") is incomplete."
+            if [[ "$ACCEPT_PRD_CHANGES" == "true" ]]; then
+                print -P "%F{cyan}[SESSION]%f --accept-prd-changes: treating PRD edits as already-finished work; refreshing baseline (no delta)."
+                # Mirror interactive option 3: refresh snapshot so future runs see
+                # the current PRD as the baseline, then resume the existing session.
+                cp "$PRD_FILE" "$CURRENT_SESSION_DIR/prd_snapshot.md"
+                print -P "%F{green}[SESSION]%f Updated snapshot. Continuing with current tasks."
+            else
             print -P "%F{yellow}[QUESTION]%f How would you like to proceed?"
             print "  1) Integrate changes into current session (update tasks)"
             print "  2) Finish current session first, then start delta session"
@@ -759,10 +793,20 @@ elif [[ -f "$PRD_FILE" ]]; then
                     exit 1
                     ;;
             esac
+            fi
             ;;
 
         PRD_CHANGED_SESSION_COMPLETE)
             print -P "%F{cyan}[SESSION]%f Previous session complete. PRD has changed."
+            if [[ "$ACCEPT_PRD_CHANGES" == "true" ]]; then
+                print -P "%F{cyan}[SESSION]%f --accept-prd-changes: work already finished/validated; accepting PRD as new baseline (no delta)."
+                # Drop any queued delta so it can't fire on a future run.
+                rm -f "$CURRENT_SESSION_DIR/.pending_delta_hash"
+                # Refresh the baseline so the next run is idempotent.
+                cp "$PRD_FILE" "$CURRENT_SESSION_DIR/prd_snapshot.md"
+                print -P "%F{green}[SESSION]%f Updated snapshot for $(basename "$CURRENT_SESSION_DIR"). Nothing to execute."
+                exit 0
+            fi
             print -P "%F{cyan}[SESSION]%f Creating delta session for changes..."
 
             PREV_SESSION_DIR="$CURRENT_SESSION_DIR"
@@ -2744,7 +2788,7 @@ start_background_research() {
 wait_for_background_research() {
     local id=$1
     local elapsed=0
-    local max_wait=${RESEARCH_TIMEOUT:-600}  # 10 min max for hung processes
+    local max_wait=${RESEARCH_TIMEOUT:-1800}  # 30 min max for hung processes
     local dirname="${RESEARCH_DIRNAMES["$id"]}"
 
     # Not queued in any active supervisor - nothing to wait for.
@@ -2784,10 +2828,12 @@ wait_for_background_research() {
             return 1
         fi
 
-        # 4. Still waiting
+        # 4. Still waiting. Stay silent for the first 1000s (normal research
+        #    can take a while), then surface a heartbeat every 100s so a
+        #    genuinely stuck supervisor is visible without spamming early on.
         sleep 5
         elapsed=$((elapsed + 5))
-        (( elapsed % 60 == 0 )) && print -P "%F{cyan}[PARALLEL]%f PID $RESEARCH_PID alive, ${elapsed}s/${max_wait}s (waiting for $id)..."
+        (( elapsed >= 1000 && elapsed % 100 == 0 )) && print -P "%F{cyan}[PARALLEL]%f PID $RESEARCH_PID alive, ${elapsed}s/${max_wait}s (waiting for $id)..."
     done
 }
 
@@ -3225,7 +3271,14 @@ run_with_retry() {
             return 0
         fi
 
-        # Retry forever until success or shutdown
+        # A watchdog timeout (exit 124) means the process was stuck; don't churn
+        # retrying something that will just re-hang.
+        if [[ $exit_status -eq 124 ]]; then
+            print -P "%F{red}[TIMEOUT]%f Command killed by watchdog (exit 124). Not retrying."
+            return 124
+        fi
+
+        # Retry until success or shutdown
         print -P "%F{yellow}[RETRY]%f Command failed (exit $exit_status). Attempt $n. Retrying in ${delay}s..."
         sleep $delay
         ((n++))
@@ -3241,8 +3294,10 @@ run_with_retry() {
 # trimming fixes. The agent wrappers (piz/pizt = `pi ... -p "$@"`) enable print
 # mode via -p; with no positional prompt, pi reads the prompt from stdin.
 #
-# The prompt is written to a temp file once and re-fed on every retry attempt
-# (a pipe would be consumed by the first attempt, starving retries).
+# The prompt is re-written to the temp file on every retry attempt. Rewriting
+# each time (not once) makes retries resilient if the file vanishes mid-run -
+# the agent or the system may clean /tmp, and once it's gone every later retry
+# fails forever. (A pipe would also be consumed by the first attempt.)
 #
 # Usage: run_with_retry_stdin <prompt_text> <agent> [agent-args...]
 #   (do NOT pass -p or < /dev/null; the helper handles stdin)
@@ -3250,13 +3305,25 @@ run_with_retry_stdin() {
     local prompt_text="$1"; shift
     local tmp
     tmp=$(mktemp -t prd-prompt.XXXXXX) || { print -P "%F{red}[ERROR]%f mktemp failed"; return 1; }
-    print -r -- "$prompt_text" > "$tmp"
     local n=1 delay=5
     while true; do
         if [[ "$SHUTDOWN_REQUESTED" == "true" ]]; then rm -f "$tmp"; return 130; fi
+        # Re-write the prompt every attempt. The temp file can vanish mid-run
+        # (the agent or the system may clean /tmp), and once it's gone every
+        # later retry fails forever with "no such file". Rewriting is cheap and
+        # makes retries resilient regardless of why the file disappeared.
+        print -r -- "$prompt_text" > "$tmp"
         eval "${(q)@}" < "$tmp"
         local exit_status=$?
         if [[ $exit_status -eq 0 ]]; then rm -f "$tmp"; return 0; fi
+        # A watchdog timeout (exit 124) means the process was stuck; retrying
+        # immediately just re-hangs it. Surface as a hard failure so the caller
+        # can stop instead of churning forever.
+        if [[ $exit_status -eq 124 ]]; then
+            rm -f "$tmp"
+            print -P "%F{red}[TIMEOUT]%f Command killed by watchdog (exit 124). Not retrying."
+            return 124
+        fi
         print -P "%F{yellow}[RETRY]%f Command failed (exit $exit_status). Attempt $n. Retrying in ${delay}s..."
         sleep $delay
         ((n++))
@@ -3652,7 +3719,12 @@ fi
 # Final Validation Step (skip if bug-hunt only mode)
 if [[ "$ONLY_BUG_HUNT" != "true" ]]; then
 print -P "\n%F{magenta}[VALIDATION]%f Starting final validation..."
-run_with_retry_stdin "$VALIDATION_PROMPT" $AGENT
+PI_AGENT_TIMEOUT=$VALIDATION_TIMEOUT run_with_retry_stdin "$VALIDATION_PROMPT" $VALIDATION_AGENT
+validation_rc=$?
+if [[ $validation_rc -ne 0 ]]; then
+    print -P "%F{red}[ERROR]%f Validation did not finish (exit $validation_rc). Aborting before cleanup/commit/bug-hunt."
+    exit $validation_rc
+fi
 print -P "\n%F{magenta}[VALIDATION]%f Validation complete. Check validation_report.md."
 
 if [[ -f "validation_report.md" ]]; then
@@ -3884,6 +3956,11 @@ ${EXPANDED_BUG_PROMPT}"
             print -r "Delete this file to force a re-run of bug hunting."
         } > "$BUGFIX_DIR/NO_ISSUES_FOUND.md"
         print -P "%F{cyan}[BUG HUNT]%f No-issues marker: $BUGFIX_DIR/NO_ISSUES_FOUND.md"
+
+        # Commit the no-issues marker so the clean result is recorded,
+        # mirroring how the bug report is committed when bugs are found.
+        git add "$BUGFIX_DIR/NO_ISSUES_FOUND.md" 2>/dev/null
+        git commit -m "No issues found: $(basename "$CURRENT_BUGFIX_SESSION")" &>/dev/null || true
 
         # Clean up empty session
         rmdir "$CURRENT_BUGFIX_SESSION" 2>/dev/null
