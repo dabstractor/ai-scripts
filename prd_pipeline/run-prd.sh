@@ -335,6 +335,22 @@ is_session_complete() {
     return 0
 }
 
+# Check if a bugfix session still needs its task breakdown generated: it has a
+# bug report ($BUG_RESULTS_FILE, normally TEST_RESULTS.md) but tasks.json is
+# missing/empty/corrupt - i.e. the recursive bug-fix run was interrupted between
+# committing the report and finishing the breakdown. Returns true (0) when the
+# breakdown still needs to (re)run. ($BUG_RESULTS_FILE is resolved at call time.)
+# Usage: bugfix_needs_breakdown <bugfix_session_dir>
+bugfix_needs_breakdown() {
+    local session_dir=$1
+    local report="$session_dir/$BUG_RESULTS_FILE"
+    local tasks="$session_dir/tasks.json"
+    [[ ! -f "$report" ]] && return 1
+    [[ ! -f "$tasks" || ! -s "$tasks" ]] && return 0
+    ! jq empty "$tasks" 2>/dev/null && return 0
+    return 1
+}
+
 # Get hash from session's PRD snapshot
 # Usage: get_session_hash <session_dir>
 # Hashes the prd_snapshot.md file directly - the authoritative source of truth
@@ -648,6 +664,35 @@ elif [[ -f "$PRD_FILE" ]]; then
         print -P "%F{cyan}[SESSION]%f Manually selected session: $(basename "$CURRENT_SESSION_DIR")"
     else
         determine_session_state
+    fi
+
+    # Auto-resume an interrupted bugfix breakdown BEFORE the session-state
+    # prompts below. If the latest bugfix session has a bug report but its
+    # tasks.json was never generated (the recursive bug-fix run was killed
+    # mid-breakdown), re-enter the pipeline as a bug-fix run - the SAME path the
+    # bug hunt stage uses when it first finds bugs (PLAN_DIR = bugfix session,
+    # PRD_FILE = bug report, SKIP_BUG_FINDING=true). The child's PHASE 0 then
+    # generates the missing tasks.json from the report. Running this BEFORE the
+    # "Start bug hunt?" prompts is what makes resume fully automatic for a plain
+    # `prd` or `prd --bug-hunt`. SKIP_BUG_FINDING=true in the child skips this
+    # check (and its bug hunt stage), so there is no re-entry loop. Skipped in
+    # --validate mode (explicit validation request) and --skip-bug-finding
+    # (already inside a bug-fix run / direct session mode).
+    if [[ "$SKIP_BUG_FINDING" == "false" && "$ONLY_VALIDATE" == "false" && -n "$CURRENT_SESSION_DIR" && -d "$CURRENT_SESSION_DIR/bugfix" ]]; then
+        _BFX_BREAKDOWN_SESSION=$(find "$CURRENT_SESSION_DIR/bugfix" -maxdepth 1 -type d -name '[0-9]*_*' 2>/dev/null | sort -n | tail -1)
+        if [[ -n "$_BFX_BREAKDOWN_SESSION" ]] && bugfix_needs_breakdown "$_BFX_BREAKDOWN_SESSION"; then
+            print -P "%F{yellow}[AUTO-DETECT]%f Found bugfix session with bug report but no task breakdown: bugfix/$(basename "$_BFX_BREAKDOWN_SESSION")"
+            print -P "%F{magenta}[RESUME]%f Generating missing task breakdown for interrupted bugfix session..."
+            SKIP_BUG_FINDING=true \
+            PRD_FILE="$_BFX_BREAKDOWN_SESSION/$BUG_RESULTS_FILE" \
+            SCOPE="$BUGFIX_SCOPE" \
+            AGENT="$AGENT" \
+            PLAN_DIR="$_BFX_BREAKDOWN_SESSION" \
+            PARALLEL_RESEARCH="$PARALLEL_RESEARCH" \
+            RESEARCH_DEPTH="$RESEARCH_DEPTH" \
+            "$0"
+            exit $?
+        fi
     fi
 
     case "$SESSION_STATE" in
