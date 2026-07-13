@@ -2506,6 +2506,26 @@ get_item_status() {
     echo "$item_status"
 }
 
+# Check whether an item's status in HEAD's tasks.json matches any of the given
+# statuses. Returns 0 (true) if HEAD records the item at one of those statuses,
+# 1 (false) otherwise (including when tasks.json or the item is absent from HEAD).
+# Used to distinguish a genuinely-COMMITTED completion from a "Complete" that
+# exists only in the working tree (a force-interrupted prior run that wrote the
+# status to disk but never reached the commit that persists it).
+_item_status_in_head() {
+    local id=$1
+    shift
+    [[ ! -d ".git" ]] && return 1
+    local head_status
+    head_status=$(git show "HEAD:$TASKS_FILE" 2>/dev/null \
+        | jq -r --arg iid "$id" '.. | objects | select(.id? == $iid) | .status // empty' 2>/dev/null | head -1)
+    local s
+    for s in "$@"; do
+        [[ "$head_status" == "$s" ]] && return 0
+    done
+    return 1
+}
+
 # Generate ID based on scope
 # Usage: generate_id <phase_num> <milestone_num> <task_num> <subtask_num>
 # Returns: P1, P1.M1, P1.M1.T1, or P1.M1.T1.S1 depending on SCOPE
@@ -3005,6 +3025,18 @@ execute_item() {
 
     # Skip if already completed
     if [[ "$current_status" == "Completed" || "$current_status" == "Complete" ]]; then
+        # Resume safety: a force-interrupted prior run can leave this item
+        # "Complete" in the WORKING TREE but never committed — stranding its
+        # plan/ work dir and the status change as untracked/unstaged. A blind
+        # skip here would orphan them forever (the cleanup agent is forbidden
+        # from touching plan/, and no later smart_commit would reach this item).
+        # If HEAD doesn't also record the item as Complete, persist the stranded
+        # work now — smart_commit stages everything via `git add -A`, so the
+        # plan/ dir + tasks.json land in git alongside any other leftover work.
+        if ! _item_status_in_head "$id" Complete Completed; then
+            print -P "%F{yellow}[RECOVERY]%f $id is Complete on disk but not in HEAD (interrupted prior run). Persisting stranded plan/ work..."
+            smart_commit
+        fi
         print -P "\n%F{green}[SKIP]%f $id is already %F{green}Completed%f. Skipping..."
         return 0
     fi
@@ -3283,6 +3315,15 @@ FEEDBACK_EOF
         # Clean up issue tracking files on success
         rm -f "$dirname/.issue_retry_count" "$dirname/issue_feedback.md"
     fi
+
+    # Persist this item's substance (source changes + plan/ work dir + Complete
+    # status) NOW, before the cleanup agent runs. Cleanup is a long, interruptible
+    # LLM call; committing first guarantees a force-interrupt here can no longer
+    # leave the item "Complete on disk but uncommitted" — the state that makes a
+    # resume skip it and orphan its plan/ dir. The cleanup agent's doc reorg is
+    # committed by the smart_commit further below. (If nothing changed, smart_commit
+    # is a no-op.)
+    smart_commit
 
     print -P "%F{blue}[CLEANUP]%f Cleaning up $id..."
     run_with_retry $AGENT -p "$CLEANUP_PROMPT" < /dev/null || print -P "%F{yellow}[WARN]%f Cleanup failed, proceeding to commit..."
