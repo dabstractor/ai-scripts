@@ -3160,7 +3160,7 @@ $issue_feedback
 
         # Use pipefail to get the agent's exit status, not tee's
         setopt pipefail
-        $IMPL_AGENT -p "$PRP_EXECUTE_PROMPT Execute the PRP for $(get_scope_name) $id. The PRP file is located at: $dirname/PRP.md. READ IT NOW." < /dev/null 2>&1 | tee "$agent_output_file"
+        $IMPL_AGENT --no-session -p "$PRP_EXECUTE_PROMPT Execute the PRP for $(get_scope_name) $id. The PRP file is located at: $dirname/PRP.md. READ IT NOW." < /dev/null 2>&1 | tee "$agent_output_file"
         agent_exit_status=$?
         unsetopt pipefail
 
@@ -3326,7 +3326,7 @@ FEEDBACK_EOF
     smart_commit
 
     print -P "%F{blue}[CLEANUP]%f Cleaning up $id..."
-    run_with_retry $AGENT -p "$CLEANUP_PROMPT" < /dev/null || print -P "%F{yellow}[WARN]%f Cleanup failed, proceeding to commit..."
+    run_with_retry $AGENT --no-session -p "$CLEANUP_PROMPT" < /dev/null || print -P "%F{yellow}[WARN]%f Cleanup failed, proceeding to commit..."
 
     # Restore tasks.json again after cleanup (cleanup agent might also modify it)
     restore_tasks_json "Complete"
@@ -3594,7 +3594,7 @@ fi
 if [[ "$INTEGRATE_CHANGES" == "true" && -f "$TASKS_FILE" ]]; then
     print -P "%F{magenta}[UPDATE]%f Integrating PRD changes into existing tasks..."
 
-    run_with_retry_stdin "$TASK_UPDATE_PROMPT" $AGENT
+    run_with_retry_stdin "$TASK_UPDATE_PROMPT" $AGENT --no-session
 
     print -P "%F{green}[UPDATE]%f Task hierarchy updated with PRD changes."
 
@@ -3629,7 +3629,7 @@ if [[ ! -f "$TASKS_FILE" ]]; then
 
         # Cleanup phase: organize .md files created during breakdown
         print -P "%F{blue}[CLEANUP]%f Organizing files after task breakdown..."
-        run_with_retry $AGENT -p "$CLEANUP_PROMPT" < /dev/null || print -P "%F{yellow}[WARN]%f Cleanup failed, proceeding to commit..."
+        run_with_retry $AGENT --no-session -p "$CLEANUP_PROMPT" < /dev/null || print -P "%F{yellow}[WARN]%f Cleanup failed, proceeding to commit..."
 
         # Commit the task breakdown
         print -P "%F{blue}[GIT]%f Committing task breakdown..."
@@ -3805,7 +3805,7 @@ fi
 # Final Validation Step (skip if bug-hunt only mode)
 if [[ "$ONLY_BUG_HUNT" != "true" ]]; then
 print -P "\n%F{magenta}[VALIDATION]%f Starting final validation..."
-PI_AGENT_TIMEOUT=$VALIDATION_TIMEOUT run_with_retry_stdin "$VALIDATION_PROMPT" $VALIDATION_AGENT
+PI_AGENT_TIMEOUT=$VALIDATION_TIMEOUT run_with_retry_stdin "$VALIDATION_PROMPT" $VALIDATION_AGENT --no-session
 validation_rc=$?
 if [[ $validation_rc -ne 0 ]]; then
     print -P "%F{red}[ERROR]%f Validation did not finish (exit $validation_rc). Aborting before cleanup/commit/bug-hunt."
@@ -3873,7 +3873,7 @@ if [[ -f "validation_report.md" ]]; then
 
         FORBIDDEN: Only edit source files to fix the reported issues. NEVER delete or move PRD.md, any PRP.md, anything under plan/, tasks.json, prd_snapshot.md, or TEST_RESULTS.md - these are pipeline state owned by humans / the orchestrator."
 
-        run_with_retry_stdin "$FIX_PROMPT" $IMPL_AGENT
+        run_with_retry_stdin "$FIX_PROMPT" $IMPL_AGENT --no-session
         print -P "%F{green}[FIX]%f Fixes applied."
     fi
 fi
@@ -3882,7 +3882,7 @@ fi
 print -P "%F{blue}[CLEANUP]%f Removing validation artifacts..."
 
 # Ask agent to delete the files (in case they were created elsewhere)
-run_with_retry $AGENT -p "Delete the validation artifacts: remove ./validate.sh and ./validation_report.md from the current directory. These are temporary files that should not be committed." < /dev/null
+run_with_retry $AGENT --no-session -p "Delete the validation artifacts: remove ./validate.sh and ./validation_report.md from the current directory. These are temporary files that should not be committed." < /dev/null
 
 # Manual deletion as backup (in case agent didn't delete them)
 rm -f "./validate.sh" "./validation_report.md" 2>/dev/null
@@ -4016,7 +4016,7 @@ Please include these in your bug report if they represent real issues.
 ${EXPANDED_BUG_PROMPT}"
         fi
 
-        run_with_retry_stdin "$EXPANDED_BUG_PROMPT" $BUG_FINDER_AGENT
+        run_with_retry_stdin "$EXPANDED_BUG_PROMPT" $BUG_FINDER_AGENT --no-session
     fi
 
     # If no file was created, no bugs were found - we're done!
