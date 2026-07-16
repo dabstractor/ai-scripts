@@ -884,3 +884,213 @@ RESEARCH_DEPTH="$RESEARCH_DEPTH" \
 2. Make the disablement visible so this class of regression can't fail silently again — the `[CONFIG]` line now prints `disabled` in the `else` branch.
 
 **Why not `export`:** The explicit per-call forwarding is preferred here because it mirrors how `SCOPE`/`AGENT`/`PLAN_DIR` are already threaded through this exact recursion boundary, keeping the contract ("the bugfix child inherits a deliberate, curated environment") locally readable rather than relying on process-wide export state.
+
+---
+
+## Changes Since Commit e286b56 (Resilience & Guard-Rails Pass)
+
+**Base commit:** `e286b56` — "fix(prd): forward parallel research and depth settings into bugfix sub-runs" (end of the prior section, item K)
+**Latest commit:** `8098249` — "fix(prd): prevent orphaned plan dirs from interrupted runs" (+ uncommitted `--no-session` changes on `run-prd.sh`)
+**Date range:** 2026-07-03 through 2026-07-13 (12 commits)
+**Files changed:**
+- `prd_pipeline/run-prd.sh` (+330 lines, −51 lines vs `e286b56`, working tree — includes uncommitted)
+- `fix_diagrams/` (rewrite: 32 files, +912/−731 in `30d224f`)
+
+**Theme:** The pipeline is now survivable across the two failure classes that caused the most lost work this period — *interrupted runs* (Ctrl+C / SIGKILL mid-item, mid-breakdown, mid-validation) and *misbehaving agents* (deleting `PRD.md`/`PRP.md`, batching thin PRPs, or stalling forever). Nearly every change here closes a path where a force-interrupt or an over-eager agent could leave the repo in a state that a blind resume would then orphan or corrupt.
+
+---
+
+### L. Critical-File Deletion Protection — `81a59ab`
+
+**Problem Solved:** The autonomous bug finder, the validation fixer, and especially the cleanup agent would sometimes delete `PRD.md` and `**/PRP.md`. Because `smart_commit` runs `git add -A`, any such deletion was staged and committed permanently — silently wiping the real PRD and every PRP on every bug-fix run.
+
+**Solution:** Two layers — a *prompt* layer telling agents never to delete these files, and a *mechanical* layer (`restore_critical_files()`) that undoes the deletion if it happens anyway, mirroring `restore_tasks_json`.
+
+**Mechanical guard:**
+```bash
+restore_critical_files() {
+    [[ ! -d ".git" ]] && return 0
+    local deleted
+    deleted=$(git diff --cached --name-only --diff-filter=D 2>/dev/null \
+        | grep -E '(^|/)PRD\.md$|(^|/)PRP\.md$')
+    [[ -z "$deleted" ]] && return 0
+    local f
+    for f in "${(@f)deleted}"; do
+        [[ -z "$f" ]] && continue
+        if git cat-file -e "HEAD:$f" 2>/dev/null; then
+            git checkout HEAD -- "$f" 2>/dev/null \
+                && print -P "%F{red}[PROTECT]%f Restored deleted critical file from HEAD: $f"
+        else
+            git reset -q HEAD -- "$f" 2>/dev/null   # created+deleted same run: just unstage
+            print -P "%F{yellow}[PROTECT]%f Cannot restore (not in HEAD); unstaged deletion of: $f"
+        fi
+    done
+}
+```
+Called from `smart_commit` right after `git add -A` (and before the `tasks.json` restore). `PRD.md` / `PRP.md` are now guaranteed to survive every commit.
+
+**Prompt layer:** Every deletion-capable agent prompt (cleanup, bug hunter, bug-fix breakdown, post-validation fix) gained an explicit **"NEVER run `rm`, `git rm`, `git clean`, or `mv` against `PRD.md`, any `PRP.md`, or anything under `plan/`"** clause, and the cleanup prompt's "Delete" step was reworded to forbid treating pipeline-state files as "temporary."
+
+---
+
+### M. `--accept-prd-changes` Flag + Validation/Retry Hardening — `81b5fa6`
+
+The largest commit of the period; several distinct concerns:
+
+**M1. `--accept-prd-changes` flag.** Accept PRD edits as the new baseline *without* generating a delta session. Use when `PRD.md` was edited (docs/refinements reflecting already-finished work) but the work is complete and validated, so the next run should stay idempotent instead of spawning a delta. Across all three `PRD_CHANGED_*` session states it cancels any queued `.pending_delta_hash`, refreshes `prd_snapshot.md` to the current PRD, and exits/resumes idempotently.
+
+**M2. Dedicated `VALIDATION_AGENT` + `VALIDATION_TIMEOUT`.** Validation now runs on a new `VALIDATION_AGENT` (default `pizr`, matching breakdown/bug-finder reasoning) instead of the generic `$AGENT`, and gets its own watchdog budget `VALIDATION_TIMEOUT` (default `7200` s / 2 h — validation legitimately runs full test suites), overriding `PI_AGENT_TIMEOUT` for the validation call only. Validation failure now **aborts the run** before cleanup/commit/bug-hunt rather than proceeding on a half-validated build:
+```bash
+PI_AGENT_TIMEOUT=$VALIDATION_TIMEOUT run_with_retry_stdin "$VALIDATION_PROMPT" $VALIDATION_AGENT
+validation_rc=$?
+if [[ $validation_rc -ne 0 ]]; then
+    print -P "%F{red}[ERROR]%f Validation did not finish (exit $validation_rc). Aborting before cleanup/commit/bug-hunt."
+    exit $validation_rc
+fi
+```
+
+**M3. Watchdog timeouts are no longer retried.** `run_with_retry` and `run_with_retry_stdin` now treat exit `124` (watchdog kill) as a hard failure — a hung process will just re-hang, so churning retries forever is wrong:
+```bash
+if [[ $exit_status -eq 124 ]]; then
+    print -P "%F{red}[TIMEOUT]%f Command killed by watchdog (exit 124). Not retrying."
+    return 124
+fi
+```
+
+**M4. Resilient stdin temp file.** `run_with_retry_stdin` now re-writes the prompt to its temp file on *every* retry attempt (not once). If the agent or the system cleans `/tmp` mid-run, the old code failed forever with "no such file" on every later retry; rewriting is cheap and makes retries resilient regardless of why the file vanished.
+
+**M5. Calmer parallel-research wait.** `wait_for_background_research` timeout raised `600 s → 1800 s` (30 min), and the heartbeat is now silent for the first 1000 s then surfaces every 100 s — normal research can take a while, but a genuinely stuck supervisor is still visible without spamming early on.
+
+---
+
+### N. Single-PRP Default with Strict Batching Gates — `de3cb15`
+
+**Problem Solved:** PRP (research) agents would batch several PRPs into one session "to be helpful," producing thin, under-researched PRPs that failed at implementation — the exact opposite of the goal.
+
+**Solution:** Made "write exactly ONE PRP — the one you were asked for" the explicit default in the PRP system prompt, the `PRP_CREATE_PROMPT`, and each per-item scope line, with a **MULTI-PRP BATCHING POLICY** that only permits batching as an optimization for tightly-coupled items at a *higher* bar (not a lower one). The hard gate before any second PRP requires: full task-tree + full-PRD awareness, per-item 3–5 subagent research calls (the budget is *per PRP*, so an N-PRP batch needs ~N× the research), a per-item "No Prior Knowledge" pass, and an explicit batch declaration. **"When in doubt, write one."**
+
+**Also:** `prd status` is now aliased to `prd task` for git muscle memory (`git status` / `prd status`).
+
+---
+
+### O. Mid-Session Integration: Preserve the Original Snapshot — `241c310`
+
+**Problem Solved:** When the user chose "Integrate changes into current session" (option 1), the code immediately overwrote `prd_snapshot.md` with the new PRD. That erased the very diff the integration agent needs to see (it diffs *original snapshot* vs *current PRD*) *and* silently swallowed the change if integration failed to apply anything. (PRD-change detection hashes `prd_snapshot.md` as its baseline.)
+
+**Solution:** Stop refreshing the snapshot at integration time; refresh it only *after* integration succeeds:
+```bash
+# Now that the task hierarchy reflects the new PRD, refresh prd_snapshot.md ...
+# This is done AFTER integration so the agent had the original snapshot to diff against.
+cp "$PRD_FILE" "$SESSION_DIR/prd_snapshot.md"
+```
+
+**Bundled in the same commit:**
+- **Prompt-escaping fix:** several heredocs (`DELTA_PRD_GENERATION_PROMPT`, `TASK_UPDATE_PROMPT`, `VALIDATION_PROMPT`, bug-hunter prompt) used `\$(cat ...)` — a literal backslash-dollar that, in an unquoted heredoc, emits the *string* `$(cat "PRD.md")` rather than the file contents. Corrected to `$(cat ...)` so the prompts actually contain the PRD/tasks text.
+- **Migrated four more call sites to `run_with_retry_stdin`** (delta-PRD generation, task update, validation, validation fix) — consistent with the argv-size bypass from item H, feeding these large prompts through stdin instead of `-p`.
+
+---
+
+### P. No-Issues Marker for Clean Bug Hunts — `2dc6ec1` (+commit in `81b5fa6`)
+
+**Problem Solved:** After a bug hunt found nothing, there was no record of it — so the user couldn't tell whether bug hunting had already run clean on a task set or just hadn't run yet.
+
+**Solution:** When the bug finder reports no bugs, write `$BUGFIX_DIR/NO_ISSUES_FOUND.md` recording the timestamp, the session tested, a `tasks.json` hash (so a stale marker is easy to spot once the task set changes), and the bug-finder agent. The marker is cleared (`rm -f`) if a later hunt *does* find bugs, so the bugfix directory always reflects the latest result. `81b5fa6` adds the matching `git commit` so the clean result is persisted just like a real bug report is.
+
+---
+
+### Q. Auto-Resume Interrupted Bugfix Task Breakdowns — `481a418`
+
+**Problem Solved:** If a recursive bug-fix run was killed *between* committing the bug report and finishing PHASE 0 (task breakdown), the bugfix session was left with a `TEST_RESULTS.md` but no `tasks.json`. Plain `prd` / `prd --bug-hunt` would then not resume it — the breakdown was stranded.
+
+**Solution:** A new `bugfix_needs_breakdown()` predicate (report present, `tasks.json` missing/empty/corrupt) plus an auto-detect block that runs *before* the session-state prompts: if the latest `bugfix/NNN_hash/` session needs its breakdown, re-enter the pipeline on the exact same path the bug-hunt stage uses when it first finds bugs (`PLAN_DIR` = bugfix session, `PRD_FILE` = bug report, `SKIP_BUG_FINDING=true`), so the child's PHASE 0 regenerates the missing `tasks.json`. `SKIP_BUG_FINDING=true` in the child skips this check, so there's no re-entry loop. Skipped in `--validate` / `--skip-bug-finding`.
+
+---
+
+### R. Prevent Orphaned `plan/` Dirs from Interrupted Runs — `8098249`
+
+**Problem Solved:** A force-interrupted prior run could leave an item "Complete" in the *working tree* but never committed — stranding its `plan/` work directory and the status change as untracked/unstaged. A blind skip in `execute_item` ("already Completed → return") would then orphan that work *forever*: the cleanup agent is forbidden from touching `plan/`, and no later `smart_commit` would reach this item.
+
+**Solution:** Two-part.
+1. **Skip-recovery:** a new `_item_status_in_head()` checks the item's status in *HEAD's* `tasks.json` (not the working tree). On the Completed-skip path, if HEAD doesn't also record the item as Complete, run `smart_commit` now to persist the stranded `plan/` dir + status:
+```bash
+if [[ "$current_status" == "Completed" || "$current_status" == "Complete" ]]; then
+    if ! _item_status_in_head "$id" Complete Completed; then
+        print -P "%F{yellow}[RECOVERY]%f $id is Complete on disk but not in HEAD (interrupted prior run). Persisting stranded plan/ work..."
+        smart_commit
+    fi
+    ...
+```
+2. **Pre-cleanup commit:** `execute_item` now runs `smart_commit` *before* the cleanup agent. Cleanup is a long, interruptible LLM call; committing the item's substance (source changes + `plan/` dir + Complete status) first guarantees a force-interrupt here can no longer leave the item "Complete on disk but uncommitted" — the state that causes the orphan. The cleanup agent's doc reorg is still committed by the later `smart_commit`.
+
+---
+
+### S. Agent Default Tuning — `pizr` / `piznt` / dedicated `VALIDATION_AGENT` — `4b6acad`, `90267ab`, `81b5fa6`
+
+Three default-agent changes so each pipeline phase runs on a model suited to its job:
+
+| Role | Default before | Default now | Commit |
+|------|----------------|-------------|--------|
+| `IMPL_AGENT` (PRP-execute + post-validation fix) | `pizt` (glm-5-turbo) | `piznt` | `4b6acad` |
+| `BREAKDOWN_AGENT` (task decomposition) | `piz` (glm-5.2) | `pizr` (pi + `--thinking xhigh`) | `90267ab` |
+| `BUG_FINDER_AGENT` | `piz` | `pizr` | `90267ab` |
+| `VALIDATION_AGENT` (new role) | *(used generic `$AGENT`)* | `pizr` | `81b5fa6` |
+
+Planning, breakdown, bug-finding, and validation — the steps that need deep reasoning — now all default to `pizr`; code-writing defaults to the faster `piznt`. (See M2 for the validation split.)
+
+---
+
+### T. Stateless Agent Invocations via `--no-session` (uncommitted, working tree)
+
+Every agent call that is *stateless by nature* — cleanup, mid-session task update, validation, the post-validation fix, bug-finder, validation-artifact deletion, and the per-item PRP-execute (`tee`'d to the output log) — now passes `--no-session`. These calls don't benefit from session resume (they're single-shot or operate on freshly-built prompts), and leaving sessions enabled was creating/resuming sessions that served no purpose. Classifier calls already used `--no-session`; this extends the same discipline to the rest of the stateless call sites.
+
+---
+
+### U. Small Fixes
+
+- **`commit-pi` → `stagecoach` (`0054127`):** the smart-commit commit tool was renamed; `smart_commit` now calls `stagecoach`. (Comments updated to drop the old name.)
+- **Menu input sanitization (`55303cc`):** the PRD-change menu `read -r "choice?..."` now trims stray whitespace/CR, so basic mistypes like `"2 "` or a trailing carriage-return from a paste are still accepted:
+```bash
+choice="${choice//$'\r'/}"
+choice="${choice#"${choice%%[![:space:]]*}"}"
+choice="${choice%"${choice##*[![:space:]]}"}"
+```
+
+---
+
+## Component: `fix_diagrams/` — Fixer Rewrite
+
+### V. Drift-Tolerant, Display-Width-Aware Diagram Fixer — `30d224f`
+
+**Scope note:** This is a separate subproject (`fix_diagrams/`, a Claude Code `PostToolUse` hook), not part of `run-prd.sh`. Documented here because it landed in the same window.
+
+**What changed:** A near-complete rewrite of the ASCII box-diagram alignment fixer (`fix_diagram.py`; +912/−731 across 32 files including regenerated golden tests), plus a new geometry linter `diagram_lint.py` and an expanded `run_tests.py`.
+
+**New error model ("drift and width"):** the fixer now models how LLMs actually break diagrams — the *top border and left corner column are written first and are almost always correct*, while errors accumulate rightward (wrong padding before `│`) and downward (bottom borders with the wrong dash count, drifted corners, or missing entirely). The pipeline:
+1. **Trace** — each top border is traced downward, matching left/right edge tokens per row within a *drift-tolerance window*, anchored on the left neighbour's *actual* token positions so cumulative drift doesn't break matching; already-matched tokens are "claimed" so neighbours can't steal them.
+2. **Layout** — target inner width = max(top-border width, widest rstripped content line), measured in **display cells** (`dwidth`: ANSI escapes are zero-width, CJK is double-width), so colored/CJK/emoji content aligns correctly in a terminal.
+3. **Render** — each box row is rebuilt at its target geometry; gaps between side-by-side boxes are *elastic* (dash runs like `────▶` stretch/shrink via `_fit_gap`); a missing bottom border is synthesised when a connector row (`│▼▲`) follows.
+
+**Conservative bail-outs ("do no harm"):** junction chars (`┬┼├┤`) in borders, double-line/rounded borders, tab-containing rows, malformed bottom borders, height > 40 rows, and connector pipes mistaken for edges all leave the text untouched.
+
+**Testing:** `run_tests.py` runs four independent oracles — golden (50 pairs), property (idempotence, expected-files-are-fixed-points, no visible character created or destroyed, output never has more geometry violations than input), seeded corruption-fuzzing (builds clean diagrams, applies LLM-style corruptions, requires byte-exact recovery; `--fuzz N`), and targeted unit tests. `diagram_lint.py` is both a test oracle and a standalone audit tool.
+
+---
+
+## Commit History (this section)
+
+| Hash | Date | Message |
+|------|------|---------|
+| `30d224f` | 2026-07-03 | refactor(diagrams): rewrite fixer with drift and width |
+| `4b6acad` | 2026-07-03 | fix(prd): update default implementation agent to piznt |
+| `90267ab` | 2026-07-05 | fix(prd): switch default breakdown and bug hunt agent |
+| `241c310` | 2026-07-05 | fix(prd): preserve original snapshot during mid-session integration |
+| `81a59ab` | 2026-07-07 | fix(prd): prevent agents from deleting PRD and PRP files |
+| `55303cc` | 2026-07-07 | fix(prd): sanitize menu input of stray whitespace |
+| `de3cb15` | 2026-07-07 | fix(prd): enforce single-PRP default with strict batching gates |
+| `2dc6ec1` | 2026-07-07 | fix(prd): persist no-issues marker after clean bug hunt |
+| `0054127` | 2026-07-08 | fix(prd): replace commit-pi with stagecoach |
+| `81b5fa6` | 2026-07-10 | fix(prd): add accept-prd-changes flag and harden retry loops |
+| `481a418` | 2026-07-11 | fix(prd): auto-resume interrupted bugfix task breakdowns |
+| `8098249` | 2026-07-13 | fix(prd): prevent orphaned plan dirs from interrupted runs |
+
+Plus uncommitted working-tree changes on `prd_pipeline/run-prd.sh` (item T).
