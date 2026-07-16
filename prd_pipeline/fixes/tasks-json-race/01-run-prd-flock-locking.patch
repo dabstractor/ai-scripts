@@ -1,0 +1,95 @@
+--- a/prd_pipeline/run-prd.sh
++++ b/prd_pipeline/run-prd.sh
+@@ -230,7 +230,7 @@
+     # Step 3: Re-apply current processing task's status
+     if [[ -n "$CURRENT_PROCESSING_ID" && -n "$status_for_current" ]]; then
+         print -P "%F{cyan}[PROTECT]%f Re-applying $CURRENT_PROCESSING_ID -> $status_for_current"
+-        tsk -f "$TASKS_FILE" update "$CURRENT_PROCESSING_ID" "$status_for_current" 2>/dev/null || true
++        tsk_locked "$TASKS_FILE" update "$CURRENT_PROCESSING_ID" "$status_for_current" 2>/dev/null || true
+     fi
+ 
+     # Step 4: Preserve background-research statuses across restore.
+@@ -245,7 +245,7 @@
+             [[ -z "$_id" || "$_id" == "$CURRENT_PROCESSING_ID" ]] && continue
+             _dir="$SESSION_DIR/${_id//./}"
+             if [[ -f "$_dir/PRP.md" ]]; then
+-                tsk -f "$TASKS_FILE" update "$_id" Ready 2>/dev/null || true
++                tsk_locked "$TASKS_FILE" update "$_id" Ready 2>/dev/null || true
+             fi
+         done
+         # Re-apply Researching (research dir exists = actively researched)
+@@ -253,7 +253,7 @@
+             [[ -z "$_id" || "$_id" == "$CURRENT_PROCESSING_ID" ]] && continue
+             _dir="$SESSION_DIR/${_id//./}"
+             if [[ -d "$_dir/research" ]]; then
+-                tsk -f "$TASKS_FILE" update "$_id" Researching 2>/dev/null || true
++                tsk_locked "$TASKS_FILE" update "$_id" Researching 2>/dev/null || true
+             fi
+         done
+     fi
+@@ -917,10 +917,35 @@
+     fi
+ fi
+ 
+-# Wrapper for tsk command to always use the correct tasks file
+-# Defined early so auto-resume can use it
++# Serialized access to tasks.json.
++#
++# tsk is an unlocked read-modify-write: TaskManager loads the file in its
++# constructor and saves with fs.writeFileSync (no flock, no atomic rename).
++# Two callers write the SAME tasks file concurrently in this pipeline:
++#   - the foreground executor  (status -> Researching/Implementing/Complete)
++#   - the background research supervisor subshell (status -> Researching/Ready
++#     for items chained ahead by RESEARCH_DEPTH)
++# Their read-modify-write cycles can interleave and the loser's update is
++# silently dropped. Symptom: the supervisor's "...Ready" write clobbers the
++# executor's just-written "Implementing", so an item visibly sits at "Ready"
++# for the entire ~minutes-long implementation, then jumps straight to
++# "Complete". Fix: every read AND write takes an exclusive flock on a per-file
++# lockfile. The `( flock 9; ... ) 9>lock` recipe scopes fd 9 to the subshell,
++# so it is safe under recursion and is inherited correctly by the backgrounded
++# supervisor subshell. Requires flock (util-linux), standard on Linux.
++tsk_locked() {
++    local _f="$1"; shift
++    ( flock 9
++      tsk -f "$_f" "$@" < /dev/null
++    ) 9>"${_f}.lock"
++}
++
++# Wrapper for tsk command to always use the correct tasks file (now locked).
++# Defined early so auto-resume can use it. Routes reads AND writes through
++# tsk_locked so concurrent supervisor/restore writes can't lose updates or
++# serve a torn read.
+ tsk_cmd() {
+-    tsk -f "$TASKS_FILE" "$@" < /dev/null
++    tsk_locked "$TASKS_FILE" "$@"
+ }
+ 
+ # Auto-resume logic
+@@ -948,7 +973,7 @@
+         # If no PRP exists, this is an orphan - reset to Planned
+         if [[ ! -f "$prp_path" ]]; then
+             print -P "%F{yellow}[CLEANUP]%f Resetting orphan item $item_id (no PRP.md) to Planned"
+-            tsk -f "$tasks_file" update "$item_id" Planned 2>/dev/null
++            tsk_locked "$tasks_file" update "$item_id" Planned 2>/dev/null
+         fi
+     done
+ }
+@@ -2718,7 +2743,7 @@
+         fi
+ 
+         mkdir -p "$cdir/research"
+-        tsk -f "$TASKS_FILE" update "$cid" Researching
++        tsk_locked "$TASKS_FILE" update "$cid" Researching
+ 
+         # Contract context from the previous item (passed in for item 1, prior chain item thereafter)
+         local prev_context=""
+@@ -2787,7 +2812,7 @@
+             print -P "%F{red}[PARALLEL]%f Background research FAILED for $cid - no PRP created"
+             exit 1
+         fi
+-        tsk -f "$TASKS_FILE" update "$cid" Ready
++        tsk_locked "$TASKS_FILE" update "$cid" Ready
+         # This item's PRP becomes the contract for the next item in the chain.
+         prev_id="$cid"; prev_dirname="$cdir"
+     done

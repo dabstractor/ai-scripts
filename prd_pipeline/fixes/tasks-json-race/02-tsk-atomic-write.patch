@@ -1,0 +1,22 @@
+--- a/task-processing/src/tsk.ts
++++ b/task-processing/src/tsk.ts
+@@ -289,7 +289,18 @@
+   }
+ 
+   private saveBacklog(): void {
+-    fs.writeFileSync(this.filePath, JSON.stringify(this.data, null, 2), 'utf8');
++    // Atomic write: serialize to a temp file in the SAME directory as the
++    // target, then rename onto it. fs.renameSync is atomic on the same
++    // filesystem, so concurrent readers (other tsk processes) never observe a
++    // half-written file and a crash mid-write cannot corrupt tasks.json.
++    // (Cross-process lost-update prevention is provided by the flock wrapper
++    // in run-prd.sh; this guard ensures tsk itself is crash-safe and
++    // tear-free for any other concurrent callers.)
++    const dir = path.dirname(this.filePath);
++    const base = path.basename(this.filePath);
++    const tmp = path.join(dir, `.${base}.${process.pid}.tmp`);
++    fs.writeFileSync(tmp, JSON.stringify(this.data, null, 2), 'utf8');
++    fs.renameSync(tmp, this.filePath);
+   }
+ 
+   private findNodeById(id: string): { node: any; parent: any; parentType: string } | null {
