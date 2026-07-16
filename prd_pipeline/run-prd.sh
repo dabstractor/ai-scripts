@@ -270,12 +270,104 @@ PRP_AGENT_MCP_ARGS=""
 
 # --- Session Management Functions ---
 
-# Generate deterministic hash of PRD content
+# --- PRD Include Resolution (@path expansion) ---
+#
+# A PRD may be split across multiple files. A line of the form
+#
+#     @path/to/file.md
+#
+# (optional leading whitespace, nothing else on the line) is an *include
+# directive*: it is replaced inline by the contents of the referenced file.
+# Includes are resolved PROJECT-ROOT-RELATIVE — i.e. relative to the directory
+# of the entry PRD file, regardless of which file contains the directive — and
+# expanded recursively with cycle detection (PRD_INCLUDE_MAX_DEPTH, default 10).
+#
+# A line is only treated as an include if the referenced path exists as a
+# file; otherwise it is passed through verbatim (so prose @mentions and
+# example @syntax stay literal). This makes resolution IDEMPOTENT: re-resolving
+# already-resolved content yields the same bytes, which is what guarantees
+# hash/snapshot consistency below.
+#
+# Env vars:
+#   PRD_INCLUDE_MAX_DEPTH  Max include nesting (default 10)
+#   PRD_INCLUDE_MARKERS    If non-empty, emit <!-- @include: path --> markers
+typeset -gA _PRD_INCLUDE_STACK
+
+resolve_prd_content() {
+    local file_path=$1
+    local depth=${2:-0}
+    local root=${3:-}
+    local max_depth=${PRD_INCLUDE_MAX_DEPTH:-10}
+
+    [[ ! -f "$file_path" ]] && return 0
+
+    # Top-level entry: reset cycle stack and establish the include root.
+    if (( depth == 0 )); then
+        _PRD_INCLUDE_STACK=()
+        [[ -z "$root" ]] && root="${file_path:A:h}"
+    fi
+
+    local abs_path="${file_path:A}"
+    if (( ${+_PRD_INCLUDE_STACK[$abs_path]} )); then
+        print -u2 -P "%F{red}[PRD INCLUDE]%f Cycle detected: $file_path already in include stack. Skipping."
+        return 0
+    fi
+    if [[ $depth -ge $max_depth ]]; then
+        print -u2 -P "%F{red}[PRD INCLUDE]%f Max include depth ($max_depth) exceeded at $file_path. Skipping."
+        return 0
+    fi
+
+    # Fast path: no sole-line @-include present — stream the file unchanged.
+    # Keeps hashing tasks.json / already-resolved snapshots at cat speed.
+    if ! grep -Eq '^[[:space:]]*@[^[:space:]]+' "$file_path"; then
+        cat "$file_path"
+        return
+    fi
+
+    _PRD_INCLUDE_STACK[$abs_path]=1
+    local line trimmed include_path
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        trimmed="${line#"${line%%[![:space:]]*}"}"   # strip leading whitespace
+        trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"  # strip trailing whitespace
+        if [[ -n "$trimmed" && "$trimmed" == @* ]]; then
+            include_path="${trimmed:1}"
+            include_path="${include_path/#\~/$HOME}"
+            # Project-root-relative unless absolute or $env-style.
+            if [[ "$include_path" != /* && "$include_path" != \$* ]]; then
+                include_path="$root/$include_path"
+            fi
+            if [[ -f "$include_path" ]]; then
+                [[ -n "$PRD_INCLUDE_MARKERS" ]] && print -r -- "<!-- @include: ${trimmed:1} -->"
+                resolve_prd_content "$include_path" $((depth + 1)) "$root"
+                [[ -n "$PRD_INCLUDE_MARKERS" ]] && print -r -- "<!-- @end-include: ${trimmed:1} -->"
+            else
+                print -u2 -P "%F{yellow}[PRD INCLUDE]%f File not found: @${trimmed:1} (referenced in $file_path) — leaving line verbatim"
+                print -r -- "$line"
+            fi
+        else
+            print -r -- "$line"
+        fi
+    done < "$file_path"
+    unset "_PRD_INCLUDE_STACK[$abs_path]"
+}
+
+# Materialize the fully-resolved PRD (all @path includes expanded) to <dest>.
+# Drop-in replacement for the `cp "$PRD_FILE" .../prd_snapshot.md` pattern so
+# that a split PRD is flattened into one canonical document for downstream
+# agents, selector extraction, and hash/delta consistency.
+write_resolved_prd() {
+    local dest=$1
+    resolve_prd_content "$PRD_FILE" > "$dest"
+}
+
+# Generate deterministic hash of PRD content.
+# Resolves @path includes first, so a split PRD and its materialized snapshot
+# hash identically (resolution is idempotent — see resolve_prd_content).
 # Usage: hash_prd_content <file_path>
 # Returns: First 12 chars of SHA256 hash
 hash_prd_content() {
     local file_path=$1
-    sha256sum "$file_path" | cut -c1-12
+    resolve_prd_content "$file_path" | sha256sum | cut -c1-12
 }
 
 # Find all existing sessions
@@ -459,18 +551,24 @@ mdsel_available() {
     fi
 }
 
-# Generate PRD index using mdsel
-# Returns the index of selectors for the PRD file, or empty if mdsel unavailable
+# Generate PRD index using mdsel over the RESOLVED PRD (all @path includes
+# expanded), so selectors reference the merged document downstream agents see.
+# Returns the index of selectors, or empty if mdsel unavailable / PRD empty.
 generate_prd_index() {
     local prd_file=$1
-    if command -v mdsel &>/dev/null; then
-        mdsel "$prd_file" 2>/dev/null
-    elif [[ -f "$HOME/projects/mdsel/dist/cli/index.js" ]]; then
-        node "$HOME/projects/mdsel/dist/cli/index.js" "$prd_file" 2>/dev/null
-    else
-        # mdsel not available - return empty
-        return 0
+    [[ ! -f "$prd_file" ]] && return 0
+    # mdsel reads from a file; materialize the resolved (includes-expanded)
+    # PRD to a temp file so selectors reference the merged document.
+    local tmp=$(mktemp -t prd_resolved.XXXXXX.md)
+    resolve_prd_content "$prd_file" > "$tmp"
+    if [[ -s "$tmp" ]]; then
+        if command -v mdsel &>/dev/null; then
+            mdsel "$tmp" 2>/dev/null
+        elif [[ -f "$HOME/projects/mdsel/dist/cli/index.js" ]]; then
+            node "$HOME/projects/mdsel/dist/cli/index.js" "$tmp" 2>/dev/null
+        fi
     fi
+    rm -f "$tmp"
 }
 
 # Extract PRD sections using mdsel selectors
@@ -607,7 +705,7 @@ Output ONLY one word: COSMETIC or SUBSTANTIVE"
         if [[ $latest_num -gt 0 ]]; then
             local latest_dir=$(get_session_dir $latest_num)
             if [[ -d "$latest_dir" ]]; then
-                cp "$PRD_FILE" "$latest_dir/prd_snapshot.md"
+                write_resolved_prd "$latest_dir/prd_snapshot.md"
                 print -P "%F{green}[PRD CHECK]%f Snapshot updated in $(basename "$latest_dir")"
             fi
         fi
@@ -641,7 +739,7 @@ if [[ "$SKIP_BUG_FINDING" == "true" && -d "$PLAN_DIR" ]]; then
     TASKS_FILE="$SESSION_DIR/tasks.json"
     # Copy PRD to session as prd_snapshot if not already there
     if [[ -f "$PRD_FILE" && ! -f "$SESSION_DIR/prd_snapshot.md" ]]; then
-        cp "$PRD_FILE" "$SESSION_DIR/prd_snapshot.md"
+        write_resolved_prd "$SESSION_DIR/prd_snapshot.md"
     fi
     print -P "%F{cyan}[BUGFIX]%f Using session: $(basename "$SESSION_DIR")"
 
@@ -704,7 +802,7 @@ elif [[ -f "$PRD_FILE" ]]; then
             print -P "%F{cyan}[SESSION]%f No existing sessions found. Creating first session..."
             CURRENT_SESSION_NUM=1
             CURRENT_SESSION_DIR=$(create_session 1 "$(hash_prd_content "$PRD_FILE")")
-            cp "$PRD_FILE" "$CURRENT_SESSION_DIR/prd_snapshot.md"
+            write_resolved_prd "$CURRENT_SESSION_DIR/prd_snapshot.md"
             print -P "%F{green}[SESSION]%f Created: $(basename "$CURRENT_SESSION_DIR")"
             ;;
 
@@ -751,7 +849,7 @@ elif [[ -f "$PRD_FILE" ]]; then
                     print -P "%F{cyan}[SESSION]%f --accept-prd-changes: cancelling previously queued delta and refreshing baseline."
                     rm -f "$CURRENT_SESSION_DIR/.pending_delta_hash"
                 fi
-                cp "$PRD_FILE" "$CURRENT_SESSION_DIR/prd_snapshot.md"
+                write_resolved_prd "$CURRENT_SESSION_DIR/prd_snapshot.md"
                 print -P "%F{green}[SESSION]%f Baseline synced for $(basename "$CURRENT_SESSION_DIR"). Nothing to execute."
                 exit 0
             fi
@@ -765,7 +863,7 @@ elif [[ -f "$PRD_FILE" ]]; then
                     CURRENT_SESSION_NUM=$((CURRENT_SESSION_NUM + 1))
                     CURRENT_SESSION_DIR=$(create_session $CURRENT_SESSION_NUM "$CURRENT_HASH")
                     echo "$((CURRENT_SESSION_NUM - 1))" > "$CURRENT_SESSION_DIR/delta_from.txt"
-                    cp "$PRD_FILE" "$CURRENT_SESSION_DIR/prd_snapshot.md"
+                    write_resolved_prd "$CURRENT_SESSION_DIR/prd_snapshot.md"
                     print -P "%F{green}[SESSION]%f Created delta session: $(basename "$CURRENT_SESSION_DIR")"
                     CREATE_DELTA=true
                 fi
@@ -795,7 +893,7 @@ elif [[ -f "$PRD_FILE" ]]; then
                 print -P "%F{cyan}[SESSION]%f --accept-prd-changes: treating PRD edits as already-finished work; refreshing baseline (no delta)."
                 # Mirror interactive option 3: refresh snapshot so future runs see
                 # the current PRD as the baseline, then resume the existing session.
-                cp "$PRD_FILE" "$CURRENT_SESSION_DIR/prd_snapshot.md"
+                write_resolved_prd "$CURRENT_SESSION_DIR/prd_snapshot.md"
                 print -P "%F{green}[SESSION]%f Updated snapshot. Continuing with current tasks."
             else
             print -P "%F{yellow}[QUESTION]%f How would you like to proceed?"
@@ -830,7 +928,7 @@ elif [[ -f "$PRD_FILE" ]]; then
                 3)
                     print -P "%F{cyan}[SESSION]%f Acknowledging PRD change as non-impacting..."
                     # Update snapshot so future detection sees current PRD as baseline
-                    cp "$PRD_FILE" "$CURRENT_SESSION_DIR/prd_snapshot.md"
+                    write_resolved_prd "$CURRENT_SESSION_DIR/prd_snapshot.md"
                     print -P "%F{cyan}[SESSION]%f Updated snapshot. Continuing with current tasks."
                     ;;
                 *)
@@ -848,7 +946,7 @@ elif [[ -f "$PRD_FILE" ]]; then
                 # Drop any queued delta so it can't fire on a future run.
                 rm -f "$CURRENT_SESSION_DIR/.pending_delta_hash"
                 # Refresh the baseline so the next run is idempotent.
-                cp "$PRD_FILE" "$CURRENT_SESSION_DIR/prd_snapshot.md"
+                write_resolved_prd "$CURRENT_SESSION_DIR/prd_snapshot.md"
                 print -P "%F{green}[SESSION]%f Updated snapshot for $(basename "$CURRENT_SESSION_DIR"). Nothing to execute."
                 exit 0
             fi
@@ -858,7 +956,7 @@ elif [[ -f "$PRD_FILE" ]]; then
             CURRENT_SESSION_NUM=$((CURRENT_SESSION_NUM + 1))
             CURRENT_SESSION_DIR=$(create_session $CURRENT_SESSION_NUM "$(hash_prd_content "$PRD_FILE")")
             echo "$((CURRENT_SESSION_NUM - 1))" > "$CURRENT_SESSION_DIR/delta_from.txt"
-            cp "$PRD_FILE" "$CURRENT_SESSION_DIR/prd_snapshot.md"
+            write_resolved_prd "$CURRENT_SESSION_DIR/prd_snapshot.md"
 
             print -P "%F{green}[SESSION]%f Created delta session: $(basename "$CURRENT_SESSION_DIR")"
             CREATE_DELTA=true
@@ -903,7 +1001,7 @@ fi
 
 # Load file contents only if they exist (avoids errors during --bug-hunt mode)
 PRD_CONTENT=""
-[[ -f "$PRD_FILE" ]] && PRD_CONTENT=$(cat "$PRD_FILE")
+[[ -f "$PRD_FILE" ]] && PRD_CONTENT=$(resolve_prd_content "$PRD_FILE")
 TASKS_CONTENT=""
 [[ -f "$TASKS_FILE" ]] && TASKS_CONTENT=$(cat "$TASKS_FILE")
 
@@ -1122,6 +1220,15 @@ Documentation drift is the #1 cause of stale README/feature overviews. Every bre
 ULTRATHINK & PLAN
 
 1.  **ANALYZE** the attached or referenced PRD.
+
+    > **DISTRIBUTED PRDs:** The PRD may be authored across multiple files.
+    > Any line of the form \`@path/to/file.md\` is an include directive that the
+    > orchestrator has **already expanded inline** — the PRD text you receive is
+    > the COMPLETE, merged document. Do NOT chase includes yourself, and do NOT
+    > re-read the source files. If you see a *verbatim* \`@...\` line remaining
+    > in the text, that include failed to resolve (file missing) — record it in
+    > your architecture/ findings rather than guessing the content. The PRD
+    > STRUCTURE INDEX below indexes this merged document.
 2.  **RESEARCH (SPAWN & VALIDATE):**
     *   **Spawn** subagents to map the codebase and verify PRD feasibility.
     *   **Spawn** subagents to find external documentation for new tech.
@@ -1251,7 +1358,10 @@ You are creating a PRP (Product Requirement Prompt) for this specific work item.
 
 ## PRD Context
 
-The following PRD sections were selected as relevant during task breakdown:
+The following PRD sections were selected as relevant during task breakdown.
+These were extracted from the MERGED PRD (all \`@path\` includes already
+expanded by the orchestrator), so this is complete in itself — you do not need
+to read any other PRD files:
 <selected_prd_content>
 
 **PRD Selectors Used**: <prd_selectors>
@@ -1989,7 +2099,7 @@ Count the actual lines/words changed. Match your output complexity to input comp
 $(cat "$PREV_SESSION_DIR/prd_snapshot.md" 2>/dev/null)
 
 ## Current PRD:
-$(cat "$PRD_FILE" 2>/dev/null)
+$(resolve_prd_content "$PRD_FILE" 2>/dev/null)
 
 ## Previous Session's Completed Tasks:
 $(cat "$PREV_SESSION_DIR/tasks.json" 2>/dev/null)
@@ -2028,7 +2138,7 @@ to incorporate these changes without losing progress on work already completed.
 $(cat "$SESSION_DIR/prd_snapshot.md")
 
 ## Updated PRD (current):
-$(cat "$PRD_FILE")
+$(resolve_prd_content "$PRD_FILE")
 
 ## Current Tasks State:
 $(cat "$TASKS_FILE")
@@ -2122,7 +2232,7 @@ read -r -d '' VALIDATION_PROMPT <<EOF
 Analyze this codebase deeply, create a validation script, and report any issues found.
 
 **INPUTS:**
-- PRD: $(cat "$PRD_FILE" 2>/dev/null)
+- PRD: $(resolve_prd_content "$PRD_FILE" 2>/dev/null)
 - Tasks: $(cat "$TASKS_FILE" 2>/dev/null)
 
 ## Step 0: Discover Real User Workflows
@@ -2247,7 +2357,7 @@ You are a creative QA engineer and bug hunter. Your mission is to rigorously tes
 ## Inputs
 
 **Original PRD:**
-$(cat "$PRD_FILE" 2>/dev/null)
+$(resolve_prd_content "$PRD_FILE" 2>/dev/null)
 
 **Completed Tasks:**
 $(cat "$TASKS_FILE" 2>/dev/null)
@@ -3605,7 +3715,7 @@ if [[ "$INTEGRATE_CHANGES" == "true" && -f "$TASKS_FILE" ]]; then
     # Now that the task hierarchy reflects the new PRD, refresh prd_snapshot.md so future
     # runs treat the current PRD as the baseline (PRD-change detection hashes this file).
     # This is done AFTER integration so the agent had the original snapshot to diff against.
-    cp "$PRD_FILE" "$SESSION_DIR/prd_snapshot.md"
+    write_resolved_prd "$SESSION_DIR/prd_snapshot.md"
     git add "$SESSION_DIR/prd_snapshot.md" 2>/dev/null
     git commit -m "Refresh prd_snapshot after mid-session integration" &>/dev/null || true
 fi
@@ -4109,7 +4219,7 @@ if [[ "$SINGLE_SESSION" == "false" && -n "$SESSION_DIR" ]]; then
             NEW_SESSION_NUM=$((CURRENT_SESSION_NUM + 1))
             NEW_SESSION_DIR=$(create_session $NEW_SESSION_NUM "$CURRENT_HASH")
             echo "$CURRENT_SESSION_NUM" > "$NEW_SESSION_DIR/delta_from.txt"
-            cp "$PRD_FILE" "$NEW_SESSION_DIR/prd_snapshot.md"
+            write_resolved_prd "$NEW_SESSION_DIR/prd_snapshot.md"
 
             print -P "%F{green}[SESSION]%f Created delta session: $(basename "$NEW_SESSION_DIR")"
             print -P "%F{cyan}[SESSION]%f Re-running pipeline for delta session..."
