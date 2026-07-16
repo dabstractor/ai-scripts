@@ -950,16 +950,28 @@ elif [[ -f "$PRD_FILE" ]]; then
                 print -P "%F{green}[SESSION]%f Updated snapshot for $(basename "$CURRENT_SESSION_DIR"). Nothing to execute."
                 exit 0
             fi
-            print -P "%F{cyan}[SESSION]%f Creating delta session for changes..."
+            # --validate / --bug-hunt re-run the already-completed work. They
+            # must NOT fork an empty delta session here: a brand-new delta has
+            # no tasks.json, which makes the validate-only / bug-hunt-only gates
+            # bail with "Cannot validate without tasks". Reuse the latest
+            # completed session instead. The PRD change is intentionally left
+            # pending so the next normal run (no --validate) still processes it.
+            if [[ "$ONLY_VALIDATE" == "true" || "$ONLY_BUG_HUNT" == "true" ]]; then
+                print -P "%F{yellow}[SESSION]%f --validate/--bug-hunt: reusing completed session %F{green}$(basename "$CURRENT_SESSION_DIR")%f%F{yellow}."
+                print -P "%F{cyan}[INFO]%f PRD change noted but not actioned. Run without --validate to create the delta session."
+                SKIP_EXECUTION_LOOP=true
+            else
+                print -P "%F{cyan}[SESSION]%f Creating delta session for changes..."
 
-            PREV_SESSION_DIR="$CURRENT_SESSION_DIR"
-            CURRENT_SESSION_NUM=$((CURRENT_SESSION_NUM + 1))
-            CURRENT_SESSION_DIR=$(create_session $CURRENT_SESSION_NUM "$(hash_prd_content "$PRD_FILE")")
-            echo "$((CURRENT_SESSION_NUM - 1))" > "$CURRENT_SESSION_DIR/delta_from.txt"
-            write_resolved_prd "$CURRENT_SESSION_DIR/prd_snapshot.md"
+                PREV_SESSION_DIR="$CURRENT_SESSION_DIR"
+                CURRENT_SESSION_NUM=$((CURRENT_SESSION_NUM + 1))
+                CURRENT_SESSION_DIR=$(create_session $CURRENT_SESSION_NUM "$(hash_prd_content "$PRD_FILE")")
+                echo "$((CURRENT_SESSION_NUM - 1))" > "$CURRENT_SESSION_DIR/delta_from.txt"
+                write_resolved_prd "$CURRENT_SESSION_DIR/prd_snapshot.md"
 
-            print -P "%F{green}[SESSION]%f Created delta session: $(basename "$CURRENT_SESSION_DIR")"
-            CREATE_DELTA=true
+                print -P "%F{green}[SESSION]%f Created delta session: $(basename "$CURRENT_SESSION_DIR")"
+                CREATE_DELTA=true
+            fi
             ;;
     esac
 
