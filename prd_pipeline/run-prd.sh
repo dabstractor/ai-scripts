@@ -110,6 +110,13 @@ TARGET_SESSION="${TARGET_SESSION:-}"       # Manual session selection
 # work is already complete and validated, so you want the next run to stay
 # idempotent instead of spawning a delta. Refreshes prd_snapshot.md only.
 ACCEPT_PRD_CHANGES="${ACCEPT_PRD_CHANGES:-false}"
+# Adopt a synthesized PRD for an ALREADY-IMPLEMENTED legacy codebase. Creates a
+# baseline session, stubs a single completed task (no breakdown, no tokens
+# wasted on planning already-shipped code), then skips straight to validation +
+# bug hunting. Implementation loop is skipped. The next PRD.md edit produces a
+# normal delta session, so deltas can drive ongoing development. Escape hatch
+# for integrating run-prd.sh into existing projects after writing the PRD.
+ADOPT_PRD="${ADOPT_PRD:-false}"
 MANUAL_START=false
 
 while getopts "s:p:m:t:u:rv-:" opt; do
@@ -140,12 +147,13 @@ while getopts "s:p:m:t:u:rv-:" opt; do
         single-session) SINGLE_SESSION=true ;;
         no-auto-flow)   SINGLE_SESSION=true ;;
         accept-prd-changes) ACCEPT_PRD_CHANGES=true ;;
+        adopt-prd)        ADOPT_PRD=true ;;
         session)        TARGET_SESSION="${!OPTIND}"; OPTIND=$(( OPTIND + 1 )) ;;
         session=*)      TARGET_SESSION="${OPTARG#*=}" ;;
-        *) print "Usage: $0 [--scope=...] [--phase=N] [--milestone=N] [--task=N] [--subtask=N] [--parallel-research] [--validate] [--bug-hunt] [--skip-bug-finding] [--single-session] [--session=N] [--accept-prd-changes]"; exit 1 ;;
+        *) print "Usage: $0 [--scope=...] [--phase=N] [--milestone=N] [--task=N] [--subtask=N] [--parallel-research] [--validate] [--bug-hunt] [--skip-bug-finding] [--single-session] [--session=N] [--accept-prd-changes] [--adopt-prd]"; exit 1 ;;
       esac ;;
     *) print "Usage: $0 [-s phase|milestone|task|subtask] [-p N] [-m N] [-t N] [-u N] [-r] [-v]
-   Or: $0 [--scope=...] [--phase=N] [--milestone=N] [--task=N] [--subtask=N] [--parallel-research] [--validate] [--bug-hunt] [--skip-bug-finding] [--single-session] [--session=N] [--accept-prd-changes]"; exit 1 ;;
+   Or: $0 [--scope=...] [--phase=N] [--milestone=N] [--task=N] [--subtask=N] [--parallel-research] [--validate] [--bug-hunt] [--skip-bug-finding] [--single-session] [--session=N] [--accept-prd-changes] [--adopt-prd]"; exit 1 ;;
   esac
 done
 
@@ -272,21 +280,35 @@ PRP_AGENT_MCP_ARGS=""
 
 # --- PRD Include Resolution (@path expansion) ---
 #
-# A PRD may be split across multiple files. A line of the form
+# A PRD may be split across multiple files. An include directive is a token of
+# the form
 #
 #     @path/to/file.md
 #
-# (optional leading whitespace, nothing else on the line) is an *include
-# directive*: it is replaced inline by the contents of the referenced file.
+# and it is recognized INLINE — anywhere on the line, not only on a line by
+# itself. That matters because companion docs are most naturally listed inside
+# a markdown table cell, e.g.
+#
+#     | @ARCHITECTURE.md | Repository layout, module map, ... |
+#
+# There is exactly one reason to put "@" in front of a filename in markdown —
+# it marks an include — so we honor it wherever it appears. A token is expanded
+# (replaced by the referenced file's contents) when BOTH hold:
+#
+#   1. BOUNDARY: the "@" is at the start of the line or preceded by a character
+#      that is NOT a path character. This keeps "foo@bar.com" / emails and
+#      mid-word "@" from being mistaken for includes.
+#   2. EXISTENCE: the path resolves to an existing file. Existence is the real
+#      discriminator — prose "@mentions" simply don't resolve and pass through
+#      untouched, exactly as before.
+#
 # Includes are resolved PROJECT-ROOT-RELATIVE — i.e. relative to the directory
 # of the entry PRD file, regardless of which file contains the directive — and
 # expanded recursively with cycle detection (PRD_INCLUDE_MAX_DEPTH, default 10).
 #
-# A line is only treated as an include if the referenced path exists as a
-# file; otherwise it is passed through verbatim (so prose @mentions and
-# example @syntax stay literal). This makes resolution IDEMPOTENT: re-resolving
-# already-resolved content yields the same bytes, which is what guarantees
-# hash/snapshot consistency below.
+# This makes resolution IDEMPOTENT: after expansion the "@<path>" token is
+# gone, so re-resolving already-resolved content yields the same bytes, which
+# is what guarantees hash/snapshot consistency below.
 #
 # Env vars:
 #   PRD_INCLUDE_MAX_DEPTH  Max include nesting (default 10)
@@ -317,38 +339,95 @@ resolve_prd_content() {
         return 0
     fi
 
-    # Fast path: no sole-line @-include present — stream the file unchanged.
-    # Keeps hashing tasks.json / already-resolved snapshots at cat speed.
-    if ! grep -Eq '^[[:space:]]*@[^[:space:]]+' "$file_path"; then
+    # Fast path: scan for ANY @<path> token. Tokens may appear on their own
+    # line OR inline (inside a markdown table cell, mid-sentence, etc.) — see
+    # expand_inline_includes. If there isn't a single candidate token, stream
+    # the file unchanged at cat speed (keeps hashing snapshots cheap).
+    if ! grep -Eq '@[A-Za-z0-9._~/-]+' "$file_path"; then
         cat "$file_path"
         return
     fi
 
     _PRD_INCLUDE_STACK[$abs_path]=1
-    local line trimmed include_path
+    local line
     while IFS= read -r line || [[ -n "$line" ]]; do
-        trimmed="${line#"${line%%[![:space:]]*}"}"   # strip leading whitespace
-        trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"  # strip trailing whitespace
-        if [[ -n "$trimmed" && "$trimmed" == @* ]]; then
-            include_path="${trimmed:1}"
+        # Expand every resolvable @<path> token on this line (inline-aware).
+        # Lines with no token — or tokens that don't resolve to a file — are
+        # emitted verbatim.
+        expand_inline_includes "$line" "$root" "$file_path" $(( depth + 1 ))
+    done < "$file_path"
+    unset "_PRD_INCLUDE_STACK[$abs_path]"
+}
+
+# Expand every inline @<path> include token on a single line.
+#
+# WHY INLINE: a PRD often lists companion docs as `| @ARCHITECTURE.md | desc |`
+# inside a markdown table, or references them in prose. There is only one
+# reason to put "@" at the start of a filename in markdown — it's an include
+# marker — so we honor it wherever it appears, not just on a line by itself.
+#
+# A token is treated as an include when BOTH hold:
+#   1. BOUNDARY: the "@" is at the start of the line or preceded by a character
+#      that is NOT a path character. This protects "foo@bar.com" / emails and
+#      mid-word "@" from being mistaken for includes.
+#   2. EXISTENCE: the path resolves to an existing file (project-root-relative
+#      unless absolute, ~/..., or $VAR). Existence is the real discriminator:
+#      prose "@mentions" simply don't resolve and pass through untouched.
+#
+# Idempotency is preserved: after expansion the "@<path>" token is gone, so
+# re-resolving produces identical bytes (nothing left to re-match).
+#
+# Unresolvable tokens are left literal. A token that looks like a document
+# (ends in .md/.markdown/.txt/...) AND fails to resolve earns a stderr warning
+# — a likely-stale include — but ordinary @mentions stay silent.
+#
+# Usage: expand_inline_includes <line> <root> <source_file> <depth>
+expand_inline_includes() {
+    local line="$1" root="$2" src="$3" depth="$4"
+    local result="" tok include_path before_at
+    local mbegin mend
+    # Match "@" + a run of path chars; capture just the path. The boundary is
+    # checked manually from the preceding char so we never clobber the match
+    # offsets ($MBEGIN/$MEND) with a second regex test.
+    while [[ "$line" =~ @([A-Za-z0-9._~/-]+) ]]; do
+        tok="${match[1]}"
+        mbegin=$MBEGIN
+        mend=$MEND
+        # Everything before the '@' is kept as-is.
+        result+="${line[1,mbegin-1]}"
+        before_at=""
+        (( mbegin > 1 )) && before_at="${line[mbegin-1,mbegin-1]}"
+
+        # Boundary: preceding char (if any) must NOT be a path character.
+        # `==` with a char-class pattern does pattern matching WITHOUT touching
+        # $match/$MBEGIN (only `=~` sets those), so offsets stay intact.
+        if [[ -n "$before_at" ]] && [[ "$before_at" == [A-Za-z0-9._~/-] ]]; then
+            # Mid-token '@' (email "foo@bar.com", "user@host") → keep literal.
+            result+="@$tok"
+        else
+            include_path="$tok"
             include_path="${include_path/#\~/$HOME}"
             # Project-root-relative unless absolute or $env-style.
             if [[ "$include_path" != /* && "$include_path" != \$* ]]; then
                 include_path="$root/$include_path"
             fi
             if [[ -f "$include_path" ]]; then
-                [[ -n "$PRD_INCLUDE_MARKERS" ]] && print -r -- "<!-- @include: ${trimmed:1} -->"
-                resolve_prd_content "$include_path" $((depth + 1)) "$root"
-                [[ -n "$PRD_INCLUDE_MARKERS" ]] && print -r -- "<!-- @end-include: ${trimmed:1} -->"
+                [[ -n "$PRD_INCLUDE_MARKERS" ]] && result+="<!-- @include: $tok -->"
+                result+="$(resolve_prd_content "$include_path" "$depth" "$root")"
+                [[ -n "$PRD_INCLUDE_MARKERS" ]] && result+="<!-- @end-include: $tok -->"
             else
-                print -u2 -P "%F{yellow}[PRD INCLUDE]%f File not found: @${trimmed:1} (referenced in $file_path) — leaving line verbatim"
-                print -r -- "$line"
+                # Not a file → leave the token literal.
+                result+="@$tok"
+                # Warn only when it really looks like an intended include.
+                [[ "$tok" =~ \.(md|markdown|mdown|mkdn|txt|adoc|rst|org)$ ]] && \
+                    print -u2 -P "%F{yellow}[PRD INCLUDE]%f File not found: @$tok (in $src) — left verbatim"
             fi
-        else
-            print -r -- "$line"
         fi
-    done < "$file_path"
-    unset "_PRD_INCLUDE_STACK[$abs_path]"
+        # Continue scanning after this token.
+        line="${line[mend+1,-1]}"
+    done
+    result+="$line"
+    print -r -- "$result"
 }
 
 # Materialize the fully-resolved PRD (all @path includes expanded) to <dest>.
@@ -485,6 +564,10 @@ create_session() {
         exit 1
     fi
 
+    # Materialize PLAN_DIR itself first so the session path is always nested
+    # under it (e.g. ./plan/001_<hash>) and never collapses to a filesystem-root
+    # path if PLAN_DIR/SESSION_DIR were somehow empty upstream.
+    mkdir -p "$PLAN_DIR"
     mkdir -p "$session_dir/architecture"
     echo "$session_dir"
 }
@@ -720,6 +803,18 @@ check_staged_prd_changes
 # --- Session State Resolution ---
 # Must happen before bug hunt auto-detect so paths are correct
 
+# --adopt-prd declares an existing PRD the source of truth for an
+# already-implemented codebase, so it REQUIRES that PRD to exist. Without this
+# check, a missing PRD_FILE skips session resolution entirely, leaves
+# SESSION_DIR empty, and the breakdown phase then writes to filesystem-root
+# paths like "/architecture" and "/prd_snapshot.md".
+if [[ "$ADOPT_PRD" == "true" && ! -f "$PRD_FILE" ]]; then
+    print -P "%F{red}[ERROR]%f --adopt-prd requires a PRD at '$PRD_FILE', but it was not found."
+    print -P "%F{cyan}[ADOPT]%f Synthesize a PRD describing the existing codebase first, then re-run"
+    print -P "%F{cyan}[ADOPT]%f 'prd --adopt-prd' from the directory containing $PRD_FILE."
+    exit 1
+fi
+
 # Initialize session variables
 SESSION_STATE=""
 CURRENT_SESSION_DIR=""
@@ -729,6 +824,7 @@ INTEGRATE_CHANGES=false
 QUEUE_DELTA=false
 CREATE_DELTA=false
 SKIP_EXECUTION_LOOP=false
+ADOPT_BASELINE=false  # Set when --adopt-prd creates a baseline for an already-implemented codebase
 
 # Bug fix mode: PLAN_DIR is already the session, use it directly
 # This happens during recursive calls for bug fixes
@@ -803,7 +899,18 @@ elif [[ -f "$PRD_FILE" ]]; then
             CURRENT_SESSION_NUM=1
             CURRENT_SESSION_DIR=$(create_session 1 "$(hash_prd_content "$PRD_FILE")")
             write_resolved_prd "$CURRENT_SESSION_DIR/prd_snapshot.md"
-            print -P "%F{green}[SESSION]%f Created: $(basename "$CURRENT_SESSION_DIR")"
+            if [[ "$ADOPT_PRD" == "true" ]]; then
+                ADOPT_BASELINE=true
+                date -Iseconds > "$CURRENT_SESSION_DIR/.adopted"
+                print -P "%F{green}[SESSION]%f Created baseline session: $(basename "$CURRENT_SESSION_DIR")"
+                print -P "%F{magenta}[ADOPT]%f --adopt-prd: declaring PRD.md as the source of truth for an"
+                print -P "%F{magenta}[ADOPT]%f already-implemented codebase."
+                print -P "%F{cyan}[ADOPT]%f Plan: stub a single completed baseline task (no breakdown),"
+                print -P "%F{cyan}[ADOPT]%f then run validation + bug hunt. Implementation is skipped;"
+                print -P "%F{cyan}[ADOPT]%f future PRD.md edits will produce normal delta sessions."
+            else
+                print -P "%F{green}[SESSION]%f Created: $(basename "$CURRENT_SESSION_DIR")"
+            fi
             ;;
 
         CURRENT_MATCH_INCOMPLETE)
@@ -974,6 +1081,14 @@ elif [[ -f "$PRD_FILE" ]]; then
             fi
             ;;
     esac
+
+    # --adopt-prd only applies to fresh projects (NO_SESSIONS). If sessions
+    # already exist, the project is already integrated, so the flag is a no-op
+    # misuse — warn and proceed with normal session resolution.
+    if [[ "$ADOPT_PRD" == "true" && "$ADOPT_BASELINE" != "true" ]]; then
+        print -P "%F{yellow}[ADOPT]%f --adopt-prd ignored: existing sessions found in '$PLAN_DIR'."
+        print -P "%F{cyan}[ADOPT]%f --adopt-prd only applies to legacy projects with no plan/ dir yet."
+    fi
 
     # Update path variables to use session directory
     SESSION_DIR="$CURRENT_SESSION_DIR"
@@ -3732,6 +3847,80 @@ if [[ "$INTEGRATE_CHANGES" == "true" && -f "$TASKS_FILE" ]]; then
     git commit -m "Refresh prd_snapshot after mid-session integration" &>/dev/null || true
 fi
 
+# HARD GUARD: never let an empty SESSION_DIR reach the breakdown/validation
+# phases. If SESSION_DIR is empty, every "$SESSION_DIR/..." path collapses to a
+# filesystem-root path ("/architecture", "/prd_snapshot.md", "/tasks.json") and
+# the agent gets a --session-id built from "$(basename "")" (rejected as empty).
+# This happens when PRD_FILE is missing so the session-resolution block above is
+# skipped entirely. Fail loudly here instead of scribbling near the drive root.
+# (Bugfix mode sets SESSION_DIR=PLAN_DIR; --bug-hunt/--validate without a session
+# exit on their own PRD/tasks checks before reaching here.)
+if [[ -z "$SESSION_DIR" ]]; then
+    print -P "%F{red}[ERROR]%f No session directory resolved (SESSION_DIR is empty)."
+    print -P "%F{cyan}[INFO]%f This usually means $PRD_FILE was not found in $(pwd)."
+    print -P "%F{cyan}[INFO]%f Run from the project root containing $PRD_FILE, or set PRD_FILE."
+    exit 1
+fi
+
+# --- Adopt mode: seed a one-subtask baseline tasks.json and SKIP breakdown ---
+# The codebase is declared already-implemented, so a real breakdown would be
+# both phoney and a waste of tokens. We write a single completed subtask
+# ("Adopt existing codebase") so is_session_complete is true (making this
+# session the idempotent baseline future deltas diff against) and the impl loop
+# is a no-op. Validation + bug hunt still run against the real codebase + PRD.
+# Writing the file before the breakdown check below short-circuits it.
+if [[ "$ADOPT_BASELINE" == "true" && ! -f "$TASKS_FILE" ]]; then
+    print -P "%F{magenta}[ADOPT]%f Seeding baseline tasks.json (no breakdown) — codebase declared already-implemented..."
+    cat > "$TASKS_FILE" <<'JSON'
+{
+  "backlog": [
+    {
+      "type": "Phase",
+      "id": "P1",
+      "title": "Adopted Baseline",
+      "status": "Complete",
+      "description": "Legacy codebase adopted as the already-implemented baseline matching the PRD. Seeded by --adopt-prd; subsequent PRD edits produce delta sessions.",
+      "milestones": [
+        {
+          "type": "Milestone",
+          "id": "P1.M1",
+          "title": "Legacy Adoption",
+          "status": "Complete",
+          "tasks": [
+            {
+              "type": "Task",
+              "id": "P1.M1.T1",
+              "title": "Adopt existing codebase",
+              "status": "Complete",
+              "subtasks": [
+                {
+                  "type": "Subtask",
+                  "id": "P1.M1.T1.S1",
+                  "title": "Adopt existing codebase as implemented baseline",
+                  "status": "Complete",
+                  "story_points": 1,
+                  "dependencies": [],
+                  "context_scope": "Adopt mode: the existing implementation is declared the source of truth for the PRD. No implementation work is performed; validation and bug hunting drive from here."
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+JSON
+    if ! jq empty "$TASKS_FILE" 2>/dev/null; then
+        print -P "%F{red}[ERROR]%f Failed to write a valid baseline tasks.json to $TASKS_FILE."
+        exit 1
+    fi
+    git add "$TASKS_FILE" "$SESSION_DIR" 2>/dev/null
+    git commit -m "Adopt baseline: stub completed tasks.json (PRD already implemented)" &>/dev/null || true
+    SKIP_EXECUTION_LOOP=true
+    print -P "%F{green}[ADOPT]%f Baseline established. Proceeding to validation + bug hunt."
+fi
+
 # A. Task Breakdown (Only run if tasks.json is missing)
 if [[ ! -f "$TASKS_FILE" ]]; then
     print -P "%F{magenta}[PHASE 0]%f Generating breakdown..."
@@ -3818,6 +4007,9 @@ if [[ "$total_phases" -eq 0 ]]; then
 fi
 
 # Outer loop: Always iterate through phases
+if [[ "$SKIP_EXECUTION_LOOP" == "true" ]]; then
+    print -P "%F{cyan}[SESSION]%f Skipping implementation loop (baseline/validation path)."
+else
 for (( phase_idx=0; phase_idx<$total_phases; phase_idx++ )); do
     # Get actual phase ID from JSON (e.g., "P5" -> 5), not array index
     PHASE_ID=$(jq -r ".backlog[$phase_idx].id // empty" "$TASKS_FILE")
@@ -3914,6 +4106,7 @@ ID=$(generate_id $PHASE_NUM $MS_NUM $TASK_NUM $SUBTASK_NUM)
         done
     done
 done
+fi  # end SKIP_EXECUTION_LOOP guard
 
 else
     # Validation Only Mode
