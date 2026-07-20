@@ -632,6 +632,14 @@ VALIDATION_TIMEOUT="${VALIDATION_TIMEOUT:-7200}"
 # When an agent returns "result": "issue", we retry with feedback up to this many times
 ISSUE_RETRY_MAX="${ISSUE_RETRY_MAX:-3}"
 
+# Commit (stagecoach) retry configuration. stagecoach emits exit 124 on its OWN
+# generation timeout (transient LLM-API slowness on a one-shot commit-message
+# call) — the OPPOSITE of the agent-subprocess-hang case, so it SHOULD be retried.
+# See run_commit_with_retry. COMMIT_RETRY_DELAY is the first backoff (seconds);
+# it doubles per attempt, capped at 120s.
+COMMIT_RETRY_MAX="${COMMIT_RETRY_MAX:-5}"
+COMMIT_RETRY_DELAY="${COMMIT_RETRY_DELAY:-10}"
+
 # --- PRD Selector Functions (mdsel integration) ---
 
 # Check if mdsel is available (either as command or via node)
@@ -3858,6 +3866,61 @@ restore_critical_files() {
     done
 }
 
+# Bounded retry for stagecoach commits. DELIBERATELY separate from run_with_retry,
+# whose exit-124 special-case is correct for the IMPLEMENTATION/PRP agents (a 124
+# there means a hung subprocess — headless editor / test runner — that would just
+# re-hang) but WRONG for stagecoach.
+#
+# stagecoach's 124 is its OWN generation-timeout exit code (see its
+# internal/provider/executor.go: "timeout ⇒ err IS context.DeadlineExceeded
+# (orchestrator: exit 124 + rescue)", default 120s via --timeout /
+# STAGECOACH_TIMEOUT / [defaults].timeout). For a one-shot commit-message call
+# that is TRANSIENT LLM-API slowness, not a stuck subprocess:
+#   - the index is untouched on a stagecoach timeout (it builds a recovery tree
+#     object but never resets the staging area — the "git commit-tree …" hint it
+#     prints runs against the still-staged files),
+#   - its lock is released on the rescue exit (OnRescueExit: lock.ReleaseCurrent),
+# so retrying is safe and very likely to succeed.
+#
+# Bounded (COMMIT_RETRY_MAX) with exponential backoff so a genuinely-down API
+# can't stall the pipeline forever. On exhaustion we fall back to a plain
+# `git commit` so a completed item's changes are never stranded uncommitted —
+# the same orphan risk the [RECOVERY] path in execute_item guards against.
+run_commit_with_retry() {
+    local n=1
+    local delay=$COMMIT_RETRY_DELAY
+    local rc
+    while true; do
+        [[ "$SHUTDOWN_REQUESTED" == "true" ]] && return 130
+        stagecoach "$@"
+        rc=$?
+        [[ $rc -eq 0 ]] && return 0
+        [[ "$SHUTDOWN_REQUESTED" == "true" ]] && return 130
+
+        if (( n >= COMMIT_RETRY_MAX )); then
+            print -P "%F{red}[GIT]%f stagecoach failed after $n attempt(s) (last exit $rc)."
+            # Last resort: preserve the staged work with a clearly-labeled commit so
+            # the pipeline never orphans a completed item. Amend/reword later.
+            if git diff --staged --quiet 2>/dev/null; then
+                print -P "%F{yellow}[GIT]%f Nothing staged after stagecoach failure; leaving index as-is."
+                return $rc
+            fi
+            if git commit -m "chore: stagecoach commit-gen failed (exit $rc); fallback commit" &>/dev/null; then
+                print -P "%F{yellow}[GIT]%f Fallback commit created (reword later). Original stagecoach exit: $rc"
+                return 0
+            fi
+            print -P "%F{red}[GIT]%f Fallback commit also failed. Staged changes remain in the index."
+            return $rc
+        fi
+
+        print -P "%F{yellow}[GIT]%f stagecoach failed (exit $rc, attempt $n/$COMMIT_RETRY_MAX). Retrying in ${delay}s..."
+        sleep $delay
+        delay=$(( delay * 2 ))
+        (( delay > 120 )) && delay=120
+        ((n++))
+    done
+}
+
 # Protects tasks.json and the plan directory from AI "cleanup"
 smart_commit() {
     print -P "%F{blue}[GIT]%f Staging changes..."
@@ -3902,7 +3965,7 @@ smart_commit() {
     if git diff --staged --quiet; then
         print -P "%F{yellow}[GIT]%f No staged changes to commit."
     else
-        run_with_retry stagecoach
+        run_commit_with_retry
     fi
 }
 
