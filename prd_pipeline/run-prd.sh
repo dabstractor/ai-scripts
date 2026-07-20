@@ -190,6 +190,17 @@ PLAN_DIR="${PLAN_DIR:-plan}"
 CURRENT_PROCESSING_ID=""  # Set by execute_item for smart_commit protection
 CURRENT_PROCESSING_STATUS=""  # The status to apply to current item after restore (Complete/Failed)
 
+# Consecutive non-implementation streak tracker. When the execution loop hits
+# several items in a row that it CANNOT implement (issue / failure / dep-blocked),
+# that is almost always a SYSTEMATIC blocker (broken build, missing dependency,
+# an unpushed git tag, contradictory requirements) that will fail every
+# downstream item too. Rather than silently walking past whole sections of work
+# — implementing unrelated items and even docs on top of the hole — we HALT the
+# run loudly so the root cause can be fixed. See handle_item_result /
+# run_item_and_check below, and check_dependencies_satisfied.
+ISSUE_STREAK=0
+ISSUE_STREAK_MAX="${ISSUE_STREAK_MAX:-3}"
+
 # Robust tasks.json restoration that re-applies all legitimate status changes
 # This is CRITICAL - agents often corrupt tasks.json despite being forbidden
 # Usage: restore_tasks_json [status_for_current_item]
@@ -3244,6 +3255,115 @@ get_next_item() {
     return 1
 }
 
+# Dependency gate for execute_item. Returns 0 (true) if the item has no
+# dependencies, or if every declared dependency is Complete; returns 1 (false)
+# if any dependency is not yet Complete. This prevents implementing a CONSUMER
+# before its PRODUCERS — the failure mode where docs/UI ship on top of skipped
+# sections (a tray calling host_capable() that was never defined; documentation
+# for CLI flags that don't exist yet). execute_item signals "blocked" via rc 3,
+# which handle_item_result counts toward the halt streak (a run that keeps
+# hitting blocked items is failing to make progress for one systematic reason).
+# Usage: check_dependencies_satisfied <id>
+check_dependencies_satisfied() {
+    local id=$1
+    local deps
+    deps=$(jq -r --arg iid "$id" '.. | objects | select(.id? == $iid) | (.dependencies // [])[]' "$TASKS_FILE" 2>/dev/null)
+    [[ -z "$deps" ]] && return 0   # no declared deps → nothing to gate on
+
+    local unsatisfied=""
+    local dep dep_status
+    for dep in ${(f)deps}; do
+        [[ -z "$dep" ]] && continue
+        dep_status=$(jq -r --arg did "$dep" '.. | objects | select(.id? == $did) | .status // empty' "$TASKS_FILE" 2>/dev/null | head -1)
+        if [[ "$dep_status" != "Complete" && "$dep_status" != "Completed" ]]; then
+            unsatisfied+="${unsatisfied:+ }$dep=${dep_status:-missing}"
+        fi
+    done
+
+    if [[ -n "$unsatisfied" ]]; then
+        print -P "%F{yellow}[DEPS]%f Not implementing $id — dependencies not yet Complete: $unsatisfied"
+        print -P "%F{cyan}[DEPS]%f Leaving it un-implemented; it will be retried once its producers land."
+        return 1
+    fi
+    return 0
+}
+
+# Track consecutive items the loop could NOT implement and HALT when a streak
+# indicates a systematic blocker. execute_item returns:
+#   0   = success / already-complete skip  → reset streak
+#   1   = failure (marked Failed)          → increment streak
+#   2   = issue-retry (reset to Planned)   → increment streak
+#   3   = dependency-blocked               → increment streak
+#   130 = interrupted                       → leave streak; shutdown path owns exit
+# Returns 0 to continue the loop, 1 to abort the whole run.
+# Usage: handle_item_result <return_code> <item_id>
+handle_item_result() {
+    local rc=$1
+    local id=$2
+
+    case $rc in
+        0)
+            ISSUE_STREAK=0
+            return 0
+            ;;
+        130)
+            # Interrupted: don't perturb the streak; the shutdown path owns exit.
+            return 0
+            ;;
+        1|2|3)
+            ISSUE_STREAK=$((ISSUE_STREAK + 1))
+            local kind="non-implementation"
+            case $rc in
+                1) kind="failure" ;;
+                2) kind="issue" ;;
+                3) kind="dependency-blocked" ;;
+            esac
+            print -P "%F{yellow}[STREAK]%f Consecutive $kind: $ISSUE_STREAK/$ISSUE_STREAK_MAX (last: $id)"
+            ;;
+        *)
+            # Unexpected code — treat conservatively as non-progress.
+            ISSUE_STREAK=$((ISSUE_STREAK + 1))
+            print -P "%F{yellow}[STREAK]%f Unexpected execute_item rc=$rc for $id; streak $ISSUE_STREAK/$ISSUE_STREAK_MAX"
+            ;;
+    esac
+
+    if (( ISSUE_STREAK >= ISSUE_STREAK_MAX )); then
+        print -P ""
+        print -P "%F{red}%B[HALT]%b%f %B$ISSUE_STREAK consecutive items could not be implemented.%b"
+        print -P "%F{red}[HALT]%f This almost always signals a SYSTEMATIC blocker — a broken build, a missing"
+        print -P "%F{red}[HALT]%f dependency, an unpushed git tag, or contradictory requirements — that will fail"
+        print -P "%F{red}[HALT]%f every downstream item too. Implementation is the core purpose of this pipeline;"
+        print -P "%F{red}[HALT]%f silently walking past it (and building docs/UI on top of the hole) is a critical"
+        print -P "%F{red}[HALT]%f failure. Aborting so the root cause can be fixed. Last attempted item: $id"
+        print -P ""
+        print -P "%F{cyan}[HALT]%f Inspect the affected task dirs under: $SESSION_DIR/"
+        print -P "%F{cyan}[HALT]%f   - issue_feedback.md / .issue_retry_count  → agent's explanation of the blocker"
+        print -P "%F{cyan}[HALT]%f   - research/  → what was gathered before the attempt"
+        print -P "%F{cyan}[HALT]%f Fix the root cause (e.g. make the build green), then re-run. Blocked/issued items"
+        print -P "%F{cyan}[HALT]%f are left as Planned and will be retried from where they stopped."
+        return 1
+    fi
+    return 0
+}
+
+# Execute one work item and enforce the non-implementation halt streak.
+# Wraps execute_item so the four scope loops don't each repeat the return-code /
+# streak logic. On a detected systematic blocker it stops background research,
+# persists current state, and exits the whole run (exit propagates out of the
+# loops and out of recursive bugfix children).
+# Usage: run_item_and_check <id> <dirname> <phase> <ms> <task> <subtask>
+run_item_and_check() {
+    execute_item "$@"
+    local rc=$?
+    if ! handle_item_result "$rc" "$1"; then
+        [[ -n "$RESEARCH_PID" ]] && kill -TERM "$RESEARCH_PID" 2>/dev/null
+        print -P "%F{blue}[GIT]%f Persisting current state before halt..."
+        smart_commit
+        exit 1
+    fi
+    return 0
+}
+
 # Execute a single work item (phase/milestone/task/subtask)
 # Usage: execute_item <id> <dirname> <phase_num> <ms_num> <task_num> <subtask_num>
 execute_item() {
@@ -3276,6 +3396,13 @@ execute_item() {
         fi
         print -P "\n%F{green}[SKIP]%f $id is already %F{green}Completed%f. Skipping..."
         return 0
+    fi
+
+    # Dependency gate: never implement a consumer before its producers.
+    # (See check_dependencies_satisfied for rationale.) rc 3 propagates to
+    # handle_item_result, which counts it toward the halt streak.
+    if ! check_dependencies_satisfied "$id"; then
+        return 3
     fi
 
     print -P "\n%B%F{green}>>> EXECUTING $id%f%b %F{cyan}(current status: $current_status)%f%b"
@@ -3395,9 +3522,16 @@ $issue_feedback
         # Clear output file for new attempt
         : > "$agent_output_file"
 
+        # Implementation runs UNDER A SESSION (prd-impl-<dirname>) so a hang or
+        # crash is recoverable: `pi --resume prd-impl-<dirname>` picks up exactly
+        # where it stopped. Implementation is the single most important call to
+        # keep a session for — it is long-running, it is the core purpose of the
+        # pipeline, and it is the call most likely to spawn subprocesses (test
+        # runners, headless editors) that can hang. Previously --no-session made
+        # these invisible in session history and un-resumable.
         # Use pipefail to get the agent's exit status, not tee's
         setopt pipefail
-        $IMPL_AGENT --no-session -p "$PRP_EXECUTE_PROMPT Execute the PRP for $(get_scope_name) $id. The PRP file is located at: $dirname/PRP.md. READ IT NOW." < /dev/null 2>&1 | tee "$agent_output_file"
+        $IMPL_AGENT --session-id "prd-impl-$(basename "$dirname")" -p "$PRP_EXECUTE_PROMPT Execute the PRP for $(get_scope_name) $id. The PRP file is located at: $dirname/PRP.md. READ IT NOW." < /dev/null 2>&1 | tee "$agent_output_file"
         agent_exit_status=$?
         unsetopt pipefail
 
@@ -3412,6 +3546,29 @@ $issue_feedback
             restore_tasks_json "Implementing"
             rm -f "$agent_output_file"
             return 130
+        fi
+
+        # Watchdog timeout (exit 124): the agent was stuck — almost always on a
+        # subprocess it spawned (a headless editor / test runner that never
+        # returned). The watchdog can only signal the DIRECT agent process (see
+        # _agent_watchdog in functions.zsh), so that stuck subprocess likely lives
+        # on as an ORPHAN and must be killed by hand. Retrying immediately would
+        # just re-hang on the same subprocess, so do NOT retry. The session is
+        # resumable and partial work is in the tree; mark Failed so it isn't
+        # auto-retried into the same hang, and return 1 so the streak counter can
+        # halt the run if several items time out in a row.
+        if [[ $agent_exit_status -eq 124 ]]; then
+            print -P "%F{red}[TIMEOUT]%f Implementation agent killed by watchdog (exit 124) for $id."
+            print -P "%F{red}[TIMEOUT]%f Almost always means it hung on a spawned subprocess (headless editor / test"
+            print -P "%F{red}[TIMEOUT]%f runner) that never returned. The watchdog only reaps the direct agent process, so"
+            print -P "%F{red}[TIMEOUT]%f that subprocess may STILL BE RUNNING AS AN ORPHAN — find & kill it (e.g. pkill -f nvim)."
+            print -P "%F{cyan}[TIMEOUT]%f Resume the stuck session to inspect/recover:  pi --resume prd-impl-$(basename "$dirname")"
+            print -P "%F{cyan}[TIMEOUT]%f Partial work is preserved in the working tree. Marking $id Failed (not auto-retried);"
+            print -P "%F{cyan}[TIMEOUT]%f after fixing the root cause, retry via:  tsk -f \"$TASKS_FILE\" next-failed --retry"
+            CURRENT_PROCESSING_STATUS="Failed"
+            restore_tasks_json "Failed"
+            rm -f "$agent_output_file"
+            return 1
         fi
 
         # Check if this is a transient error vs actual agent failure
@@ -4026,7 +4183,7 @@ for (( phase_idx=0; phase_idx<$total_phases; phase_idx++ )); do
     if [[ $SCOPE == "phase" ]]; then
         ID=$(generate_id $PHASE_NUM 1 1 1)
         DIRNAME="$SESSION_DIR/$(generate_dirname $PHASE_NUM 1 1 1)"
-        execute_item "$ID" "$DIRNAME" $PHASE_NUM 1 1 1
+        run_item_and_check "$ID" "$DIRNAME" $PHASE_NUM 1 1 1
         continue
     fi
 
@@ -4051,7 +4208,7 @@ for (( phase_idx=0; phase_idx<$total_phases; phase_idx++ )); do
         if [[ $SCOPE == "milestone" ]]; then
             ID=$(generate_id $PHASE_NUM $MS_NUM 1 1)
             DIRNAME="$SESSION_DIR/$(generate_dirname $PHASE_NUM $MS_NUM 1 1)"
-            execute_item "$ID" "$DIRNAME" $PHASE_NUM $MS_NUM 1 1
+            run_item_and_check "$ID" "$DIRNAME" $PHASE_NUM $MS_NUM 1 1
             continue
         fi
 
@@ -4077,7 +4234,7 @@ for (( phase_idx=0; phase_idx<$total_phases; phase_idx++ )); do
             if [[ $SCOPE == "task" ]]; then
                 ID=$(generate_id $PHASE_NUM $MS_NUM $TASK_NUM 1)
                 DIRNAME="$SESSION_DIR/$(generate_dirname $PHASE_NUM $MS_NUM $TASK_NUM 1)"
-                execute_item "$ID" "$DIRNAME" $PHASE_NUM $MS_NUM $TASK_NUM 1
+                run_item_and_check "$ID" "$DIRNAME" $PHASE_NUM $MS_NUM $TASK_NUM 1
                 continue
             fi
 
@@ -4101,7 +4258,7 @@ for (( phase_idx=0; phase_idx<$total_phases; phase_idx++ )); do
 
 ID=$(generate_id $PHASE_NUM $MS_NUM $TASK_NUM $SUBTASK_NUM)
                 DIRNAME="$SESSION_DIR/$(generate_dirname $PHASE_NUM $MS_NUM $TASK_NUM $SUBTASK_NUM)"
-                execute_item "$ID" "$DIRNAME" $PHASE_NUM $MS_NUM $TASK_NUM $SUBTASK_NUM
+                run_item_and_check "$ID" "$DIRNAME" $PHASE_NUM $MS_NUM $TASK_NUM $SUBTASK_NUM
             done
         done
     done
@@ -4202,12 +4359,15 @@ run_with_retry $AGENT --no-session -p "Delete the validation artifacts: remove .
 # Manual deletion as backup (in case agent didn't delete them)
 rm -f "./validate.sh" "./validation_report.md" 2>/dev/null
 
-# Mark final task as complete before committing
-print -P "%F{blue}[STATUS]%f Marking final task as complete..."
-FINAL_TASK=$(tsk -f "$TASKS_FILE" -s "$SCOPE" next 2>/dev/null)
-if [[ -n "$FINAL_TASK" ]]; then
-    run_with_retry tsk_cmd update "$FINAL_TASK" Complete
-fi
+# NOTE: We deliberately do NOT auto-mark any task Complete here.
+# Previously this block ran `tsk next` (which returns the FIRST actionable
+# item, not the last) and blindly marked it Complete — without verifying it was
+# implemented. When the execution loop was interrupted, incomplete, or had
+# skipped items (e.g. a broken-build blocker made items report "issue"), this
+# marked unimplemented work as done and PERMANENTLY orphaned it: future runs
+# skip "Complete" items, so the implementation was never recovered. Completion
+# is the SOLE responsibility of execute_item, which only marks Complete after
+# verifying real source/PRP changes. Do not re-add blind completion here.
 
 # Final smart commit after validation
 print -P "%F{blue}[GIT]%f Committing final changes with smart commit..."
