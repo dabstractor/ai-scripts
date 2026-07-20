@@ -1469,6 +1469,14 @@ You write ONLY to \`$TASKS_FILE\` and \`$SESSION_DIR/architecture/\`.
 Nothing else. Do not modify any other files.
 EOF
 
+# TASK_BREAKDOWN_PROMPT embeds $PRD_CONTENT, which is reassigned to the delta
+# PRD for delta sessions AFTER these prompts are first defined. Because an
+# unquoted heredoc expands $PRD_CONTENT at definition time, wrapping the read in
+# a function lets us rebuild it once the delta content is known. Without the
+# rebuild, the breakdown agent decomposes the FULL PRD and ignores the delta
+# entirely (the bare `PRD_CONTENT=$(cat delta_prd.md)` reassignment would be
+# dead code, since the variable was already consumed by the heredoc).
+build_task_breakdown_prompt() {
 read -r -d '' TASK_BREAKDOWN_PROMPT <<EOF
 # PROJECT INITIATION
 
@@ -1491,6 +1499,8 @@ $PRD_INDEX
 5.  **Populate \`prd_selectors\`** for each subtask using selectors from the PRD STRUCTURE INDEX. Reference ALL relevant sections.
 6.  **CRITICAL: Write the JSON to \`./$TASKS_FILE\` (current working directory) using your file writing tools.** Do NOT output the JSON to the conversation. Do NOT search for or modify any existing tasks.json files in other directories. Create a NEW file at \`./$TASKS_FILE\`. The file MUST exist when you are done.
 EOF
+}
+build_task_breakdown_prompt
 
 read -r -d '' PRP_CREATE_PROMPT <<EOF
 # Create PRP for Work Item
@@ -4040,6 +4050,11 @@ $PREVIOUS_SESSION_CONTEXT_PROMPT" $BREAKDOWN_AGENT --session-id "prd-delta-$(bas
         print -P "%F{green}[DELTA]%f Delta PRD generated: $SESSION_DIR/delta_prd.md"
         # Use delta PRD as input for task breakdown
         PRD_CONTENT=$(cat "$SESSION_DIR/delta_prd.md")
+        # Rebuild the breakdown prompt so $PRD_CONTENT — now the delta PRD —
+        # actually reaches the breakdown agent. Without this, the heredoc frozen
+        # at definition time with the FULL PRD makes delta sessions decompose
+        # the entire project instead of just the delta.
+        build_task_breakdown_prompt
     else
         print -P "%F{red}[ERROR]%f Delta PRD generation FAILED. Required file missing: $SESSION_DIR/delta_prd.md"
         print -P "%F{red}[ERROR]%f Cannot proceed with delta session without delta PRD."
