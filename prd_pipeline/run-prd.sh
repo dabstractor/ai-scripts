@@ -3306,12 +3306,35 @@ check_dependencies_satisfied() {
     return 0
 }
 
+# A dependency-blocked item is only a SYSTEMATIC blocker if one of its
+# unsatisfied dependencies is FAILED or MISSING. If every unsatisfied dep is
+# merely PENDING (Planned/Researching/Ready/Implementing), the producer just
+# hasn't landed yet — that is normal ordering, not a failure, and must NOT
+# count toward the halt streak (otherwise a single Mode-B docs task that
+# legitimately depends on later-phase work halts the whole run).
+# Returns 0 (true) if recoverable (all unsatisfied deps pending), 1 (false) if
+# any unsatisfied dep is Failed/missing.
+dependency_block_is_recoverable() {
+    local id=$1 deps recoverable=1 dep st
+    deps=$(jq -r --arg iid "$id" '.. | objects | select(.id? == $iid) | (.dependencies // [])[]' "$TASKS_FILE" 2>/dev/null)
+    [[ -z "$deps" ]] && return 1
+    for dep in ${(f)deps}; do
+        st=$(jq -r --arg did "$dep" '.. | objects | select(.id? == $did) | .status // "missing"' "$TASKS_FILE" 2>/dev/null | head -1)
+        case "$st" in
+            Complete|Completed) ;;              # satisfied
+            Failed|missing) recoverable=0 ;;    # genuine, unrecoverable blocker
+            *) ;;                                # pending — recoverable
+        esac
+    done
+    [[ $recoverable -eq 1 ]]
+}
+
 # Track consecutive items the loop could NOT implement and HALT when a streak
 # indicates a systematic blocker. execute_item returns:
 #   0   = success / already-complete skip  → reset streak
 #   1   = failure (marked Failed)          → increment streak
 #   2   = issue-retry (reset to Planned)   → increment streak
-#   3   = dependency-blocked               → increment streak
+#   3   = dependency-blocked               → defer if pending (rc 0), else streak
 #   130 = interrupted                       → leave streak; shutdown path owns exit
 # Returns 0 to continue the loop, 1 to abort the whole run.
 # Usage: handle_item_result <return_code> <item_id>
@@ -3328,15 +3351,26 @@ handle_item_result() {
             # Interrupted: don't perturb the streak; the shutdown path owns exit.
             return 0
             ;;
-        1|2|3)
+        1|2)
             ISSUE_STREAK=$((ISSUE_STREAK + 1))
             local kind="non-implementation"
             case $rc in
                 1) kind="failure" ;;
                 2) kind="issue" ;;
-                3) kind="dependency-blocked" ;;
             esac
             print -P "%F{yellow}[STREAK]%f Consecutive $kind: $ISSUE_STREAK/$ISSUE_STREAK_MAX (last: $id)"
+            ;;
+        3)
+            # Dependency-blocked. A PENDING producer (Planned/Researching/Ready/
+            # Implementing) is normal ordering, not a systematic failure — defer
+            # without penalizing the streak so the loop can advance to the
+            # producer. Only a FAILED/MISSING dependency counts toward the halt.
+            if dependency_block_is_recoverable "$id"; then
+                print -P "%F{cyan}[DEFER]%f $id deferred — producer(s) not yet Complete (streak held at $ISSUE_STREAK); it runs once they land."
+                return 0
+            fi
+            ISSUE_STREAK=$((ISSUE_STREAK + 1))
+            print -P "%F{yellow}[STREAK]%f Consecutive dependency-blocked: $ISSUE_STREAK/$ISSUE_STREAK_MAX (last: $id — failed/missing dependency)"
             ;;
         *)
             # Unexpected code — treat conservatively as non-progress.
