@@ -2597,14 +2597,58 @@ Small improvements or polish items.
 5. **Prioritize**: Focus on what matters most to users
 6. **Document Everything**: Even if you're not sure it's a bug, note it
 
-## Output - IMPORTANT
+## Output - IMPORTANT (READ CAREFULLY — bugs have been lost here before)
 
-**It is IMPORTANT that you follow these rules exactly:**
+The presence or absence of \`\$BUG_RESULTS_FILE\` is the **only** signal the
+pipeline uses to decide whether bugs were found. The pipeline **never** reads
+your chat output — only that file counts. So getting this right is the
+difference between bugs getting fixed and bugs shipping to users.
 
-- **If you find Critical or Major bugs**: You MUST write the bug report to \`\$BUG_RESULTS_FILE\`. It is imperative that actionable bugs are documented.
-- **If you find NO Critical or Major bugs**: Do NOT write any file. Do NOT create \`\$BUG_RESULTS_FILE\`. Leave no trace. The absence of the file signals success.
+### Rule 1 — Write the report whenever you find ANY real issue
 
-This is imperative. The presence or absence of the bug report file controls the entire bugfix pipeline. Writing an empty or "no bugs found" file will cause unnecessary work. Not writing the file when there ARE bugs will cause bugs to be missed.
+Write \`\$BUG_RESULTS_FILE\` if you found **any** issue worth a human's attention
+— **Critical, Major, OR Minor**. Minor issues are part of the durable record
+too; a later stage decides what to act on. Your job is to faithfully record what
+you found, never to triage it away by severity.
+
+Omit the file **only** if you genuinely found nothing reportable — no defect, no
+spec violation, no noteworthy gap of any severity. In that one case, leave no
+file; its absence signals a clean run.
+
+**When in doubt about whether to write the file, WRITE IT.** A report that turns
+out to be empty costs a few seconds of review. A report that is silently dropped
+loses real bugs — that exact failure (a full report written only to chat, never
+to the file) has shipped regressions before. Always err on the side of recording.
+
+### Rule 2 — Use EXACTLY these three severity levels: Critical / Major / Minor
+
+The template above uses Critical / Major / Minor, and downstream stages match on
+those exact words. **Do not invent another scale.** If you catch yourself writing
+High/Medium/Low, P0/P1/P2, or Severity 1-5, map them onto the canonical three:
+
+- High / P0 / "blocks release" / "must fix"  → **Critical**
+- Medium / P1 / "should fix"                  → **Major**
+- Low / P2 / "nice to fix" / polish           → **Minor**
+
+A real report filed entirely under "## High severity" was once read by this
+pipeline as "no Critical/Major bugs" and thrown away — every finding lost. Use
+the words Critical / Major / Minor.
+
+### Final self-check before you finish
+
+1. Re-read your own findings. Did you describe **any** issue at all, at any
+   severity? If yes, \`\$BUG_RESULTS_FILE\` **MUST** exist on disk right now with
+   that content.
+2. If you wrote your report only in your reasoning/chat and never saved the file,
+   the pipeline will treat every bug you found as "not found." Stop and write the
+   file now.
+3. Never write an empty file or a "no bugs found" file — that wastes a fix cycle.
+   Either real content goes in, or no file at all.
+
+This is imperative. The presence or absence of the bug report file controls the
+entire bugfix pipeline. Writing an empty or "no bugs found" file causes
+unnecessary work; not writing the file when there ARE bugs causes bugs to be
+missed.
 
 ## FORBIDDEN OPERATIONS - CRITICAL
 
@@ -2622,8 +2666,7 @@ This is imperative. The presence or absence of the bug report file controls the 
 **NEVER run \`rm\`, \`git rm\`, \`git clean\`, or \`mv\` against PRD.md, any PRP.md, or anything under plan/.** These files are owned by humans and the orchestrator. Deleting them destroys pipeline state. The pipeline auto-restores them, so a deletion will not stick - but do not attempt it.
 
 ### YOUR OUTPUT:
-You write ONLY to \`\$BUG_RESULTS_FILE\` (if bugs are found).
-Nothing else. Do not modify, move, or delete any other files.
+You write ONLY to \`\$BUG_RESULTS_FILE\` (whenever you find any issue, per the Output rules above). Nothing else. Do not modify, move, or delete any other files.
 EOF
 
 # Bug Fix Task Breakdown - SIMPLE flat structure for bug fixes
@@ -3845,8 +3888,19 @@ run_with_retry_stdin() {
         # later retry fails forever with "no such file". Rewriting is cheap and
         # makes retries resilient regardless of why the file disappeared.
         print -r -- "$prompt_text" > "$tmp"
-        eval "${(q)@}" < "$tmp"
-        local exit_status=$?
+        local exit_status
+        if [[ -n "$CAPTURE_STDOUT" ]]; then
+            # Optional opt-in capture: tee combined stdout+stderr to a file
+            # while still streaming live. Used by the bug hunt so a report
+            # the agent writes only to chat (and never to BUG_RESULTS_FILE)
+            # is still recoverable and detectable. pipestatus[1] = the agent
+            # (eval), not tee; tee's status is intentionally ignored.
+            eval "${(q)@}" < "$tmp" 2>&1 | tee "$CAPTURE_STDOUT"
+            exit_status=$pipestatus[1]
+        else
+            eval "${(q)@}" < "$tmp"
+            exit_status=$?
+        fi
         if [[ $exit_status -eq 0 ]]; then rm -f "$tmp"; return 0; fi
         # A watchdog timeout (exit 124) means the process was stuck; retrying
         # immediately just re-hangs it. Surface as a hard failure so the caller
@@ -4603,45 +4657,101 @@ Please include these in your bug report if they represent real issues.
 ${EXPANDED_BUG_PROMPT}"
         fi
 
-        run_with_retry_stdin "$EXPANDED_BUG_PROMPT" $BUG_FINDER_AGENT --no-session
+        # Capture the agent's combined output so that if it describes bugs in
+        # chat but fails to write BUG_RESULTS_FILE (a real past failure: a full
+        # High/Medium/Low report was produced but never saved, so real bugs were
+        # lost to a silent NO_ISSUES_FOUND), the report is recoverable and the
+        # inconsistency is detected below instead of being marked clean.
+        BUG_HUNT_TRANSCRIPT="$CURRENT_BUGFIX_SESSION/bug-hunt-transcript.log"
+        CAPTURE_STDOUT="$BUG_HUNT_TRANSCRIPT" run_with_retry_stdin "$EXPANDED_BUG_PROMPT" $BUG_FINDER_AGENT --no-session
     fi
 
-    # If no file was created, no bugs were found - we're done!
+    # If no report file was created, distinguish two cases:
+    #   (a) genuinely clean — agent found nothing reportable; or
+    #   (b) INCONSISTENT — the agent described bugs (visible in its captured
+    #       transcript) but never wrote BUG_RESULTS_FILE. This has happened
+    #       before: the bug finder produced a full High/Medium/Low report in
+    #       chat, applied the old "only write on Critical/Major" rule literally,
+    #       and wrote nothing — so real bugs shipped under a silent
+    #       NO_ISSUES_FOUND. The transcript capture lets us catch it here.
     if [[ ! -f "$BUG_RESULTS_FILE" ]]; then
-        print -P "%F{green}[BUG HUNT]%f No bugs found. Quality looks good!"
+        BUG_HUNT_TRANSCRIPT="$CURRENT_BUGFIX_SESSION/bug-hunt-transcript.log"
+        BUG_SIGNAL_COUNT=0
+        if [[ -f "$BUG_HUNT_TRANSCRIPT" ]]; then
+            # Structural markers the report template asks for, MINUS the
+            # template's own placeholder lines (in case the prompt is echoed).
+            # A real report has several; a genuinely-clean transcript has ~none.
+            BUG_SIGNAL_COUNT=$(grep -Ei '^[[:space:]]*#{1,6}[[:space:]]*(issue|critical|major|minor|high|medium|low|p[0-2])|^[[:space:]]*#{1,6}[[:space:]]+.*(report|requirements)|^[[:space:]]*\*\*severity\*\*|suggested fix|steps to reproduce|expected behavior|actual behavior|issues? found|bugs? found' "$BUG_HUNT_TRANSCRIPT" 2>/dev/null \
+                | grep -viE '\[title\]|\[which section|\[same format|brief summary|polish items|prevent core|significantly impact|performed: x|areas with|\[list\]|\[brief description\]' \
+                | grep -c '^')
+            BUG_SIGNAL_COUNT=${BUG_SIGNAL_COUNT//[^0-9]/}
+            BUG_SIGNAL_COUNT=${BUG_SIGNAL_COUNT:-0}
+        fi
 
-        # Leave an indicator so the user knows bugfix already ran clean on
-        # this task set and need not be re-run. Records the tasks hash so a
-        # stale marker is easy to spot once the task set changes.
-        NI_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-        NI_SESSION=$(basename "$SESSION_DIR")
-        NI_HASH="none"
-        [[ -f "$SESSION_DIR/tasks.json" ]] && NI_HASH=$(hash_prd_content "$SESSION_DIR/tasks.json")
-        {
-            print -r "No Issues Found"
-            print -r ""
-            print -r "Bug hunt ran on $NI_TS and found no Critical/Major bugs."
-            print -r ""
-            print -r "  Session tested:    $NI_SESSION"
-            print -r "  Tasks hash:        $NI_HASH  (tasks.json, sha256 first 12)"
-            print -r "  Bug finder agent:  $BUG_FINDER_AGENT"
-            print -r ""
-            print -r "Delete this file to force a re-run of bug hunting."
-        } > "$BUGFIX_DIR/NO_ISSUES_FOUND.md"
-        print -P "%F{cyan}[BUG HUNT]%f No-issues marker: $BUGFIX_DIR/NO_ISSUES_FOUND.md"
+        if [[ "$BUG_SIGNAL_COUNT" -ge 2 ]]; then
+            # INCONSISTENT: bugs appear in the transcript but no file was written.
+            print -P "%F{red}[BUG HUNT]%f ⚠ INCONSISTENT: no $BUG_RESULTS_FILE was written, but the bug finder's transcript contains $BUG_SIGNAL_COUNT bug-report signal(s)."
+            print -P "%F{red}[BUG HUNT]%f The agent likely found bugs but failed to persist them to the report file"
+            print -P "%F{red}[BUG HUNT]%f (past cause: a High/Medium/Low taxonomy made it think none were 'Critical or Major')."
+            print -P "%F{red}[BUG HUNT]%f Refusing to mark this run clean. Findings are NOT lost — recover them from:"
+            print -P "%F{red}[BUG HUNT]%f   $BUG_HUNT_TRANSCRIPT"
+            print -P "%F{red}[BUG HUNT]%f Copy the report into $BUG_RESULTS_FILE and re-run, or delete the transcript to confirm clean."
+            NI_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+            {
+                print -r "Inconsistent Bug Hunt Result"
+                print -r ""
+                print -r "The bug finder ran on $NI_TS but produced NO TEST_RESULTS.md,"
+                print -r "even though its transcript contains $BUG_SIGNAL_COUNT bug-report signal(s)."
+                print -r ""
+                print -r "This usually means the agent found bugs in chat but mis-applied the"
+                print -r "file-write rule (e.g. used a High/Medium/Low taxonomy and concluded none"
+                print -r "were 'Critical or Major', or only found Minor issues under the old rules)."
+                print -r "The findings are NOT lost — see the transcript:"
+                print -r "  $BUG_HUNT_TRANSCRIPT"
+                print -r ""
+                print -r "Recover the report into TEST_RESULTS.md and re-run bug hunting to fix."
+                print -r "Delete this file AND the transcript only if you confirm the run was clean."
+            } > "$BUGFIX_DIR/INCONSISTENT_BUG_HUNT.md"
+            git add "$BUGFIX_DIR/INCONSISTENT_BUG_HUNT.md" "$BUG_HUNT_TRANSCRIPT" 2>/dev/null
+            git commit -m "Inconsistent bug hunt: report in transcript but no file ($(basename "$CURRENT_BUGFIX_SESSION"))" &>/dev/null || true
+            # Keep the session dir: the transcript is evidence. Do NOT mark clean.
+        else
+            print -P "%F{green}[BUG HUNT]%f No bugs found. Quality looks good!"
 
-        # Commit the no-issues marker so the clean result is recorded,
-        # mirroring how the bug report is committed when bugs are found.
-        git add "$BUGFIX_DIR/NO_ISSUES_FOUND.md" 2>/dev/null
-        git commit -m "No issues found: $(basename "$CURRENT_BUGFIX_SESSION")" &>/dev/null || true
+            # Leave an indicator so the user knows bugfix already ran clean on
+            # this task set and need not be re-run. Records the tasks hash so a
+            # stale marker is easy to spot once the task set changes.
+            NI_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+            NI_SESSION=$(basename "$SESSION_DIR")
+            NI_HASH="none"
+            [[ -f "$SESSION_DIR/tasks.json" ]] && NI_HASH=$(hash_prd_content "$SESSION_DIR/tasks.json")
+            {
+                print -r "No Issues Found"
+                print -r ""
+                print -r "Bug hunt ran on $NI_TS and found no issues (Critical, Major, or Minor)."
+                print -r ""
+                print -r "  Session tested:    $NI_SESSION"
+                print -r "  Tasks hash:        $NI_HASH  (tasks.json, sha256 first 12)"
+                print -r "  Bug finder agent:  $BUG_FINDER_AGENT"
+                print -r ""
+                print -r "Delete this file to force a re-run of bug hunting."
+            } > "$BUGFIX_DIR/NO_ISSUES_FOUND.md"
+            print -P "%F{cyan}[BUG HUNT]%f No-issues marker: $BUGFIX_DIR/NO_ISSUES_FOUND.md"
 
-        # Clean up empty session
-        rmdir "$CURRENT_BUGFIX_SESSION" 2>/dev/null
+            # Commit the no-issues marker so the clean result is recorded,
+            # mirroring how the bug report is committed when bugs are found.
+            git add "$BUGFIX_DIR/NO_ISSUES_FOUND.md" 2>/dev/null
+            git commit -m "No issues found: $(basename "$CURRENT_BUGFIX_SESSION")" &>/dev/null || true
+
+            # Clean up the session: drop the transcript and remove the now-empty dir.
+            rm -f "$BUG_HUNT_TRANSCRIPT" 2>/dev/null
+            rmdir "$CURRENT_BUGFIX_SESSION" 2>/dev/null
+        fi
     else
         # Bug report exists - run the fix pipeline
-        # A previous "no issues" marker is now stale; clear it so the bugfix
-        # directory reflects that bugs were found this round.
-        rm -f "$BUGFIX_DIR/NO_ISSUES_FOUND.md"
+        # Previous "clean" / "inconsistent" markers are now stale; clear them
+        # so the bugfix directory reflects that bugs were found this round.
+        rm -f "$BUGFIX_DIR/NO_ISSUES_FOUND.md" "$BUGFIX_DIR/INCONSISTENT_BUG_HUNT.md"
         print -P "%F{cyan}[BUG HUNT]%f Bug report generated: $BUG_RESULTS_FILE"
         print -P "\n%F{yellow}[BUG FIX]%f Bugs found! Starting bug fix pipeline..."
         print -P "%F{yellow}[BUG FIX]%f PRD: $BUG_RESULTS_FILE"
