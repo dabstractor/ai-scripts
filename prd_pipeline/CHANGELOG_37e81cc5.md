@@ -1094,3 +1094,236 @@ choice="${choice%"${choice##*[![:space:]]}"}"
 | `8098249` | 2026-07-13 | fix(prd): prevent orphaned plan dirs from interrupted runs |
 
 Plus uncommitted working-tree changes on `prd_pipeline/run-prd.sh` (item T).
+
+---
+
+## Changes Since Commit 8098249 (Distributed PRDs, Dependency Discipline & Commit Resilience)
+
+**Base commit:** `8098249` — "fix(prd): prevent orphaned plan dirs from interrupted runs" (end of the prior section, item R)
+**Latest commit:** `6b52c0a` — "fix(prd): ignore pending deps in failure streak"
+**Date range:** 2026-07-13 through 2026-07-20 (10 commits)
+**Files changed:**
+- `prd_pipeline/run-prd.sh` (+644 lines, −57 lines vs `8098249`)
+- `prd_pipeline/fixes/tasks-json-race/` (new subproject: README + repro script + 2 patches, +312 lines)
+- `prd_pipeline/CHANGELOG_37e81cc5.md` (this file; +210 lines in `ab098a9`, the "Resilience & Guard-Rails Pass" section itself)
+
+**Theme:** Three threads converge here.
+
+1. **Distributed PRDs** — a PRD may now be authored across many files via `@path` include directives (first sole-line, then generalized inline), resolved into one canonical merged document that every downstream agent, selector, and hash sees. This is what makes a split PRD behave exactly like a monolithic one.
+2. **Dependency discipline & failure halts** — the execution loop no longer implements a *consumer* before its *producers*, and it HALTS the whole run when a streak of items can't make progress (a systematic blocker), while removing the blind end-of-run "mark Complete" that used to permanently orphan incomplete work.
+3. **Resilience** — stagecoach commit-gen is retried with a `git commit` fallback, `--validate`/`--bug-hunt` re-runs reuse a session instead of forking an empty delta, and the previously-uncommitted `--no-session` stateless-invocation discipline (item T) landed as a real commit.
+
+Plus a new **`--adopt-prd`** mode for integrating the pipeline into an already-implemented legacy codebase, and a fully root-caused **`tasks.json` lost-update race** fix shipped as reviewable patches.
+
+---
+
+### W. Stateless `--no-session` Invocations Land as a Commit — `7f862c0`
+
+**Supersedes item T.** The "uncommitted working-tree" `--no-session` discipline described in item T was committed here. Every agent call that is *stateless by nature* — the per-item PRP execute (`tee`'d to the output log), both cleanup sites (post-execute and post-breakdown), the mid-session task update, final validation, the post-validation fix, validation-artifact deletion, and the bug finder — now passes `--no-session`. These calls don't benefit from session resume (they're single-shot or operate on freshly-built prompts), and leaving sessions enabled was creating/resuming sessions that served no purpose.
+
+> **Note (later refined in item AA):** this commit made the *implementation* call `--no-session` too, but `ca97e80` deliberately restored a resumable session (`--session-id prd-impl-<dirname>`) for implementation specifically — it is the one call that must survive a hang/crash. The other stateless call sites remain `--no-session`.
+
+---
+
+### X. Distributed PRDs: Recursive + Inline `@path` Include Resolution — `033a8c9`, `73a15e5`
+
+**Problem Solved:** A PRD of any real size wants to be split across multiple files (architecture, API, data model, companion docs). Before this, the pipeline hashed/snapshotted/showed agents only the single entry `PRD.md` file, so a split PRD was either partially invisible to agents or produced hash churn that broke delta detection.
+
+**Solution:** An `@path/to/file.md` token is an *include directive* — it is replaced inline by the referenced file's contents. The resolver is **idempotent** (re-resolving already-resolved content yields identical bytes), which is the property that guarantees hash/snapshot consistency.
+
+**Two-stage rollout:**
+
+- **`033a8c9` — sole-line includes (recursive).** A line of the form `@path/to/file.md` (optional leading whitespace, nothing else on the line) is expanded. Includes are resolved **project-root-relative** (relative to the entry PRD's directory, regardless of which file contains the directive) and expanded **recursively with cycle detection** (`PRD_INCLUDE_MAX_DEPTH`, default 10). A token only expands if the path resolves to an existing file; otherwise it passes through verbatim, so prose `@mentions` stay literal.
+- **`73a15e5` — inline includes.** Generalized so the `@path` token is honored **anywhere on a line**, not just alone — because companion docs are most naturally listed inside a markdown table cell (`| @ARCHITECTURE.md | Repository layout, module map |`) or in prose. A token expands when *both* hold: (1) **boundary** — the `@` is at the start of the line or preceded by a non-path character (protects `foo@bar.com` / mid-word `@`), and (2) **existence** — the path resolves to a file. Existence is the real discriminator; prose `@mentions` simply don't resolve.
+
+**Plumbing:**
+```bash
+resolve_prd_content() { … }        # recursive, cycle-detected, project-root-relative
+write_resolved_prd() { … }         # materialize fully-resolved PRD to <dest>
+expand_inline_includes() { … }      # per-line inline token expansion
+hash_prd_content() {
+    resolve_prd_content "$1" | sha256sum | cut -c1-12   # hash the RESOLVED doc
+}
+```
+
+Every `cp "$PRD_FILE" .../prd_snapshot.md` and `cat "$PRD_FILE"` site (snapshot writes, delta PRD inputs, integration/validation/bug-finder prompts, mdsel index generation) was routed through the resolver, so a split PRD is flattened into one canonical document everywhere downstream. mdsel now runs over a temp materialized copy so selectors reference the merged document. Agent prompts were updated to tell the model the text it receives is *already* the complete merged document (don't chase includes yourself).
+
+**New env vars:** `PRD_INCLUDE_MAX_DEPTH` (default 10), `PRD_INCLUDE_MARKERS` (if non-empty, emit `<!-- @include: path -->` / `<!-- @end-include -->` markers).
+
+**Impact:** A split PRD now behaves identically to a monolithic one for hashing, delta detection, mdsel selectors, and every agent prompt. Stale includes (a `.md` token that fails to resolve) earn a stderr warning; ordinary `@mentions` stay silent.
+
+---
+
+### Y. `--adopt-prd` Mode (Legacy Codebase Adoption) — `73a15e5`
+
+**Problem Solved:** Integrating `run-prd.sh` into an existing, *already-implemented* project after writing the PRD used to waste a full breakdown + implementation pass planning and "building" code that already exists.
+
+**Solution:** `--adopt-prd` (`ADOPT_PRD`) declares the PRD the source of truth for an already-shipped codebase. On a **fresh project** (no `plan/` sessions yet) it:
+1. Creates a baseline session and stamps it with a `.adopted` marker.
+2. Seeds a single completed `tasks.json` (one Phase → Milestone → Task → "Adopt existing codebase" Subtask, all `Complete`) — **no breakdown, no tokens** — so `is_session_complete` is true and this session becomes the idempotent baseline future deltas diff against.
+3. Sets `SKIP_EXECUTION_LOOP=true`; implementation is skipped, but **validation + bug hunt still run** against the real codebase + PRD.
+
+The next `PRD.md` edit produces a normal delta session, so deltas drive ongoing development from the adopted baseline.
+
+**Guard rails:**
+- `--adopt-prd` **requires** the PRD to exist (`PRD_FILE`); a missing PRD otherwise skips session resolution and would scribble near the filesystem root (`/architecture`, `/prd_snapshot.md`). It now exits loudly instead.
+- It **only applies to fresh projects**; if sessions already exist the flag is a no-op misuse (warn + proceed with normal resolution).
+- A new hard guard rejects an empty `SESSION_DIR` before breakdown/validation so collapsed root paths can never be written.
+- `create_session()` now `mkdir -p "$PLAN_DIR"` first so the session path is always nested under it.
+
+---
+
+### Z. `--validate` / `--bug-hunt` Re-runs Reuse the Completed Session — `fddc68c`
+
+**Problem Solved:** Re-running with `--validate` or `--bug-hunt` against an already-completed session whose PRD had a pending change would **fork an empty delta session** (because PRD-change detection fires before the flags are honored). That empty delta has no `tasks.json`, which made the validate-only / bug-hunt-only gates bail with *"Cannot validate without tasks"*.
+
+**Solution:** When `ONLY_VALIDATE` or `ONLY_BUG_HUNT` is set, the PRD-change branch now **reuses the latest completed session** instead of creating a delta. The PRD change is intentionally left pending (not actioned) so the *next normal* run (no `--validate`) still processes it into a proper delta:
+```bash
+if [[ "$ONLY_VALIDATE" == "true" || "$ONLY_BUG_HUNT" == "true" ]]; then
+    print -P "…reusing completed session $(basename "$CURRENT_SESSION_DIR")…"
+    print -P "…PRD change noted but not actioned. Run without --validate to create the delta session…"
+    SKIP_EXECUTION_LOOP=true
+else
+    # … create the delta session as before …
+fi
+```
+
+---
+
+### AA. Dependency-Order Enforcement, Failure-Halt Streak, & End-of-Run Completion Fix — `ca97e80`
+
+The largest change in this window. Four related disciplines, one commit.
+
+#### 1. Dependency gate (never build a consumer before its producers)
+
+**Problem Solved:** Without ordering enforcement the loop would happily implement a *consumer* (docs, UI, a CLI flag) on top of *producers* that were skipped or not-yet-done — e.g. a tray calling `host_capable()` that was never defined, or documentation for CLI flags that don't exist yet.
+
+**Solution:** `check_dependencies_satisfied <id>` returns false if any declared dependency is not yet `Complete`. `execute_item` calls it up front and signals "blocked" via **return code 3**, which the streak tracker consumes. Blocked items are left as `Planned` and retried once their producers land.
+
+#### 2. Failure-halt streak (`ISSUE_STREAK`)
+
+**Problem Solved:** Several items in a row that the loop *cannot* implement (failure / issue-retry / dep-blocked) almost always signals a **systematic blocker** — a broken build, a missing dependency, an unpushed git tag, contradictory requirements — that will fail every downstream item too. Silently walking past it (and building docs on top of the hole) was a critical failure.
+
+**Solution:** `handle_item_result <rc> <id>` tracks the consecutive non-implementation streak (`ISSUE_STREAK_MAX`, default **3**); `run_item_and_check` wraps `execute_item` so all four scope loops share the logic:
+
+| `execute_item` rc | meaning | streak effect |
+|---|---|---|
+| `0` | success / already-complete skip | **reset** |
+| `1` | failure (marked `Failed`) | increment |
+| `2` | issue-retry (reset to `Planned`) | increment |
+| `3` | dependency-blocked | increment (refined in item AD) |
+| `130` | interrupted | leave streak; shutdown owns exit |
+
+At the max, the run **HALTs**: it stops background research, persists current state with `smart_commit`, and exits 1 so the root cause can be fixed. Blocked/issued items stay `Planned` and resume from where they stopped.
+
+#### 3. Implementation runs under a (resumable) session; watchdog timeouts are not retried
+
+**Refines item W.** The single implementation call — `IMPL_AGENT … Execute the PRP …` — switched from `--no-session` back to **`--session-id prd-impl-<dirname>`**. Rationale: implementation is the longest-running, most-subprocess-heavy call (test runners, headless editors) and the one most worth keeping resumable; `pi --resume prd-impl-<dirname>` picks up exactly where a hang/crash stopped. (All other stateless call sites from item W stay `--no-session`.)
+
+A **watchdog timeout (exit 124)** is now treated distinctly from a normal agent failure: 124 means the agent hung — almost always on a spawned subprocess (headless editor / test runner) the watchdog can't reap, so that orphan likely still runs and must be killed by hand (`pkill -f nvim`, etc.). Retrying immediately would just re-hang on the same subprocess, so the item is marked `Failed` (not auto-retried) and returns `1` so the streak counter can halt the run if several items time out in a row. The session stays resumable for manual recovery.
+
+#### 4. Removed blind end-of-run "mark final task Complete"
+
+**Problem Solved:** The old tail block ran `tsk next` (which returns the *first* actionable item, not the last) and blindly marked it `Complete` — without verifying it was implemented. When the execution loop was interrupted, incomplete, or had skipped items, this marked **unimplemented work as done** and permanently orphaned it (future runs skip `Complete` items). The block is deleted; a comment now states completion is the *sole* responsibility of `execute_item`, which only marks `Complete` after verifying real source/PRP changes.
+
+---
+
+### AB. Stagecoach Commit-Gen Retry + `git commit` Fallback — `28c2d5d`
+
+**Problem Solved:** `stagecoach` emits **exit 124 on its OWN generation timeout** (default 120s) — which is the *opposite* situation from the agent-subprocess hang in item AA. For a one-shot commit-message call, a 124 is **transient LLM-API slowness**, not a stuck subprocess, so it *should* be retried. But `smart_commit` routed stagecoach through `run_with_retry`, whose exit-124 special-case is correct for implementation/PRP agents (don't retry a hung subprocess) but **wrong** for stagecoach (do retry transient API slowness). The index is untouched on a stagecoach timeout and its lock is released on the rescue exit, so retrying is safe.
+
+**Solution:** A deliberately separate primitive, `run_commit_with_retry`, with bounded retries and exponential backoff, and a last-resort fallback so a completed item's changes are never stranded uncommitted:
+```bash
+run_commit_with_retry() {
+    local n=1 delay=${COMMIT_RETRY_DELAY:-10} rc
+    while true; do
+        [[ "$SHUTDOWN_REQUESTED" == "true" ]] && return 130
+        stagecoach "$@"; rc=$?
+        [[ $rc -eq 0 ]] && return 0
+        (( n >= ${COMMIT_RETRY_MAX:-5} )) && break
+        sleep "$delay"; delay=$(( delay * 2 )); (( delay > 120 )) && delay=120; ((n++))
+    done
+    # Fallback: preserve staged work with a clearly-labeled commit (reword later)
+    git diff --staged --quiet && return $rc
+    git commit -m "chore: stagecoach commit-gen failed (exit $rc); fallback commit" && return 0
+    return $rc
+}
+```
+`smart_commit` now calls `run_commit_with_retry` instead of `run_with_retry stagecoach`. **New env vars:** `COMMIT_RETRY_MAX` (default 5), `COMMIT_RETRY_DELAY` (first backoff, default 10s, doubling, capped at 120s).
+
+---
+
+### AC. Delta Breakdown Now Scoped to the Delta PRD — `c6c5f59`
+
+**Problem Solved:** `TASK_BREAKDOWN_PROMPT` is an unquoted heredoc that embeds `$PRD_CONTENT` at **definition time**. For a delta session, `PRD_CONTENT` is reassigned to the *delta* PRD **after** the prompt was already defined — so the reassignment was dead code and the breakdown agent decomposed the **full** PRD, ignoring the delta entirely.
+
+**Solution:** Wrap the heredoc read in a function and **rebuild** it once the delta content is known:
+```bash
+build_task_breakdown_prompt() {
+    read -r -d '' TASK_BREAKDOWN_PROMPT <<EOF
+    … $PRD_INDEX … $PRD_CONTENT …
+EOF
+}
+# after PRD_CONTENT=$(cat "$SESSION_DIR/delta_prd.md"):
+build_task_breakdown_prompt   # re-expand so the delta actually reaches the agent
+```
+
+---
+
+### AD. Pending Dependencies Don't Count Toward the Halt Streak — `6b52c0a`
+
+**Refines item AA.** The original dependency-block (rc 3) unconditionally incremented the streak. But a dependency block is only a **systematic** blocker if one of its unsatisfied dependencies is **Failed or missing**. If every unsatisfied dep is merely **pending** (Planned/Researching/Ready/Implementing), the producer just hasn't landed yet — that's normal ordering, not a failure, and must not count toward the halt. (Otherwise a single Mode-B docs task that legitimately depends on later-phase work would halt the whole run.)
+
+**Solution:** `dependency_block_is_recoverable <id>` returns true if all unsatisfied deps are pending. In `handle_item_result`, an rc 3 now **defers without penalizing the streak** when recoverable, so the loop can advance to the producer; only a Failed/missing dependency increments the streak:
+```bash
+3)
+    if dependency_block_is_recoverable "$id"; then
+        print -P "[DEFER] $id deferred — producer(s) not yet Complete (streak held); runs once they land."
+        return 0
+    fi
+    ISSUE_STREAK=$((ISSUE_STREAK + 1))
+    ;;
+```
+
+---
+
+### AE. `tasks.json` Lost-Update Race — Root-Caused & Shipped as Patches — `2b98341`
+
+**Not yet applied to `run-prd.sh` / `tsk.ts` — shipped as reviewable patches under `prd_pipeline/fixes/tasks-json-race/`.**
+
+**Symptom (observed in production):** A work item sat visibly at `Ready` for ~10 minutes while it was in fact being implemented, then jumped straight to `Complete`. It looked like the pipeline was hung on a single item with no agent working.
+
+**Root cause:** `tsk` is an **unlocked read-modify-write** (`JSON.parse(readFileSync)` → mutate → `writeFileSync`, no `flock`, no lockfile, no atomic temp+rename). Two callers write the **same** `tasks.json` concurrently in this pipeline: the **foreground executor** (`Implementing`/`Complete`) and the **background research supervisor** (`Researching`/`Ready` for depth-2-chained items). Their read-modify-write cycles can interleave; the losing interleave clobbers a status back (e.g. the supervisor reverts `N:Implementing` → `N:Ready` because it read the file before the executor's write landed). `restore_tasks_json` is vulnerable for the same reason.
+
+**Proof:** `repro-lost-update.sh` widens tsk's sub-ms read→write window to make the interleave observable — **10/10 bare trials lost an update; 10/10 flock-wrapped trials were clean.**
+
+**The fix (two patches, to be applied when no run is active):**
+1. **`01-run-prd-flock-locking.patch`** (the real fix, no dependencies) — add `tsk_locked()` wrapping `( flock 9; tsk … ) 9>"${file}.lock"` and route **every** `tasks.json` read/write through it: `tsk_cmd()` and the 6 direct-write sites (supervisor, `restore_tasks_json`, `cleanup_orphan_researching`). fd 9 is scoped to the subshell so it's safe under recursion and the backgrounded supervisor. Requires `flock` (util-linux).
+2. **`02-tsk-atomic-write.patch`** (hardening) — make `saveBacklog()` in `task-processing/src/tsk.ts` **atomic**: write `.${basename}.${pid}.tmp` then `fs.renameSync` onto the target. `rename` is atomic on the same filesystem, so concurrent readers never see a half-written file and a crash mid-write can't corrupt `tasks.json`. (Doesn't by itself prevent lost updates — process-level mutual exclusion is Patch 1's flock — but makes `tsk` crash-safe for any other callers.)
+
+**Artifacts:** `prd_pipeline/fixes/tasks-json-race/{README.md,repro-lost-update.sh,01-run-prd-flock-locking.patch,02-tsk-atomic-write.patch}`. Apply per the README's instructions after all runs finish; rebuild `task-processing` (`npm run build`) for Patch 2.
+
+---
+
+### AF. Docs / Meta — `ab098a9`
+
+`ab098a9` is the **docs commit that added this changelog's "Changes Since Commit e286b56 (Resilience & Guard-Rails Pass)" section itself** (items L–V, +210 lines). It changed no pipeline code. Documented here for completeness so the commit is accounted for; it is the prior section, not new behavior.
+
+---
+
+## Commit History (this section)
+
+| Hash | Date | Message |
+|------|------|--------|
+| `7f862c0` | 2026-07-13 | fix(prd): disable session persistence across pipeline agent calls |
+| `2b98341` | 2026-07-16 | fix(prd): serialize tasks.json writes to prevent race |
+| `ab098a9` | 2026-07-16 | docs(prd): add resilience pass changelog |
+| `033a8c9` | 2026-07-16 | feat(prd): add recursive @path include resolution |
+| `fddc68c` | 2026-07-16 | fix(prd): preserve session on validate-only re-runs |
+| `73a15e5` | 2026-07-18 | feat(prd): add adopt mode and inline imports |
+| `ca97e80` | 2026-07-20 | fix(prd): enforce dependency order and failure halts |
+| `28c2d5d` | 2026-07-20 | fix(prd): retry stagecoach generation and add fallback |
+| `c6c5f59` | 2026-07-20 | fix(prd): scope delta breakdown to current prd |
+| `6b52c0a` | 2026-07-20 | fix(prd): ignore pending deps in failure streak |
+
+> **Note on item T:** the uncommitted working-tree `--no-session` changes described in the prior section's item T were committed here as `7f862c0` (this section, item W) and are therefore no longer pending.
