@@ -1327,3 +1327,46 @@ build_task_breakdown_prompt   # re-expand so the delta actually reaches the agen
 | `6b52c0a` | 2026-07-20 | fix(prd): ignore pending deps in failure streak |
 
 > **Note on item T:** the uncommitted working-tree `--no-session` changes described in the prior section's item T were committed here as `7f862c0` (this section, item W) and are therefore no longer pending.
+
+---
+
+## Changes Since Commit fc727a4 (Bug-Hunt False-Negative: Reports Lost to NO_ISSUES_FOUND)
+
+**Base commit:** `fc727a4`
+**Symptom (observed in production on two projects):** The bug finder produced a **full bug report in chat** but the pipeline emitted `NO_ISSUES_FOUND.md` anyway — so real bugs (3 High-severity in one project, 5 Minor in another) were silently dropped with zero durable record.
+
+**Root cause:** The pipeline's *only* signal for "were bugs found?" is the **presence of the file** `$BUG_RESULTS_FILE` (`TEST_RESULTS.md`). The bug finder itself decides whether to create it, and the old output-gate instructions said:
+
+> - If you find **Critical or Major** bugs: write the file.
+> - If you find **NO Critical or Major** bugs: do **not** write the file.
+
+That gate failed in two distinct ways, both made silent by a structural fragility: the agent's **self-classification is the sole determinant** of whether anything is persisted, and the pipeline **never captures or inspects the agent's actual output** — so any mis-gating is a total, invisible loss.
+
+1. **Taxonomy mismatch (the High-severity case).** The agent categorized findings as **High / Medium / Low** instead of Critical / Major / Minor, then applied the gate literally. Since its own scale had no "Critical" or "Major" bucket, it concluded none qualified — **even though it had found High-severity bugs and written a complete markdown report in its chat output.** It never persisted the file → pipeline saw no file → emitted `NO_ISSUES_FOUND.md`.
+2. **Minor-issue black hole (the Minor case).** The agent correctly found only **Minor** issues and correctly applied the gate ("no Critical/Major → don't write"). Working as literally designed — but the design silently discards everything below "Major," so 5 real issues vanished with no record.
+
+**The fix (two layers):**
+
+### AG. Bug-Finder Output Gate Rewritten (primary fix) — `run-prd.sh`
+
+Replaced the severity-conditional gate in `BUG_FINDING_PROMPT` with one that is robust to both failure modes:
+
+- **Write on ANY issue (Critical, Major, *or Minor*).** The file is the durable record; a later stage decides what to act on. Omit it *only* when genuinely nothing reportable was found. This closes the Minor black hole.
+- **Pin the taxonomy.** Require exactly **Critical / Major / Minor**, with an explicit **High→Critical / Medium→Major / Low→Minor** mapping, and call out that a "## High severity" report has been dropped before. This closes the taxonomy mismatch.
+- **Bias toward writing.** "When in doubt, WRITE IT" — a spurious report costs seconds of review; a dropped report ships regressions. Added a final self-check: "Did I describe any issue? Then the file MUST exist on disk."
+- Added a prominent header noting the pipeline never reads chat output — only the file counts.
+
+### AH. Transcript Capture + Inconsistency Detection (defense in depth) — `run-prd.sh`
+
+Turns the silent failure into a loud, recoverable one so a future misbehaving agent can't repeat it:
+
+- `run_with_retry_stdin` gained an opt-in `CAPTURE_STDOUT` (tee combined stdout+stderr to a file while still streaming live; agent exit status preserved via `pipestatus[1]`). Other call sites are unaffected.
+- The bug hunt sets `CAPTURE_STDOUT=<bugfix-session>/bug-hunt-transcript.log`, so the agent's full report is always persisted during the run.
+- After the run, the old "`! -f BUG_RESULTS_FILE` ⇒ clean" branch now **scans the transcript first** for structural bug-report signals (severity headings, `### Issue`, `**Severity**`, "Steps to Reproduce", "Suggested Fix", "Issues found", …), with the prompt template's own placeholder lines excluded. Threshold ≥2 so a clean run that merely says "no bugs found" (count 1) isn't a false positive.
+  - **≥2 signals but no file** → **INCONSISTENT**: refuse to mark clean, print a red warning, write `INCONSISTENT_BUG_HUNT.md`, commit it with the transcript, and keep the session dir as evidence. The findings are NOT lost — recoverable from the transcript.
+  - **<2 signals** → genuinely clean → existing `NO_ISSUES_FOUND.md` path (wording updated from "no Critical/Major" to "no issues (Critical, Major, or Minor)"); transcript removed and empty session reaped.
+- A successful bug-report run clears both stale `NO_ISSUES_FOUND.md` and stale `INCONSISTENT_BUG_HUNT.md`.
+
+**Validation:** signal-count tested against the two real reports — the dense High/Medium/Low report scores 9 (caught); a genuinely-clean transcript scores 0 (no false positive); missing/empty transcripts score 0 (graceful). `zsh -n` clean. The sparse Minor-only transcript scores 1 (below the backstop threshold) but is fully handled at the source by item AG (Minor now triggers file-writing), and would in any case be recoverable from the captured transcript.
+
+**Why two layers:** item AG makes the agent write the file reliably (fixes both incidents at the source); item AH guarantees that if an agent *still* mis-gates, the report is neither lost nor silently marked clean.
