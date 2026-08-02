@@ -4676,23 +4676,44 @@ ${EXPANDED_BUG_PROMPT}"
     #       NO_ISSUES_FOUND. The transcript capture lets us catch it here.
     if [[ ! -f "$BUG_RESULTS_FILE" ]]; then
         BUG_HUNT_TRANSCRIPT="$CURRENT_BUGFIX_SESSION/bug-hunt-transcript.log"
-        BUG_SIGNAL_COUNT=0
+        BUG_CLAIM_COUNT=0
+        BUG_STRUCT_COUNT=0
         if [[ -f "$BUG_HUNT_TRANSCRIPT" ]]; then
-            # Structural markers the report template asks for, MINUS the
-            # template's own placeholder lines (in case the prompt is echoed).
-            # A real report has several; a genuinely-clean transcript has ~none.
-            BUG_SIGNAL_COUNT=$(grep -Ei '^[[:space:]]*#{1,6}[[:space:]]*(issue|critical|major|minor|high|medium|low|p[0-2])|^[[:space:]]*#{1,6}[[:space:]]+.*(report|requirements)|^[[:space:]]*\*\*severity\*\*|suggested fix|steps to reproduce|expected behavior|actual behavior|issues? found|bugs? found' "$BUG_HUNT_TRANSCRIPT" 2>/dev/null \
-                | grep -viE '\[title\]|\[which section|\[same format|brief summary|polish items|prevent core|significantly impact|performed: x|areas with|\[list\]|\[brief description\]' \
-                | grep -c '^')
-            BUG_SIGNAL_COUNT=${BUG_SIGNAL_COUNT//[^0-9]/}
-            BUG_SIGNAL_COUNT=${BUG_SIGNAL_COUNT:-0}
+            # Two-tier inconsistency detection. The old single regex only matched
+            # the report template's exact shape ("## Critical / ### Issue /
+            # **Severity**: / Steps to Reproduce"). Real bug finders — especially
+            # reasoning agents — often write a FREEFORM prose report: emoji
+            # severity lead-ins ("**🟠 MEDIUM —"), "## New findings" headers,
+            # count phrases ("Bugs found (5 total)"), or "findings written to …",
+            # sometimes to a non-contract file. Those silently shipped as
+            # NO_ISSUES_FOUND because nothing here recognized them. The two tiers
+            # below catch both the rigid template AND the freeform styles.
+            #
+            # Lines the prompt echoes (template placeholders) and NEGATIVE
+            # severity statements ("## No Critical Issues", "found no bugs") are
+            # stripped first so a regurgitated or explicitly-clean transcript is
+            # not mistaken for a bug list.
+            BUG_NEG='\[title\]|\[which section|\[same format|brief summary|polish items|prevent core|significantly impact|performed: x|areas with|\[list\]|\[brief description\]|nice[[:space:]]+to[[:space:]]+fix|small[[:space:]]+improvements|issues[[:space:]]+that[[:space:]]+(prevent|significantly)|^[[:space:]]*#{0,6}[[:space:]]*no[[:space:]]+(critical|major|minor|high|medium|low|bugs?|issues?|defects?|regressions?|problems?|findings?)|^[[:space:]]*#{0,6}[[:space:]]*(found|detected|observed|saw)[[:space:]]+(no|none|zero|0)[[:space:]]|^[[:space:]]*[-*_>[:space:]]*(none|n/a)([^a-z]|$)|^[[:space:]]*[-*_>[:space:]]*0[[:space:]]+(bugs?|issues?|defects?)([^a-z]|$)'
+            # Tier 1 — explicit bug-finding claims (smoking guns). ANY one => inconsistent.
+            BUG_CLAIM_PAT='found[[:space:]]+[1-9][0-9]*[[:space:]]+(bugs?|issues?|defects?|findings?|regressions?)|found[[:space:]]+(a|an|several|some|multiple|the|one|two|three|four|five|six|seven|eight|nine|ten)[[:space:]]+(bugs?|issues?|defects?|findings?|regressions?)|findings?[[:space:]]+(written|recorded|reported|saved|logged)|(bugs?|issues?|defects?|findings?)[[:space:]]*[(:].{0,40}[1-9][0-9]*[[:space:]]+(total|issue|bug|finding|defect)|[1-9][0-9]*[[:space:]]+(bugs?|issues?|defects?|findings?|regressions?)[[:space:]]+((were|are)?[[:space:]]*)?(found|reported|recorded|identified|detected)'
+            # Tier 2 — structural severity markers. >=2 => inconsistent.
+            BUG_STRUCT_PAT='^[[:space:]]*#{1,6}[[:space:]]*(issues?|critical|major|minor|high|medium|low|p[0-3]|bugs?|findings?|defects?|regressions?|violations?)|^[[:space:]]*#{1,6}[[:space:]]+.*(report|requirements|bugs?|issues?|findings?|defects?)|^[[:space:]]*[-*>*_]*[[:space:]]*[*_]*[[:space:]]*(🔴|🟠|🟡|🟢|🟣|⚠️?|❗|❌|🐛|🐞)|^[[:space:]]*[-*>*_]*[[:space:]]*[*_]*[[:space:]]*(critical|major|minor|high|medium|low|p[0-3])([^a-z]|$)|^[[:space:]]*#{1,6}[[:space:]]+(bug|issue|defect)|\*\*severity\*\*|suggested[[:space:]]+fix|steps[[:space:]]+to[[:space:]]+reproduce|expected[[:space:]]+behavior|actual[[:space:]]+behavior'
+
+            BUG_CLAIM_COUNT=$(grep -Ei "$BUG_CLAIM_PAT" "$BUG_HUNT_TRANSCRIPT" 2>/dev/null | grep -viE "$BUG_NEG" | grep -c '^')
+            BUG_STRUCT_COUNT=$(grep -Ei "$BUG_STRUCT_PAT" "$BUG_HUNT_TRANSCRIPT" 2>/dev/null | grep -viE "$BUG_NEG" | grep -c '^')
+            BUG_CLAIM_COUNT=${BUG_CLAIM_COUNT//[^0-9]/}; BUG_CLAIM_COUNT=${BUG_CLAIM_COUNT:-0}
+            BUG_STRUCT_COUNT=${BUG_STRUCT_COUNT//[^0-9]/}; BUG_STRUCT_COUNT=${BUG_STRUCT_COUNT:-0}
         fi
 
-        if [[ "$BUG_SIGNAL_COUNT" -ge 2 ]]; then
+        # Inconsistent if the agent EXPLICITLY claimed bugs (tier 1) OR produced
+        # a structured bug-report shape (>=2 tier-2 signals). Either way the bugs
+        # never reached BUG_RESULTS_FILE, so refuse to mark the run clean.
+        if [[ "$BUG_CLAIM_COUNT" -ge 1 || "$BUG_STRUCT_COUNT" -ge 2 ]]; then
+            BUG_SIGNAL_COUNT=$((BUG_CLAIM_COUNT + BUG_STRUCT_COUNT))
             # INCONSISTENT: bugs appear in the transcript but no file was written.
-            print -P "%F{red}[BUG HUNT]%f ⚠ INCONSISTENT: no $BUG_RESULTS_FILE was written, but the bug finder's transcript contains $BUG_SIGNAL_COUNT bug-report signal(s)."
-            print -P "%F{red}[BUG HUNT]%f The agent likely found bugs but failed to persist them to the report file"
-            print -P "%F{red}[BUG HUNT]%f (past cause: a High/Medium/Low taxonomy made it think none were 'Critical or Major')."
+            print -P "%F{red}[BUG HUNT]%f ⚠ INCONSISTENT: no $BUG_RESULTS_FILE was written, but the bug finder's transcript reports bugs ($BUG_CLAIM_COUNT explicit claim(s), $BUG_STRUCT_COUNT structural signal(s))."
+            print -P "%F{red}[BUG HUNT]%f The agent likely found bugs but failed to persist them to the report file."
+            print -P "%F{red}[BUG HUNT]%f Common causes: wrote a freeform/emoji-severity report only to chat or a non-contract file, used a High/Medium/Low taxonomy and concluded none were 'Critical or Major', or only found Minor issues under the old rules."
             print -P "%F{red}[BUG HUNT]%f Refusing to mark this run clean. Findings are NOT lost — recover them from:"
             print -P "%F{red}[BUG HUNT]%f   $BUG_HUNT_TRANSCRIPT"
             print -P "%F{red}[BUG HUNT]%f Copy the report into $BUG_RESULTS_FILE and re-run, or delete the transcript to confirm clean."
@@ -4701,11 +4722,13 @@ ${EXPANDED_BUG_PROMPT}"
                 print -r "Inconsistent Bug Hunt Result"
                 print -r ""
                 print -r "The bug finder ran on $NI_TS but produced NO TEST_RESULTS.md,"
-                print -r "even though its transcript contains $BUG_SIGNAL_COUNT bug-report signal(s)."
+                print -r "even though its transcript contains $BUG_CLAIM_COUNT explicit bug-claim"
+                print -r "signal(s) and $BUG_STRUCT_COUNT structural bug-report signal(s)."
                 print -r ""
-                print -r "This usually means the agent found bugs in chat but mis-applied the"
-                print -r "file-write rule (e.g. used a High/Medium/Low taxonomy and concluded none"
-                print -r "were 'Critical or Major', or only found Minor issues under the old rules)."
+                print -r "This usually means the agent found bugs in chat (sometimes writing them to"
+                print -r "a non-contract markdown file) but never persisted them to TEST_RESULTS.md —"
+                print -r "e.g. a freeform/emoji-severity report, a High/Medium/Low taxonomy read as"
+                print -r "'no Critical/Major', or only Minor issues under the old rules."
                 print -r "The findings are NOT lost — see the transcript:"
                 print -r "  $BUG_HUNT_TRANSCRIPT"
                 print -r ""
