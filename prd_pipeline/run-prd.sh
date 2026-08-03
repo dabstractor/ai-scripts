@@ -448,6 +448,116 @@ expand_inline_includes() {
 write_resolved_prd() {
     local dest=$1
     resolve_prd_content "$PRD_FILE" > "$dest"
+    # Also refresh the per-file include manifest so a later "PRD has changed"
+    # can name the exact companion doc that changed instead of just "PRD".
+    write_prd_manifest "${dest:h}"
+}
+
+# Enumerate the main PRD file plus every @include it (recursively) resolves to.
+# Fills the global _PRD_INCLUDES_FOUND array with absolute, order-preserving,
+# deduped paths (the main PRD first). Uses the existing PRD_INCLUDE_MARKERS
+# machinery so the traversal logic is not duplicated.
+# Usage: collect_prd_includes  (operates on $PRD_FILE)
+collect_prd_includes() {
+    typeset -ga _PRD_INCLUDES_FOUND
+    _PRD_INCLUDES_FOUND=()
+    [[ -f "$PRD_FILE" ]] || return 0
+    local root="${PRD_FILE:A:h}"
+    _PRD_INCLUDES_FOUND+=("${PRD_FILE:A}")
+    local resolved tok inc_path
+    resolved=$(PRD_INCLUDE_MARKERS=1 resolve_prd_content "$PRD_FILE" 2>/dev/null) || resolved=""
+    while IFS= read -r tok; do
+        [[ -z "$tok" ]] && continue
+        inc_path="$tok"
+        inc_path="${inc_path/#\~/$HOME}"
+        [[ "$inc_path" != /* && "$inc_path" != \$* ]] && inc_path="$root/$inc_path"
+        [[ -f "$inc_path" ]] && _PRD_INCLUDES_FOUND+=("${inc_path:A}")
+    done < <(print -r -- "$resolved" | sed -nE 's/.*<!-- @include: ([^ ]+) -->.*/\1/p')
+    # Dedupe, preserve order.
+    local -A seen=()
+    local out=() p
+    for p in "${_PRD_INCLUDES_FOUND[@]}"; do
+        (( ${+seen[$p]} )) && continue
+        seen[$p]=1; out+=("$p")
+    done
+    _PRD_INCLUDES_FOUND=("${out[@]}")
+}
+
+# Write a per-file hash manifest next to prd_snapshot.md so "PRD changed" can be
+# attributed to the exact file. Format: "<sha256(12)> <path-relative-to-PWD>".
+# Called automatically by write_resolved_prd.
+# Usage: write_prd_manifest <session_dir>
+write_prd_manifest() {
+    local session_dir=$1
+    [[ -n "$session_dir" && -d "$session_dir" ]] || return 0
+    collect_prd_includes || return 0
+    local manifest="$session_dir/prd_manifest.txt" p rel h
+    : > "$manifest"
+    for p in "${_PRD_INCLUDES_FOUND[@]}"; do
+        [[ -f "$p" ]] || continue
+        if [[ "$p" == "$PWD"/* ]]; then rel="${p#$PWD/}"; else rel="$p"; fi
+        h=$(sha256sum "$p" 2>/dev/null | cut -c1-12)
+        [[ -n "$h" ]] && print -r "$h $rel" >> "$manifest"
+    done
+}
+
+# Print WHICH PRD component(s) changed since a session's baseline. Uses
+# prd_manifest.txt when present (precise per-file comparison); otherwise lists
+# every component and flags those edited since the snapshot was written.
+# Printed to stdout for inline inclusion in the PRD_CHANGED messages.
+# Usage: prd_change_report <session_dir>
+prd_change_report() {
+    local session_dir=$1
+    local snapshot="$session_dir/prd_snapshot.md"
+    local manifest="$session_dir/prd_manifest.txt"
+    collect_prd_includes
+    local p rel cur h
+    if [[ -f "$manifest" ]]; then
+        local -A baseline=()
+        local line mh mrel
+        while IFS=' ' read -r mh mrel; do
+            [[ -n "$mrel" ]] && baseline[$mrel]=$mh
+        done < "$manifest"
+        local found_changed=0
+        for p in "${_PRD_INCLUDES_FOUND[@]}"; do
+            cur="${p#$PWD/}"; [[ "$cur" == "$p" ]] && cur="$p"
+            if [[ -z "${baseline[$cur]}" ]]; then
+                print -P "    %F{yellow}+%f new: $cur"; found_changed=1
+            else
+                h=$(sha256sum "$p" 2>/dev/null | cut -c1-12)
+                if [[ "$h" != "${baseline[$cur]}" ]]; then
+                    print -P "    %F{red}~%f changed: $cur"; found_changed=1
+                fi
+            fi
+        done
+        local gone
+        for gone in "${(@k)baseline}"; do
+            [[ -z "$gone" ]] && continue
+            { [[ -f "$PWD/$gone" ]] || [[ -f "$gone" ]]; } && continue
+            print -P "    %F{red}-%f removed: $gone"; found_changed=1
+        done
+        (( ! found_changed )) && print -P "    %F{cyan}(no component file changed — diff is elsewhere in the resolved content)%f"
+        return
+    fi
+    # Fallback for older sessions without a manifest.
+    local snap_mtime=0 f any=0
+    [[ -f "$snapshot" ]] && snap_mtime=$(stat -c %Y "$snapshot" 2>/dev/null || echo 0)
+    print -P "    %F{cyan}This session predates per-file manifests. The resolved PRD comprises:%f"
+    for p in "${_PRD_INCLUDES_FOUND[@]}"; do
+        rel="${p#$PWD/}"; [[ "$rel" == "$p" ]] && rel="$p"
+        [[ "$p" == "${PRD_FILE:A}" ]] && print -r "      [main PRD]  $rel" || print -r "      [@include]  $rel"
+    done
+    if [[ "$snap_mtime" -gt 0 ]]; then
+        print -P "    %F{cyan}Edited since this session was created (by mtime):%f"
+        for p in "${_PRD_INCLUDES_FOUND[@]}"; do
+            f=$(stat -c %Y "$p" 2>/dev/null || echo 0)
+            if [[ "$f" -gt "$snap_mtime" ]]; then
+                rel="${p#$PWD/}"; [[ "$rel" == "$p" ]] && rel="$p"
+                print -r "      - $rel"; any=1
+            fi
+        done
+        (( ! any )) && print -r "      (none by mtime — change may be a pull/checkout that reset mtimes)"
+    fi
 }
 
 # Generate deterministic hash of PRD content.
@@ -1015,6 +1125,8 @@ elif [[ -f "$PRD_FILE" ]]; then
 
         PRD_CHANGED_SESSION_INCOMPLETE)
             print -P "%F{yellow}[SESSION]%f PRD has changed but session $(basename "$CURRENT_SESSION_DIR") is incomplete."
+            print -P "%F{cyan}[SESSION]%f The resolved PRD = the main PRD + any @include companion docs. Changed component(s):"
+            prd_change_report "$CURRENT_SESSION_DIR"
             if [[ "$ACCEPT_PRD_CHANGES" == "true" ]]; then
                 print -P "%F{cyan}[SESSION]%f --accept-prd-changes: treating PRD edits as already-finished work; refreshing baseline (no delta)."
                 # Mirror interactive option 3: refresh snapshot so future runs see
@@ -1067,6 +1179,8 @@ elif [[ -f "$PRD_FILE" ]]; then
 
         PRD_CHANGED_SESSION_COMPLETE)
             print -P "%F{cyan}[SESSION]%f Previous session complete. PRD has changed."
+            print -P "%F{cyan}[SESSION]%f The resolved PRD = the main PRD + any @include companion docs. Changed component(s):"
+            prd_change_report "$CURRENT_SESSION_DIR"
             if [[ "$ACCEPT_PRD_CHANGES" == "true" ]]; then
                 print -P "%F{cyan}[SESSION]%f --accept-prd-changes: work already finished/validated; accepting PRD as new baseline (no delta)."
                 # Drop any queued delta so it can't fire on a future run.
@@ -2547,46 +2661,42 @@ Think creatively about what could go wrong:
 4. **Implicit Requirements**: What should obviously work but wasn't explicitly stated?
 5. **User Experience Issues**: Is the implementation usable and intuitive?
 
-### Phase 4: Documentation as Bug Report
+### Phase 4: Report Findings as Structured JSON
 
-Write a structured bug report to \`\$BUG_RESULTS_FILE\` that can be used as a PRD for fixes:
+Report your findings by writing ONE structured JSON file. The orchestrator reads
+that file and decides everything else: it renders the markdown bug report and
+launches the fix pipeline when bugs were found, or marks the run clean when not.
+You do NOT write TEST_RESULTS.md or NO_ISSUES_FOUND.md - only the JSON below.
 
-\`\`\`markdown
-# Bug Fix Requirements
+**Write your result to EXACTLY this path:** \`\$BUG_RESULTS_JSON\`
 
-## Overview
-Brief summary of testing performed and overall quality assessment.
+The file MUST be valid JSON matching this schema (the TestResults contract).
+This is a concrete valid example - replace the values with your real findings:
 
-## Critical Issues (Must Fix)
-Issues that prevent core functionality from working.
+```json
+{
+  "hasBugs": true,
+  "bugs": [
+    {
+      "id": "BUG-001",
+      "severity": "critical",
+      "title": "Short, specific title",
+      "description": "What is wrong and why it matters - include the PRD/spec clause it violates.",
+      "reproduction": "Exact steps to reproduce, with file:line references where known.",
+      "location": "src/path/to/file.rs:123"
+    }
+  ],
+  "summary": "Brief overview of the testing you performed and the overall quality.",
+  "recommendations": ["Optional next-step recommendation"]
+}
+```
 
-### Issue 1: [Title]
-**Severity**: Critical
-**PRD Reference**: [Which section/requirement]
-**Expected Behavior**: What should happen
-**Actual Behavior**: What actually happens
-**Steps to Reproduce**: How to see the bug
-**Suggested Fix**: Brief guidance on resolution
+For a clean hunt (nothing reportable found), write the same file with an empty
+bugs array:
 
-## Major Issues (Should Fix)
-Issues that significantly impact user experience or functionality.
-
-### Issue N: [Title]
-[Same format as above]
-
-## Minor Issues (Nice to Fix)
-Small improvements or polish items.
-
-### Issue N: [Title]
-[Same format as above]
-
-## Testing Summary
-- Total tests performed: X
-- Passing: X
-- Failing: X
-- Areas with good coverage: [list]
-- Areas needing more attention: [list]
-\`\`\`
+```json
+{ "hasBugs": false, "bugs": [], "summary": "...", "recommendations": [] }
+```
 
 ## Important Guidelines
 
@@ -2597,58 +2707,41 @@ Small improvements or polish items.
 5. **Prioritize**: Focus on what matters most to users
 6. **Document Everything**: Even if you're not sure it's a bug, note it
 
-## Output - IMPORTANT (READ CAREFULLY — bugs have been lost here before)
+## Output Rules - CRITICAL (bugs have been lost here before)
 
-The presence or absence of \`\$BUG_RESULTS_FILE\` is the **only** signal the
-pipeline uses to decide whether bugs were found. The pipeline **never** reads
-your chat output — only that file counts. So getting this right is the
-difference between bugs getting fixed and bugs shipping to users.
+1. **ALWAYS write \`\$BUG_RESULTS_JSON\`, whether or not you found bugs.** This is not
+   optional and not conditional. A clean hunt writes the file too, with an empty
+   bugs array. Never leave it unwritten: its absence is treated as a FAILURE,
+   not as "clean", and forces an inconsistent-result recovery.
 
-### Rule 1 — Write the report whenever you find ANY real issue
+2. **`hasBugs` MUST be true exactly when the bugs array is non-empty.** These two
+   fields are cross-checked; a mismatch is flagged.
 
-Write \`\$BUG_RESULTS_FILE\` if you found **any** issue worth a human's attention
-— **Critical, Major, OR Minor**. Minor issues are part of the durable record
-too; a later stage decides what to act on. Your job is to faithfully record what
-you found, never to triage it away by severity.
+3. **Use EXACTLY three severity values: `critical`, `major`, `minor`** (lowercase,
+   in the JSON). Map any other scale onto these:
+   - High / P0 / "blocks release" / "must fix"  -> `critical`
+   - Medium / P1 / "should fix"                  -> `major`
+   - Low / P2 / "nice to fix" / polish           -> `minor`
+   (A report filed under a "High/Medium/Low" taxonomy was once read as "no
+   Critical/Major" and thrown away. Use the canonical three.)
 
-Omit the file **only** if you genuinely found nothing reportable — no defect, no
-spec violation, no noteworthy gap of any severity. In that one case, leave no
-file; its absence signals a clean run.
+4. **Record EVERY real issue you find** - critical, major, OR minor. Your job is
+   to faithfully report what you found, not to triage it away. Minor issues are
+   part of the durable record; a later stage decides what to act on.
 
-**When in doubt about whether to write the file, WRITE IT.** A report that turns
-out to be empty costs a few seconds of review. A report that is silently dropped
-loses real bugs — that exact failure (a full report written only to chat, never
-to the file) has shipped regressions before. Always err on the side of recording.
-
-### Rule 2 — Use EXACTLY these three severity levels: Critical / Major / Minor
-
-The template above uses Critical / Major / Minor, and downstream stages match on
-those exact words. **Do not invent another scale.** If you catch yourself writing
-High/Medium/Low, P0/P1/P2, or Severity 1-5, map them onto the canonical three:
-
-- High / P0 / "blocks release" / "must fix"  → **Critical**
-- Medium / P1 / "should fix"                  → **Major**
-- Low / P2 / "nice to fix" / polish           → **Minor**
-
-A real report filed entirely under "## High severity" was once read by this
-pipeline as "no Critical/Major bugs" and thrown away — every finding lost. Use
-the words Critical / Major / Minor.
+5. **Write ONLY valid JSON to that one path.** Do not wrap your whole hunt in
+   prose and skip the file. Do not write the report to any other filename. Do
+   not also write a markdown report - the orchestrator renders the markdown from
+   your JSON. (Earlier failures shipped regressions because a full report was
+   written only to chat, or to a differently-named file, and the run was marked
+   clean.)
 
 ### Final self-check before you finish
 
-1. Re-read your own findings. Did you describe **any** issue at all, at any
-   severity? If yes, \`\$BUG_RESULTS_FILE\` **MUST** exist on disk right now with
-   that content.
-2. If you wrote your report only in your reasoning/chat and never saved the file,
-   the pipeline will treat every bug you found as "not found." Stop and write the
-   file now.
-3. Never write an empty file or a "no bugs found" file — that wastes a fix cycle.
-   Either real content goes in, or no file at all.
-
-This is imperative. The presence or absence of the bug report file controls the
-entire bugfix pipeline. Writing an empty or "no bugs found" file causes
-unnecessary work; not writing the file when there ARE bugs causes bugs to be
-missed.
+1. Does \`\$BUG_RESULTS_JSON\` exist on disk right now? If not, write it now.
+2. Is it valid JSON? Is `hasBugs` consistent with the bugs array length?
+3. Did you list every issue you described? If you described a bug in chat but
+   omitted it from the array, the pipeline treats it as "not found." Add it.
 
 ## FORBIDDEN OPERATIONS - CRITICAL
 
@@ -2658,7 +2751,7 @@ missed.
 - \`PRD.md\` - The product requirements document (READ-ONLY, owned by humans). NEVER delete or move it.
 - \`**/PRP.md\` - Plan Research Protocol files. NEVER delete, move, or overwrite them.
 - \`plan/\` - The entire plan directory and all contents (sessions, PRPs, snapshots)
-- \`**/TEST_RESULTS.md\` - Bug report files
+- \`**/TEST_RESULTS.md\` - Bug report files (the orchestrator renders these from your JSON; do not write them yourself)
 - \`**/tasks.json\` - Any tasks.json file anywhere
 - \`.gitignore\` - Never add plan/, PRD.md, or task files to gitignore
 - Source code files - you are hunting bugs, not fixing them
@@ -2666,7 +2759,10 @@ missed.
 **NEVER run \`rm\`, \`git rm\`, \`git clean\`, or \`mv\` against PRD.md, any PRP.md, or anything under plan/.** These files are owned by humans and the orchestrator. Deleting them destroys pipeline state. The pipeline auto-restores them, so a deletion will not stick - but do not attempt it.
 
 ### YOUR OUTPUT:
-You write ONLY to \`\$BUG_RESULTS_FILE\` (whenever you find any issue, per the Output rules above). Nothing else. Do not modify, move, or delete any other files.
+You write ONLY to \`\$BUG_RESULTS_JSON\` - one valid JSON file matching the schema above,
+every run, clean or not. Nothing else. Do not write or modify any other file
+(in particular, do NOT write TEST_RESULTS.md or NO_ISSUES_FOUND.md yourself - the
+orchestrator produces those from your JSON).
 EOF
 
 # Bug Fix Task Breakdown - SIMPLE flat structure for bug fixes
@@ -3931,6 +4027,68 @@ run_agent_stdin() {
     return $_s
 }
 
+# Render the bug-hunt JSON contract (bug_hunt_result.json, TestResultsSchema:
+# { hasBugs, bugs:[{id,severity,title,description,reproduction,location?}],
+#   summary, recommendations }) into the TEST_RESULTS.md markdown the downstream
+# bug-fix breakdown consumes as a PRD (it indexes sections by h2/h3).
+#
+# The orchestrator — NOT the bug-finder agent — owns this file. The agent only
+# writes the structured JSON; we render the markdown so the output format is
+# always correct regardless of which agent/model ran the hunt. Tolerates a
+# ```json fence and missing optional fields.
+#
+# Usage: render_bug_results_md <json_path> <out_md_path>
+render_bug_results_md() {
+    local json="$1" out="$2"
+    python3 - "$json" "$out" <<'PYEOF'
+import json, re, sys
+inp, outp = sys.argv[1], sys.argv[2]
+raw = open(inp, encoding="utf-8").read()
+m = re.search(r"```(?:json)?\s*(\{.*\})\s*```", raw, re.S)
+try:
+    data = json.loads(m.group(1) if m else raw)
+except Exception as e:
+    sys.stderr.write("render_bug_results_md: invalid JSON: %s\n" % e)
+    sys.exit(1)
+bugs = data.get("bugs") or []
+summary = (data.get("summary") or "Bug hunt complete.").strip()
+recs = data.get("recommendations") or []
+sect = {
+    "critical": ("## Critical Issues (Must Fix)",
+                 "Issues that prevent core functionality from working."),
+    "major":    ("## Major Issues (Should Fix)",
+                 "Issues that significantly impact user experience or functionality."),
+    "minor":    ("## Minor Issues (Nice to Fix)",
+                 "Small improvements or polish items."),
+}
+L = ["# Bug Fix Requirements", "", "## Overview", summary, ""]
+for sev in ("critical", "major", "minor"):
+    grp = [b for b in bugs if str(b.get("severity", "")).lower() == sev]
+    L += ["", sect[sev][0], sect[sev][1], ""]
+    if not grp:
+        L += ["None.", ""]
+        continue
+    for i, b in enumerate(grp, 1):
+        L.append("### Issue %d: %s" % (i, b.get("title") or "Untitled"))
+        L.append("**Severity**: %s%s" % (sev[:1].upper(), sev[1:]))
+        if b.get("id"):
+            L.append("**ID**: %s" % b["id"])
+        if b.get("location"):
+            L.append("**Location**: %s" % b["location"])
+        L += ["", "**Description**:", b.get("description") or "-", "",
+              "**Steps to Reproduce**:",
+              b.get("reproduction") or b.get("steps_to_reproduce") or "-", ""]
+L += ["## Testing Summary",
+      "- Total bugs found: %d" % len(bugs),
+      "- Critical: %d" % sum(1 for b in bugs if str(b.get("severity", "")).lower() == "critical"),
+      "- Major: %d"    % sum(1 for b in bugs if str(b.get("severity", "")).lower() == "major"),
+      "- Minor: %d"    % sum(1 for b in bugs if str(b.get("severity", "")).lower() == "minor")]
+if recs:
+    L += ["", "## Recommendations"] + ["- %s" % r for r in recs]
+open(outp, "w", encoding="utf-8").write("\n".join(L) + "\n")
+PYEOF
+}
+
 # Protects PRD.md and **/PRP.md from AI deletion.
 # The autonomous bug finder, the validation fixer, and especially the cleanup
 # agent sometimes delete these critical files. Because smart_commit runs
@@ -4586,6 +4744,12 @@ if [[ "$SKIP_BUG_FINDING" == "false" ]]; then
     fi
 
     BUG_RESULTS_FILE="$CURRENT_BUGFIX_SESSION/TEST_RESULTS.md"
+    # Structured contract the bug finder writes (TestResults JSON). This is the
+    # agent's ONLY output. The orchestrator renders TEST_RESULTS.md from it when
+    # bugs were found, or records a clean result when not — the agent never
+    # writes (or fails to write) the disposition files itself.
+    BUG_RESULTS_JSON="$CURRENT_BUGFIX_SESSION/bug_hunt_result.json"
+    BUG_HUNT_TRANSCRIPT="$CURRENT_BUGFIX_SESSION/bug-hunt-transcript.log"
 
     # --- Check for failed tasks from previous session ---
     # Priority: previous bugfix session > main session
@@ -4641,14 +4805,17 @@ Please include these in your bug report if they represent real issues.
 
     print -P "\n%F{magenta}[BUG HUNT]%f Starting creative bug finding with $BUG_FINDER_AGENT..."
 
-    # Check if bug report already exists (resuming interrupted session)
-    if [[ -f "$BUG_RESULTS_FILE" ]]; then
-        print -P "%F{yellow}[BUG HUNT]%f Existing bug report found: $BUG_RESULTS_FILE"
+    # Check if a result already exists (resuming interrupted session).
+    # Either a rendered TEST_RESULTS.md (bugs) or the raw JSON contract counts.
+    if [[ -f "$BUG_RESULTS_FILE" || -f "$BUG_RESULTS_JSON" ]]; then
+        [[ -f "$BUG_RESULTS_FILE" ]] && print -P "%F{yellow}[BUG HUNT]%f Existing bug report found: $BUG_RESULTS_FILE"
+        [[ -f "$BUG_RESULTS_JSON" ]] && print -P "%F{yellow}[BUG HUNT]%f Existing bug-hunt contract found: $BUG_RESULTS_JSON"
         print -P "%F{cyan}[BUG HUNT]%f Skipping discovery, proceeding to bug fix pipeline..."
     else
-        # Run bug finding - agent will ONLY create file if bugs found
-        # Expand $BUG_RESULTS_FILE in the prompt template and inject failed tasks info
-        EXPANDED_BUG_PROMPT=$(echo "$BUG_FINDING_PROMPT" | BUG_RESULTS_FILE="$BUG_RESULTS_FILE" envsubst '$BUG_RESULTS_FILE')
+        # Run bug finding. The agent writes ONE file: the JSON contract. Expand
+        # both $BUG_RESULTS_FILE (referenced in FORBIDDEN rules) and
+        # $BUG_RESULTS_JSON (the path it must write) in the prompt template.
+        EXPANDED_BUG_PROMPT=$(echo "$BUG_FINDING_PROMPT" | BUG_RESULTS_FILE="$BUG_RESULTS_FILE" BUG_RESULTS_JSON="$BUG_RESULTS_JSON" envsubst '$BUG_RESULTS_FILE:$BUG_RESULTS_JSON')
 
         # Prepend failed tasks info if we have any
         if [[ -n "$FAILED_TASKS_INFO" ]]; then
@@ -4657,19 +4824,59 @@ Please include these in your bug report if they represent real issues.
 ${EXPANDED_BUG_PROMPT}"
         fi
 
-        # Capture the agent's combined output so that if it describes bugs in
-        # chat but fails to write BUG_RESULTS_FILE (a real past failure: a full
-        # High/Medium/Low report was produced but never saved, so real bugs were
-        # lost to a silent NO_ISSUES_FOUND), the report is recoverable and the
-        # inconsistency is detected below instead of being marked clean.
-        BUG_HUNT_TRANSCRIPT="$CURRENT_BUGFIX_SESSION/bug-hunt-transcript.log"
+        # Capture the agent's combined output as an audit trail + safety net: if
+        # the agent describes bugs in chat but never writes a valid JSON contract
+        # (a real past failure — a report written only to chat, or to a
+        # differently-named file), the transcript lets us detect and recover it
+        # below instead of marking the run clean and losing real bugs.
         CAPTURE_STDOUT="$BUG_HUNT_TRANSCRIPT" run_with_retry_stdin "$EXPANDED_BUG_PROMPT" $BUG_FINDER_AGENT --no-session
     fi
 
-    # If no report file was created, distinguish two cases:
-    #   (a) genuinely clean — agent found nothing reportable; or
+    # --- Resolve the JSON contract into the disposition files ---
+    # The agent's only job was to write bug_hunt_result.json. WE own what happens
+    # next: render TEST_RESULTS.md when bugs were found (so the fix branch below
+    # runs), or signal clean. This is what makes "the agent forgot to write the
+    # right file" impossible — there is now exactly one contract path, and the
+    # orchestrator produces every disposition file from it.
+    if [[ -f "$BUG_RESULTS_JSON" && ! -f "$BUG_RESULTS_FILE" ]]; then
+        # Tolerate a ```json fence some models wrap the file in.
+        if ! jq -e 'type=="object" and has("bugs")' "$BUG_RESULTS_JSON" >/dev/null 2>&1; then
+            BUG_FENCED=$(python3 -c 'import re,sys; raw=open(sys.argv[1],encoding="utf-8").read(); m=re.search(r"```(?:json)?\s*(\{.*\})\s*```",raw,re.S); print(m.group(1) if m else "")' "$BUG_RESULTS_JSON" 2>/dev/null)
+            if [[ -n "$BUG_FENCED" ]]; then
+                print -r -- "$BUG_FENCED" > "$BUG_RESULTS_JSON"
+            fi
+        fi
+        # Validate shape: object with a bugs array whose severities are canonical.
+        if jq -e 'type=="object" and has("bugs") and (.bugs|type=="array") and (all(.bugs[]?; ((.severity//"none")|ascii_downcase) as $s | $s=="critical" or $s=="major" or $s=="minor"))' "$BUG_RESULTS_JSON" >/dev/null 2>&1; then
+            BUG_COUNT=$(jq '.bugs | length' "$BUG_RESULTS_JSON")
+            BUG_HASBUGS=$(jq -r '.hasBugs // false' "$BUG_RESULTS_JSON")
+            if [[ "${BUG_COUNT:-0}" -gt 0 ]]; then
+                render_bug_results_md "$BUG_RESULTS_JSON" "$BUG_RESULTS_FILE"
+                print -P "%F{cyan}[BUG HUNT]%f Rendered bug report from JSON contract: $BUG_RESULTS_FILE ($BUG_COUNT bug(s))"
+            elif [[ "$BUG_HASBUGS" == "true" ]]; then
+                # Contract claims bugs but lists none — do NOT mark clean. Leave
+                # the transcript so the inconsistency scan below catches it.
+                print -P "%F{yellow}[BUG HUNT]%f JSON contract has hasBugs=true but lists 0 bugs; scanning transcript for the claimed findings..."
+            else
+                # Genuinely clean per the contract. Drop the transcript + JSON so
+                # the clean branch below runs without the safety net second-
+                # guessing a clean contract (and without leaving chat chatter
+                # that mentions bug-shaped words around an actually-clean run).
+                print -P "%F{green}[BUG HUNT]%f JSON contract reports a clean run (hasBugs=false, 0 bugs)."
+                rm -f "$BUG_HUNT_TRANSCRIPT" "$BUG_RESULTS_JSON" 2>/dev/null
+            fi
+        else
+            print -P "%F{yellow}[BUG HUNT]%f $BUG_RESULTS_JSON failed schema validation; falling back to transcript scan."
+        fi
+    fi
+
+    # If no TEST_RESULTS.md exists by now, the JSON contract either reported a
+    # clean run, was missing/invalid, or claimed bugs but listed none. The first
+    # two already left things clean; the last falls through to the safety-net
+    # transcript scan below. Distinguish:
+    #   (a) genuinely clean — contract reported no bugs (already handled above);
     #   (b) INCONSISTENT — the agent described bugs (visible in its captured
-    #       transcript) but never wrote BUG_RESULTS_FILE. This has happened
+    #       transcript) but never wrote a valid JSON contract. This has happened
     #       before: the bug finder produced a full High/Medium/Low report in
     #       chat, applied the old "only write on Critical/Major" rule literally,
     #       and wrote nothing — so real bugs shipped under a silent
@@ -4781,8 +4988,8 @@ ${EXPANDED_BUG_PROMPT}"
         print -P "%F{yellow}[BUG FIX]%f Session: $(basename "$CURRENT_BUGFIX_SESSION")"
         print -P "%F{yellow}[BUG FIX]%f Scope: $BUGFIX_SCOPE"
 
-        # Commit the bug report before starting fix cycle
-        git add "$BUG_RESULTS_FILE" 2>/dev/null
+        # Commit the bug report + its JSON contract before starting the fix cycle
+        git add "$BUG_RESULTS_FILE" "$BUG_RESULTS_JSON" 2>/dev/null
         git commit -m "Add bug report: $(basename "$CURRENT_BUGFIX_SESSION")" &>/dev/null || true
 
         # Re-run the pipeline with bug fixes - session dir IS the bugfix session
