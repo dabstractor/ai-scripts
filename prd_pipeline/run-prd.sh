@@ -360,11 +360,24 @@ resolve_prd_content() {
     fi
 
     _PRD_INCLUDE_STACK[$abs_path]=1
-    local line
+    local line in_fence=0 bt=$'\140'
+    # Fenced code blocks (``` or ~~~, up to 3 leading spaces) pass through
+    # verbatim, so @<path> tokens shown inside one as documentation are never
+    # treated as include directives. The delimiter line toggles the state.
+    local fence_re="^[[:space:]]{0,3}(${bt}${bt}${bt}+|~~~+)"
     while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" =~ $fence_re ]]; then
+            print -r -- "$line"
+            (( in_fence )) && in_fence=0 || in_fence=1
+            continue
+        fi
+        if (( in_fence )); then
+            print -r -- "$line"
+            continue
+        fi
         # Expand every resolvable @<path> token on this line (inline-aware).
-        # Lines with no token — or tokens that don't resolve to a file — are
-        # emitted verbatim.
+        # Lines with no token — or tokens that don't resolve to a file, or that
+        # are wrapped in inline code — are emitted verbatim.
         expand_inline_includes "$line" "$root" "$file_path" $(( depth + 1 ))
     done < "$file_path"
     unset "_PRD_INCLUDE_STACK[$abs_path]"
@@ -395,25 +408,44 @@ resolve_prd_content() {
 # Usage: expand_inline_includes <line> <root> <source_file> <depth>
 expand_inline_includes() {
     local line="$1" root="$2" src="$3" depth="$4"
-    local result="" tok include_path before_at
-    local mbegin mend
-    # Match "@" + a run of path chars; capture just the path. The boundary is
-    # checked manually from the preceding char so we never clobber the match
-    # offsets ($MBEGIN/$MEND) with a second regex test.
+    local result="" tok include_path before_at pre pre_bt
+    local cap_begin cap_end
+    local bt=$'\140' bt_count=0
+    # Match "@" + a run of path chars; capture just the path. Copy the whole-match
+    # offsets into neutrally-named locals (cap_begin/cap_end) right here: zsh also
+    # repopulates the RESERVED $mbegin/$mend arrays on every =~, including the
+    # warning match below, which would otherwise clobber our saved offsets before
+    # the line slice. The char before '@' is then checked via `==` (pattern match,
+    # not =~) so $match/$MBEGIN/$MEND stay intact here too.
     while [[ "$line" =~ @([A-Za-z0-9._~/-]+) ]]; do
         tok="${match[1]}"
-        mbegin=$MBEGIN
-        mend=$MEND
+        cap_begin=$MBEGIN
+        cap_end=$MEND
         # Everything before the '@' is kept as-is.
-        result+="${line[1,mbegin-1]}"
+        pre="${line[1,cap_begin-1]}"
+        result+="$pre"
         before_at=""
-        (( mbegin > 1 )) && before_at="${line[mbegin-1,mbegin-1]}"
+        (( cap_begin > 1 )) && before_at="${line[cap_begin-1,cap_begin-1]}"
 
-        # Boundary: preceding char (if any) must NOT be a path character.
-        # `==` with a char-class pattern does pattern matching WITHOUT touching
-        # $match/$MBEGIN (only `=~` sets those), so offsets stay intact.
-        if [[ -n "$before_at" ]] && [[ "$before_at" == [A-Za-z0-9._~/-] ]]; then
-            # Mid-token '@' (email "foo@bar.com", "user@host") → keep literal.
+        # Markdown awareness: an '@' inside an inline code span (`@token`) is
+        # documentation, not a directive. We track the running backtick count of
+        # the original line — the shrunken $line buffer is always a suffix of it,
+        # so the per-iteration prefixes sum correctly — and an odd count means
+        # this '@' sits between an opening and a closing backtick. Pure parameter
+        # expansion here (no `=~`) keeps $match/$MBEGIN/$MEND intact. Fenced code
+        # blocks are handled by the caller (resolve_prd_content), which emits such
+        # lines verbatim.
+        pre_bt="${pre//[^$bt]/}"
+        bt_count=$(( bt_count + ${#pre_bt} ))
+
+        if (( bt_count % 2 )); then
+            # Inside an inline code span → keep literal, no warning.
+            result+="@$tok"
+        elif [[ -n "$before_at" ]] && [[ "$before_at" == [A-Za-z0-9._~/-] ]]; then
+            # Boundary: preceding char is a path character → mid-token '@'
+            # (email "foo@bar.com", "user@host") → keep literal. `==` with a
+            # char-class pattern does pattern matching WITHOUT touching
+            # $match/$MBEGIN (only `=~` sets those), so offsets stay intact.
             result+="@$tok"
         else
             include_path="$tok"
@@ -435,7 +467,7 @@ expand_inline_includes() {
             fi
         fi
         # Continue scanning after this token.
-        line="${line[mend+1,-1]}"
+        line="${line[cap_end+1,-1]}"
     done
     result+="$line"
     print -r -- "$result"
@@ -737,6 +769,13 @@ SKIP_BUG_FINDING="${SKIP_BUG_FINDING:-false}"
 # gets its own watchdog budget - overriding PI_AGENT_TIMEOUT for the validation
 # call only. Bump via the env var if a particular validation needs even longer.
 VALIDATION_TIMEOUT="${VALIDATION_TIMEOUT:-7200}"
+
+# The validation-driven fixer re-runs lint/typecheck/the full test suite and
+# rebuilds while iterating on EVERY reported issue — strictly more work than
+# inspecting, so it gets a bigger watchdog budget than validation itself. (Some
+# projects' unit suites alone take 5+ minutes per run; a fixer looping over 250+
+# failures needs the headroom.) Default 4h; bump via the env var for heavy runs.
+FIX_TIMEOUT="${FIX_TIMEOUT:-14400}"
 
 # Issue retry configuration
 # When an agent returns "result": "issue", we retry with feedback up to this many times
@@ -2661,19 +2700,28 @@ Think creatively about what could go wrong:
 4. **Implicit Requirements**: What should obviously work but wasn't explicitly stated?
 5. **User Experience Issues**: Is the implementation usable and intuitive?
 
-### Phase 4: Report Findings as Structured JSON
+### Phase 4: Report Findings as a Structured JSON VERDICT
 
-Report your findings by writing ONE structured JSON file. The orchestrator reads
-that file and decides everything else: it renders the markdown bug report and
-launches the fix pipeline when bugs were found, or marks the run clean when not.
-You do NOT write TEST_RESULTS.md or NO_ISSUES_FOUND.md - only the JSON below.
+Your final output MUST contain ONE structured JSON object: your VERDICT. The
+orchestrator parses this object DIRECTLY OUT OF YOUR RESPONSE (and out of the
+JSON file you were given, if you also write it) and uses it - and ONLY it - to
+decide whether bugs were found. It is not a summary; it is the decision.
+
+The orchestrator CANNOT guess your verdict from prose, a markdown table, or an
+emoji-severity report. If your response contains no parseable JSON object
+matching the schema below, the run is treated as a FAILURE (never "clean"), and
+a forced re-extraction pass will try to recover your findings from your
+transcript. So emit the JSON yourself, as the LAST block in your response, to
+make your verdict unambiguous. Writing it to the file too is a courtesy and a
+cross-check; your emitted JSON is the authoritative contract either way. You do
+NOT write TEST_RESULTS.md or NO_ISSUES_FOUND.md.
 
 **Write your result to EXACTLY this path:** \`\$BUG_RESULTS_JSON\`
 
 The file MUST be valid JSON matching this schema (the TestResults contract).
 This is a concrete valid example - replace the values with your real findings:
 
-```json
+\`\`\`json
 {
   "hasBugs": true,
   "bugs": [
@@ -2689,14 +2737,14 @@ This is a concrete valid example - replace the values with your real findings:
   "summary": "Brief overview of the testing you performed and the overall quality.",
   "recommendations": ["Optional next-step recommendation"]
 }
-```
+\`\`\`
 
 For a clean hunt (nothing reportable found), write the same file with an empty
 bugs array:
 
-```json
+\`\`\`json
 { "hasBugs": false, "bugs": [], "summary": "...", "recommendations": [] }
-```
+\`\`\`
 
 ## Important Guidelines
 
@@ -2710,18 +2758,20 @@ bugs array:
 ## Output Rules - CRITICAL (bugs have been lost here before)
 
 1. **ALWAYS write \`\$BUG_RESULTS_JSON\`, whether or not you found bugs.** This is not
-   optional and not conditional. A clean hunt writes the file too, with an empty
-   bugs array. Never leave it unwritten: its absence is treated as a FAILURE,
-   not as "clean", and forces an inconsistent-result recovery.
+   optional and not conditional. Emit the object as the LAST block of your
+   response (a fenced json code block is ideal); a clean hunt emits it too, with
+   an empty bugs array. The ONLY way the run is marked clean is if your emitted
+   object has hasBugs:false and an empty bugs array; a missing, malformed, or
+   self-contradictory verdict is a FAILURE, not "clean".
 
-2. **`hasBugs` MUST be true exactly when the bugs array is non-empty.** These two
+2. **\`hasBugs\` MUST be true exactly when the bugs array is non-empty.** These two
    fields are cross-checked; a mismatch is flagged.
 
-3. **Use EXACTLY three severity values: `critical`, `major`, `minor`** (lowercase,
+3. **Use EXACTLY three severity values: \`critical\`, \`major\`, \`minor\`** (lowercase,
    in the JSON). Map any other scale onto these:
-   - High / P0 / "blocks release" / "must fix"  -> `critical`
-   - Medium / P1 / "should fix"                  -> `major`
-   - Low / P2 / "nice to fix" / polish           -> `minor`
+   - High / P0 / "blocks release" / "must fix"  -> \`critical\`
+   - Medium / P1 / "should fix"                  -> \`major\`
+   - Low / P2 / "nice to fix" / polish           -> \`minor\`
    (A report filed under a "High/Medium/Low" taxonomy was once read as "no
    Critical/Major" and thrown away. Use the canonical three.)
 
@@ -2739,7 +2789,7 @@ bugs array:
 ### Final self-check before you finish
 
 1. Does \`\$BUG_RESULTS_JSON\` exist on disk right now? If not, write it now.
-2. Is it valid JSON? Is `hasBugs` consistent with the bugs array length?
+2. Is it valid JSON? Is \`hasBugs\` consistent with the bugs array length?
 3. Did you list every issue you described? If you described a bug in chat but
    omitted it from the array, the pipeline treats it as "not found." Add it.
 
@@ -4089,6 +4139,177 @@ open(outp, "w", encoding="utf-8").write("\n".join(L) + "\n")
 PYEOF
 }
 
+# Resolve the bug finder's verdict DETERMINISTICALLY from its own output.
+#
+# WHY THIS EXISTS: pi exposes no provider-level response-schema enforcement
+# (no --output-schema / response_format), so a tool-using agent CANNOT be
+# decode-constrained to JSON. The old design papered over that by (a) asking
+# the agent to write a JSON file and (b) backstopping a missing file with a
+# prose-regex scan of the transcript. Both are "hope", not "force": the agent
+# frequently wrote a freeform markdown report instead of the file, and the
+# regex could not see severity markers inside markdown TABLE cells, so 3 real
+# bugs were once silently shipped under a NO_ISSUES_FOUND marker.
+#
+# This function makes the agent's EMITTED JSON the single source of truth and
+# parses it ourselves, with a strict rule:
+#   * CLEAN  iff the agent EXPLICITLY declared {hasBugs:false, bugs:[]}
+#   * FOUND  iff the bugs array is non-empty
+#   * INVALID otherwise (missing / malformed / self-contradictory)
+# A run can reach CLEAN only through an explicit false declaration — there is
+# no "clean by default". The caller treats INVALID as INCONSISTENT (refuses to
+# mark the run done, keeps the transcript). The prose-regex scan is gone.
+#
+# Source priority: (1) $json_file if it already holds a valid TestResults
+# object; (2) the LAST {...} / ```json``` block in $transcript that validates
+# (prefering objects that carry an explicit hasBugs key). Severities are
+# canonicalized (high/p0/blocker->critical, medium/p1/major->major,
+# low/p2/minor/trivial->minor) so downstream staging is uniform regardless of
+# the taxonomy the agent used.
+#
+# Side effects: on found/clean, writes the canonicalized object to $json_file
+# (durable record of the declaration). The caller renders the markdown report.
+# Stdout: one JSON line
+#   {"verdict":"found|clean|invalid","bug_count":N,"source":"file|transcript|none","reason":"..."}
+# Usage: resolve_bug_verdict <transcript_path> <json_file_path>
+resolve_bug_verdict() {
+    local transcript="$1" json_file="$2"
+    if [[ -z "$transcript" && -z "$json_file" ]]; then
+        print '{"verdict":"invalid","bug_count":0,"source":"none","reason":"no sources given"}'
+        return
+    fi
+    python3 - "$transcript" "$json_file" <<'PYEOF'
+import json, sys
+transcript, json_file = sys.argv[1], sys.argv[2]
+
+SEV = {'critical':'critical','crit':'critical','p0':'critical','high':'critical',
+       'blocker':'critical','fatal':'critical','severe':'critical','urgent':'critical',
+       'major':'major','p1':'major','medium':'major','moderate':'major','normal':'major',
+       'minor':'minor','p2':'minor','low':'minor','trivial':'minor','cosmetic':'minor',
+       'polish':'minor','nice':'minor','nice-to-have':'minor','nice to fix':'minor',
+       'info':'minor','low-med':'minor','low\u2013med':'minor','low-medium':'minor'}
+def canon(s):
+    if s is None:
+        return None
+    return SEV.get(str(s).strip().lower())
+
+def objects_in(text):
+    """Yield (start, parsed) for every brace-balanced {...} that parses to a dict.
+    Prefiltered: only '{' positions whose next 400 chars mention bugs/hasBugs,
+    so a prose transcript with many stray braces stays fast."""
+    if not text:
+        return
+    for i, c in enumerate(text):
+        if c != '{':
+            continue
+        window = text[i:i+400]
+        if 'bugs' not in window and 'hasBugs' not in window and 'has_bugs' not in window:
+            continue
+        depth = 0
+        in_str = False
+        esc = False
+        for j in range(i, len(text)):
+            ch = text[j]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == '\\':
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+            else:
+                if ch == '"':
+                    in_str = True
+                elif ch == '{':
+                    depth += 1
+                elif ch == '}':
+                    depth -= 1
+                    if depth == 0:
+                        try:
+                            obj = json.loads(text[i:j+1])
+                        except Exception:
+                            obj = None
+                        if isinstance(obj, dict):
+                            yield i, obj
+                        break
+
+def is_testresults(o):
+    return isinstance(o, dict) and isinstance(o.get('bugs'), list)
+
+def best_object(text):
+    with_hb = []
+    without = []
+    for start, o in objects_in(text):
+        if not is_testresults(o):
+            continue
+        if 'hasBugs' in o:
+            with_hb.append((start, o))
+        else:
+            without.append((start, o))
+    pool = with_hb or without
+    if not pool:
+        return None
+    pool.sort(key=lambda t: t[0])   # document order
+    return pool[-1][1]              # last wins: the verdict is the agent's FINAL output
+
+data = None
+source = 'none'
+if json_file:
+    try:
+        o = best_object(open(json_file, encoding='utf-8').read())
+        if o is not None:
+            data, source = o, 'file'
+    except Exception:
+        pass
+if data is None and transcript:
+    try:
+        o = best_object(open(transcript, encoding='utf-8').read())
+        if o is not None:
+            data, source = o, 'transcript'
+    except Exception:
+        pass
+
+if data is None:
+    print(json.dumps({"verdict": "invalid", "bug_count": 0, "source": source,
+                      "reason": "no TestResults JSON object found in file or transcript"}))
+    sys.exit(0)
+
+bugs = []
+for b in data.get('bugs') or []:
+    if not isinstance(b, dict):
+        continue
+    nb = dict(b)
+    nb['severity'] = canon(b.get('severity')) or 'minor'
+    bugs.append(nb)
+has_bugs = data.get('hasBugs', None)
+
+# CLEAN is valid ONLY as an explicit false declaration with no bugs listed.
+if bugs:
+    verdict = 'found'
+elif has_bugs is False:
+    verdict = 'clean'
+else:
+    if has_bugs is True:
+        reason = "hasBugs=true but the bugs list is empty \u2014 agent claims bugs but listed none"
+    else:
+        reason = "bugs list empty and hasBugs not explicitly false \u2014 no explicit clean declaration"
+    print(json.dumps({"verdict": "invalid", "bug_count": 0, "source": source, "reason": reason}))
+    sys.exit(0)
+
+canonical = {
+    "hasBugs": verdict == 'found',
+    "bugs": bugs,
+    "summary": data.get('summary') or ("Bugs found." if verdict == 'found' else "No issues found."),
+    "recommendations": data.get('recommendations') or [],
+}
+if json_file:
+    try:
+        open(json_file, 'w', encoding='utf-8').write(json.dumps(canonical, ensure_ascii=False, indent=2) + "\n")
+    except Exception as e:
+        sys.stderr.write("resolve_bug_verdict: could not write %s: %s\n" % (json_file, e))
+print(json.dumps({"verdict": verdict, "bug_count": len(bugs), "source": source, "reason": "ok"}))
+PYEOF
+}
+
 # Protects PRD.md and **/PRP.md from AI deletion.
 # The autonomous bug finder, the validation fixer, and especially the cleanup
 # agent sometimes delete these critical files. Because smart_commit runs
@@ -4589,6 +4810,30 @@ ID=$(generate_id $PHASE_NUM $MS_NUM $TASK_NUM $SUBTASK_NUM)
 done
 fi  # end SKIP_EXECUTION_LOOP guard
 
+# HALT gate: if any item ended in Failed, implementation is incomplete and
+# validation must NOT run on top of known failures (it would only re-report
+# them, then the old cleanup/commit path marched on as if nothing was wrong).
+# Per-task retry is the TS rewrite's job; the shell pipeline's contract is to
+# STOP the whole run here so the failure can be diagnosed and the item re-run.
+# This closes the gap the ISSUE_STREAK mid-loop halt can't: a single Failed task
+# whose downstream dependents merely defer/block (streak stays under MAX) used
+# to fall through to validation. Only applies when we actually ran the loop.
+if [[ "$SKIP_EXECUTION_LOOP" != "true" ]]; then
+    _failed_count=$(jq '[.. | objects | select(.status? == "Failed")] | length' "$TASKS_FILE" 2>/dev/null)
+    if [[ "${_failed_count:-0}" -gt 0 ]]; then
+        print -P ""
+        print -P "%F{red}%B[HALT]%b%f %BImplementation incomplete: $_failed_count item(s) in Failed status.%b"
+        print -P "%F{red}[HALT]%f Validation will not run on top of known failures."
+        print -P "%F{red}[HALT]%f Failed items:"
+        jq -r '[.. | objects | select(.status? == "Failed")] | .[] | "  - \(.id // "?")  \(.title // "")"' "$TASKS_FILE" 2>/dev/null | head -20
+        print -P "%F{cyan}[HALT]%f Fix the root cause, then retry a failed item with:  tsk -f \"$TASKS_FILE\" next-failed --retry"
+        [[ -n "$RESEARCH_PID" ]] && kill -TERM "$RESEARCH_PID" 2>/dev/null
+        print -P "%F{blue}[GIT]%f Persisting current state before halt..."
+        smart_commit
+        exit 1
+    fi
+fi
+
 else
     # Validation Only Mode
     print -P "%F{cyan}[CONFIG]%f Running in %F{magenta}VALIDATION ONLY%f mode"
@@ -4669,19 +4914,51 @@ if [[ -f "validation_report.md" ]]; then
 
         FORBIDDEN: Only edit source files to fix the reported issues. NEVER delete or move PRD.md, any PRP.md, anything under plan/, tasks.json, prd_snapshot.md, or TEST_RESULTS.md - these are pipeline state owned by humans / the orchestrator."
 
-        run_with_retry_stdin "$FIX_PROMPT" $IMPL_AGENT --no-session
-        print -P "%F{green}[FIX]%f Fixes applied."
+        # Give the fixer its own generous watchdog budget (FIX_TIMEOUT, default
+        # 4h) — same override pattern validation uses. The default PI_AGENT_TIMEOUT
+        # (1h) is far too short for a phase that re-runs full test suites.
+        fix_rc=0
+        PI_AGENT_TIMEOUT=$FIX_TIMEOUT run_with_retry_stdin "$FIX_PROMPT" $IMPL_AGENT --no-session || fix_rc=$?
+        if (( fix_rc == 0 )); then
+            print -P "%F{green}[FIX]%f Fixes applied."
+        elif (( fix_rc == 124 )); then
+            print -P "%F{red}[FIX]%f Fixer agent exceeded the watchdog budget (exit 124). Fixes are INCOMPLETE — the validation report is preserved (see [CLEANUP]); re-run or finish the fixes manually."
+            FIX_INCOMPLETE=1
+        else
+            print -P "%F{red}[FIX]%f Fixer agent failed (exit $fix_rc). Fixes are INCOMPLETE — the validation report is preserved (see [CLEANUP]); finish the fixes manually."
+            FIX_INCOMPLETE=1
+        fi
     fi
 fi
 
-# Cleanup: Delete validation artifacts
-print -P "%F{blue}[CLEANUP]%f Removing validation artifacts..."
+# Cleanup: move validation artifacts out of the working tree WITHOUT destroying
+# them. The validation report is the only record of what was wrong and what the
+# fixer was asked to repair. A past bug watchdog-killed the fixer mid-fix, then
+# this step `rm`'d the only copy — the critical findings were gone for good.
+# Always preserve both files into the session directory first; only then remove
+# them from the cwd, and only when the fix actually completed.
+PRESERVED_REPORT=""
+if [[ -n "$SESSION_DIR" ]] && [[ -d "$SESSION_DIR" ]]; then
+    [[ -f "./validation_report.md" ]] && cp -f "./validation_report.md" "$SESSION_DIR/validation_report.md" && PRESERVED_REPORT="$SESSION_DIR/validation_report.md"
+    [[ -f "./validate.sh" ]] && cp -f "./validate.sh" "$SESSION_DIR/validate.sh"
+fi
 
-# Ask agent to delete the files (in case they were created elsewhere)
-run_with_retry $AGENT --no-session -p "Delete the validation artifacts: remove ./validate.sh and ./validation_report.md from the current directory. These are temporary files that should not be committed." < /dev/null
-
-# Manual deletion as backup (in case agent didn't delete them)
-rm -f "./validate.sh" "./validation_report.md" 2>/dev/null
+if [[ "${FIX_INCOMPLETE:-0}" == "1" ]]; then
+    # Fixer didn't finish: keep the artifacts in the cwd too (immediately
+    # visible) and skip the auto-commit so incomplete work isn't stamped as done.
+    if [[ -n "$PRESERVED_REPORT" ]]; then
+        print -P "%F{yellow}[CLEANUP]%f Fix incomplete — validation_report.md KEPT in cwd and also preserved at: $PRESERVED_REPORT"
+    else
+        print -P "%F{yellow}[CLEANUP]%f Fix incomplete — validation_report.md left in cwd (no session dir to preserve into)."
+    fi
+else
+    print -P "%F{blue}[CLEANUP]%f Removing validation artifacts from working tree (preserved in session dir)..."
+    # Ask agent to delete the files (in case they were created elsewhere)
+    run_with_retry $AGENT --no-session -p "Delete the validation artifacts: remove ./validate.sh and ./validation_report.md from the current directory. These are temporary files that should not be committed." < /dev/null
+    # Manual deletion as backup (in case agent didn't delete them)
+    rm -f "./validate.sh" "./validation_report.md" 2>/dev/null
+    [[ -n "$PRESERVED_REPORT" ]] && print -P "%F{cyan}[CLEANUP]%f Validation report preserved at: $PRESERVED_REPORT"
+fi
 
 # NOTE: We deliberately do NOT auto-mark any task Complete here.
 # Previously this block ran `tsk next` (which returns the FIRST actionable
@@ -4693,9 +4970,15 @@ rm -f "./validate.sh" "./validation_report.md" 2>/dev/null
 # is the SOLE responsibility of execute_item, which only marks Complete after
 # verifying real source/PRP changes. Do not re-add blind completion here.
 
-# Final smart commit after validation
-print -P "%F{blue}[GIT]%f Committing final changes with smart commit..."
-smart_commit
+# Final smart commit after validation — but only if the fixer completed. On an
+# incomplete/failed fix we leave partial changes uncommitted in the working tree
+# for manual review instead of stamping them with a clean "fixed" commit.
+if [[ "${FIX_INCOMPLETE:-0}" == "1" ]]; then
+    print -P "%F{yellow}[GIT]%f Skipping auto-commit (fixer did not complete). Partial changes remain in the working tree — review and commit manually."
+else
+    print -P "%F{blue}[GIT]%f Committing final changes with smart commit..."
+    smart_commit
+fi
 
 fi  # End of validation block (skip if bug-hunt only mode)
 
@@ -4831,122 +5114,104 @@ ${EXPANDED_BUG_PROMPT}"
         # below instead of marking the run clean and losing real bugs.
         CAPTURE_STDOUT="$BUG_HUNT_TRANSCRIPT" run_with_retry_stdin "$EXPANDED_BUG_PROMPT" $BUG_FINDER_AGENT --no-session
     fi
+    # --- Resolve the verdict DETERMINISTICALLY from the agent's own output ---
+    #
+    # The bug finder is a tool-using reasoning agent. pi exposes NO provider-
+    # level response-schema enforcement (no --output-schema / response_format),
+    # so we cannot decode-constrain its answer to JSON. Instead we make the
+    # agent's EMITTED JSON the single source of truth and parse it ourselves,
+    # then enforce a strict rule the old design lacked:
+    #
+    #   A run can be marked CLEAN only if the agent EXPLICITLY declared
+    #   {hasBugs:false, bugs:[]}. A missing, malformed, or self-contradictory
+    #   verdict is NEVER clean -- it is INCONSISTENT, the transcript is kept,
+    #   and the run refuses to mark itself done.
+    #
+    # This kills the failure mode that just lost 3 real bugs: the agent wrote a
+    # freeform markdown-TABLE report (not the JSON file), and the old transcript
+    # regex could not see severity markers inside table cells, so it scored 1
+    # signal < threshold 2 and declared "quality looks good". There is no more
+    # prose regex -- the model's own structured verdict is the contract, and if
+    # it will not emit one we FORCE one (below) before ever considering "clean".
+    VERDICT_LINE=$(resolve_bug_verdict "$BUG_HUNT_TRANSCRIPT" "$BUG_RESULTS_JSON" 2>/dev/null)
+    BUG_VERDICT=$(echo "$VERDICT_LINE" | jq -r '.verdict // "invalid"' 2>/dev/null)
+    BUG_VERDICT_COUNT=$(echo "$VERDICT_LINE" | jq -r '.bug_count // 0' 2>/dev/null)
+    BUG_VERDICT_SOURCE=$(echo "$VERDICT_LINE" | jq -r '.source // "none"' 2>/dev/null)
 
-    # --- Resolve the JSON contract into the disposition files ---
-    # The agent's only job was to write bug_hunt_result.json. WE own what happens
-    # next: render TEST_RESULTS.md when bugs were found (so the fix branch below
-    # runs), or signal clean. This is what makes "the agent forgot to write the
-    # right file" impossible — there is now exactly one contract path, and the
-    # orchestrator produces every disposition file from it.
-    if [[ -f "$BUG_RESULTS_JSON" && ! -f "$BUG_RESULTS_FILE" ]]; then
-        # Tolerate a ```json fence some models wrap the file in.
-        if ! jq -e 'type=="object" and has("bugs")' "$BUG_RESULTS_JSON" >/dev/null 2>&1; then
-            BUG_FENCED=$(python3 -c 'import re,sys; raw=open(sys.argv[1],encoding="utf-8").read(); m=re.search(r"```(?:json)?\s*(\{.*\})\s*```",raw,re.S); print(m.group(1) if m else "")' "$BUG_RESULTS_JSON" 2>/dev/null)
-            if [[ -n "$BUG_FENCED" ]]; then
-                print -r -- "$BUG_FENCED" > "$BUG_RESULTS_JSON"
-            fi
+    # FORCE STEP: if the agent never emitted a parseable TestResults verdict,
+    # convert its transcript into one with a single no-tools call whose ONLY job
+    # is to output the JSON. This is the "force explicit declaration" step. It
+    # recovers a freeform/table/emoji-severity report into the structured
+    # verdict so we never depend on the bug finder styling its output correctly.
+    # If the force step ALSO fails to produce a verdict, we fall through to the
+    # INCONSISTENT branch (never clean).
+    if [[ "$BUG_VERDICT" == "invalid" && -s "$BUG_HUNT_TRANSCRIPT" ]]; then
+        BUG_VERDICT_REASON=$(echo "$VERDICT_LINE" | jq -r '.reason // "?"' 2>/dev/null)
+        print -P "%F{yellow}[BUG HUNT]%f No parseable JSON verdict in agent output ($BUG_VERDICT_REASON). Forcing a structured verdict..."
+        FORCE_SYS="You convert a bug-hunt report into a STRICT JSON object and output ONLY that JSON -- no prose, no code fences. Schema: {\"hasBugs\":boolean,\"bugs\":[{\"id\":string,\"severity\":\"critical\"|\"major\"|\"minor\",\"title\":string,\"description\":string,\"reproduction\":string,\"location\":string}],\"summary\":string,\"recommendations\":[string]}. Map the report's own severity scale onto critical/major/minor (High/P0/blocker->critical, Medium/P1/should-fix->major, Low/P2/minor/trivial/polish->minor). If the report describes NO real defects, output {\"hasBugs\":false,\"bugs\":[],\"summary\":\"...\",\"recommendations\":[]}. You MUST list EVERY issue the report describes; do not omit any."
+        FORCE_BODY_FILE=$(mktemp -t prd-bugforce.XXXXXX)
+        FORCE_OUT=$(mktemp -t prd-bugforce-out.XXXXXX)
+        {
+            print -r "Below is the transcript of a bug-hunt run that did NOT emit its required JSON verdict. Convert its findings into the JSON object described in your instructions. Output ONLY the JSON object."
+            print -r ""
+            print -r "TRANSCRIPT:"
+            cat "$BUG_HUNT_TRANSCRIPT"
+        } > "$FORCE_BODY_FILE"
+        # CLASSIFIER_AGENT (pizc) = no-tools, no-session, watchdog-wrapped; reads
+        # the prompt via stdin (the transcript can exceed MAX_ARG_STRLEN).
+        if $CLASSIFIER_AGENT --system-prompt "$FORCE_SYS" < "$FORCE_BODY_FILE" > "$FORCE_OUT" 2>/dev/null; then
+            VERDICT_LINE=$(resolve_bug_verdict "$FORCE_OUT" "$BUG_RESULTS_JSON" 2>/dev/null)
+            BUG_VERDICT=$(echo "$VERDICT_LINE" | jq -r '.verdict // "invalid"' 2>/dev/null)
+            BUG_VERDICT_COUNT=$(echo "$VERDICT_LINE" | jq -r '.bug_count // 0' 2>/dev/null)
+            BUG_VERDICT_SOURCE=$(echo "$VERDICT_LINE" | jq -r '.source // "none"' 2>/dev/null)
+            [[ "$BUG_VERDICT" != "invalid" ]] && print -P "%F{green}[BUG HUNT]%f Forced structured verdict obtained: $BUG_VERDICT ($BUG_VERDICT_COUNT bug(s))"
         fi
-        # Validate shape: object with a bugs array whose severities are canonical.
-        if jq -e 'type=="object" and has("bugs") and (.bugs|type=="array") and (all(.bugs[]?; ((.severity//"none")|ascii_downcase) as $s | $s=="critical" or $s=="major" or $s=="minor"))' "$BUG_RESULTS_JSON" >/dev/null 2>&1; then
-            BUG_COUNT=$(jq '.bugs | length' "$BUG_RESULTS_JSON")
-            BUG_HASBUGS=$(jq -r '.hasBugs // false' "$BUG_RESULTS_JSON")
-            if [[ "${BUG_COUNT:-0}" -gt 0 ]]; then
-                render_bug_results_md "$BUG_RESULTS_JSON" "$BUG_RESULTS_FILE"
-                print -P "%F{cyan}[BUG HUNT]%f Rendered bug report from JSON contract: $BUG_RESULTS_FILE ($BUG_COUNT bug(s))"
-            elif [[ "$BUG_HASBUGS" == "true" ]]; then
-                # Contract claims bugs but lists none — do NOT mark clean. Leave
-                # the transcript so the inconsistency scan below catches it.
-                print -P "%F{yellow}[BUG HUNT]%f JSON contract has hasBugs=true but lists 0 bugs; scanning transcript for the claimed findings..."
-            else
-                # Genuinely clean per the contract. Drop the transcript + JSON so
-                # the clean branch below runs without the safety net second-
-                # guessing a clean contract (and without leaving chat chatter
-                # that mentions bug-shaped words around an actually-clean run).
-                print -P "%F{green}[BUG HUNT]%f JSON contract reports a clean run (hasBugs=false, 0 bugs)."
-                rm -f "$BUG_HUNT_TRANSCRIPT" "$BUG_RESULTS_JSON" 2>/dev/null
-            fi
-        else
-            print -P "%F{yellow}[BUG HUNT]%f $BUG_RESULTS_JSON failed schema validation; falling back to transcript scan."
-        fi
+        rm -f "$FORCE_BODY_FILE" "$FORCE_OUT"
     fi
 
-    # If no TEST_RESULTS.md exists by now, the JSON contract either reported a
-    # clean run, was missing/invalid, or claimed bugs but listed none. The first
-    # two already left things clean; the last falls through to the safety-net
-    # transcript scan below. Distinguish:
-    #   (a) genuinely clean — contract reported no bugs (already handled above);
-    #   (b) INCONSISTENT — the agent described bugs (visible in its captured
-    #       transcript) but never wrote a valid JSON contract. This has happened
-    #       before: the bug finder produced a full High/Medium/Low report in
-    #       chat, applied the old "only write on Critical/Major" rule literally,
-    #       and wrote nothing — so real bugs shipped under a silent
-    #       NO_ISSUES_FOUND. The transcript capture lets us catch it here.
-    if [[ ! -f "$BUG_RESULTS_FILE" ]]; then
-        BUG_HUNT_TRANSCRIPT="$CURRENT_BUGFIX_SESSION/bug-hunt-transcript.log"
-        BUG_CLAIM_COUNT=0
-        BUG_STRUCT_COUNT=0
-        if [[ -f "$BUG_HUNT_TRANSCRIPT" ]]; then
-            # Two-tier inconsistency detection. The old single regex only matched
-            # the report template's exact shape ("## Critical / ### Issue /
-            # **Severity**: / Steps to Reproduce"). Real bug finders — especially
-            # reasoning agents — often write a FREEFORM prose report: emoji
-            # severity lead-ins ("**🟠 MEDIUM —"), "## New findings" headers,
-            # count phrases ("Bugs found (5 total)"), or "findings written to …",
-            # sometimes to a non-contract file. Those silently shipped as
-            # NO_ISSUES_FOUND because nothing here recognized them. The two tiers
-            # below catch both the rigid template AND the freeform styles.
-            #
-            # Lines the prompt echoes (template placeholders) and NEGATIVE
-            # severity statements ("## No Critical Issues", "found no bugs") are
-            # stripped first so a regurgitated or explicitly-clean transcript is
-            # not mistaken for a bug list.
-            BUG_NEG='\[title\]|\[which section|\[same format|brief summary|polish items|prevent core|significantly impact|performed: x|areas with|\[list\]|\[brief description\]|nice[[:space:]]+to[[:space:]]+fix|small[[:space:]]+improvements|issues[[:space:]]+that[[:space:]]+(prevent|significantly)|^[[:space:]]*#{0,6}[[:space:]]*no[[:space:]]+(critical|major|minor|high|medium|low|bugs?|issues?|defects?|regressions?|problems?|findings?)|^[[:space:]]*#{0,6}[[:space:]]*(found|detected|observed|saw)[[:space:]]+(no|none|zero|0)[[:space:]]|^[[:space:]]*[-*_>[:space:]]*(none|n/a)([^a-z]|$)|^[[:space:]]*[-*_>[:space:]]*0[[:space:]]+(bugs?|issues?|defects?)([^a-z]|$)'
-            # Tier 1 — explicit bug-finding claims (smoking guns). ANY one => inconsistent.
-            BUG_CLAIM_PAT='found[[:space:]]+[1-9][0-9]*[[:space:]]+(bugs?|issues?|defects?|findings?|regressions?)|found[[:space:]]+(a|an|several|some|multiple|the|one|two|three|four|five|six|seven|eight|nine|ten)[[:space:]]+(bugs?|issues?|defects?|findings?|regressions?)|findings?[[:space:]]+(written|recorded|reported|saved|logged)|(bugs?|issues?|defects?|findings?)[[:space:]]*[(:].{0,40}[1-9][0-9]*[[:space:]]+(total|issue|bug|finding|defect)|[1-9][0-9]*[[:space:]]+(bugs?|issues?|defects?|findings?|regressions?)[[:space:]]+((were|are)?[[:space:]]*)?(found|reported|recorded|identified|detected)'
-            # Tier 2 — structural severity markers. >=2 => inconsistent.
-            BUG_STRUCT_PAT='^[[:space:]]*#{1,6}[[:space:]]*(issues?|critical|major|minor|high|medium|low|p[0-3]|bugs?|findings?|defects?|regressions?|violations?)|^[[:space:]]*#{1,6}[[:space:]]+.*(report|requirements|bugs?|issues?|findings?|defects?)|^[[:space:]]*[-*>*_]*[[:space:]]*[*_]*[[:space:]]*(🔴|🟠|🟡|🟢|🟣|⚠️?|❗|❌|🐛|🐞)|^[[:space:]]*[-*>*_]*[[:space:]]*[*_]*[[:space:]]*(critical|major|minor|high|medium|low|p[0-3])([^a-z]|$)|^[[:space:]]*#{1,6}[[:space:]]+(bug|issue|defect)|\*\*severity\*\*|suggested[[:space:]]+fix|steps[[:space:]]+to[[:space:]]+reproduce|expected[[:space:]]+behavior|actual[[:space:]]+behavior'
+    case "$BUG_VERDICT" in
+        found)
+            # Bugs confirmed by an explicit structured verdict. Clear any stale
+            # clean/inconsistent markers and run the fix pipeline.
+            rm -f "$BUGFIX_DIR/NO_ISSUES_FOUND.md" "$BUGFIX_DIR/INCONSISTENT_BUG_HUNT.md"
+            render_bug_results_md "$BUG_RESULTS_JSON" "$BUG_RESULTS_FILE"
+            print -P "%F{cyan}[BUG HUNT]%f Bug report generated from verdict ($BUG_VERDICT_COUNT bug(s), source: $BUG_VERDICT_SOURCE): $BUG_RESULTS_FILE"
+            print -P "\n%F{yellow}[BUG FIX]%f Bugs found! Starting bug fix pipeline..."
+            print -P "%F{yellow}[BUG FIX]%f PRD: $BUG_RESULTS_FILE"
+            print -P "%F{yellow}[BUG FIX]%f Session: $(basename "$CURRENT_BUGFIX_SESSION")"
+            print -P "%F{yellow}[BUG FIX]%f Scope: $BUGFIX_SCOPE"
 
-            BUG_CLAIM_COUNT=$(grep -Ei "$BUG_CLAIM_PAT" "$BUG_HUNT_TRANSCRIPT" 2>/dev/null | grep -viE "$BUG_NEG" | grep -c '^')
-            BUG_STRUCT_COUNT=$(grep -Ei "$BUG_STRUCT_PAT" "$BUG_HUNT_TRANSCRIPT" 2>/dev/null | grep -viE "$BUG_NEG" | grep -c '^')
-            BUG_CLAIM_COUNT=${BUG_CLAIM_COUNT//[^0-9]/}; BUG_CLAIM_COUNT=${BUG_CLAIM_COUNT:-0}
-            BUG_STRUCT_COUNT=${BUG_STRUCT_COUNT//[^0-9]/}; BUG_STRUCT_COUNT=${BUG_STRUCT_COUNT:-0}
-        fi
+            # Commit the bug report + its JSON contract before starting the fix cycle
+            git add "$BUG_RESULTS_FILE" "$BUG_RESULTS_JSON" 2>/dev/null
+            git commit -m "Add bug report: $(basename "$CURRENT_BUGFIX_SESSION")" &>/dev/null || true
 
-        # Inconsistent if the agent EXPLICITLY claimed bugs (tier 1) OR produced
-        # a structured bug-report shape (>=2 tier-2 signals). Either way the bugs
-        # never reached BUG_RESULTS_FILE, so refuse to mark the run clean.
-        if [[ "$BUG_CLAIM_COUNT" -ge 1 || "$BUG_STRUCT_COUNT" -ge 2 ]]; then
-            BUG_SIGNAL_COUNT=$((BUG_CLAIM_COUNT + BUG_STRUCT_COUNT))
-            # INCONSISTENT: bugs appear in the transcript but no file was written.
-            print -P "%F{red}[BUG HUNT]%f ⚠ INCONSISTENT: no $BUG_RESULTS_FILE was written, but the bug finder's transcript reports bugs ($BUG_CLAIM_COUNT explicit claim(s), $BUG_STRUCT_COUNT structural signal(s))."
-            print -P "%F{red}[BUG HUNT]%f The agent likely found bugs but failed to persist them to the report file."
-            print -P "%F{red}[BUG HUNT]%f Common causes: wrote a freeform/emoji-severity report only to chat or a non-contract file, used a High/Medium/Low taxonomy and concluded none were 'Critical or Major', or only found Minor issues under the old rules."
-            print -P "%F{red}[BUG HUNT]%f Refusing to mark this run clean. Findings are NOT lost — recover them from:"
-            print -P "%F{red}[BUG HUNT]%f   $BUG_HUNT_TRANSCRIPT"
-            print -P "%F{red}[BUG HUNT]%f Copy the report into $BUG_RESULTS_FILE and re-run, or delete the transcript to confirm clean."
-            NI_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-            {
-                print -r "Inconsistent Bug Hunt Result"
-                print -r ""
-                print -r "The bug finder ran on $NI_TS but produced NO TEST_RESULTS.md,"
-                print -r "even though its transcript contains $BUG_CLAIM_COUNT explicit bug-claim"
-                print -r "signal(s) and $BUG_STRUCT_COUNT structural bug-report signal(s)."
-                print -r ""
-                print -r "This usually means the agent found bugs in chat (sometimes writing them to"
-                print -r "a non-contract markdown file) but never persisted them to TEST_RESULTS.md —"
-                print -r "e.g. a freeform/emoji-severity report, a High/Medium/Low taxonomy read as"
-                print -r "'no Critical/Major', or only Minor issues under the old rules."
-                print -r "The findings are NOT lost — see the transcript:"
-                print -r "  $BUG_HUNT_TRANSCRIPT"
-                print -r ""
-                print -r "Recover the report into TEST_RESULTS.md and re-run bug hunting to fix."
-                print -r "Delete this file AND the transcript only if you confirm the run was clean."
-            } > "$BUGFIX_DIR/INCONSISTENT_BUG_HUNT.md"
-            git add "$BUGFIX_DIR/INCONSISTENT_BUG_HUNT.md" "$BUG_HUNT_TRANSCRIPT" 2>/dev/null
-            git commit -m "Inconsistent bug hunt: report in transcript but no file ($(basename "$CURRENT_BUGFIX_SESSION"))" &>/dev/null || true
-            # Keep the session dir: the transcript is evidence. Do NOT mark clean.
-        else
-            print -P "%F{green}[BUG HUNT]%f No bugs found. Quality looks good!"
+            # Re-run the pipeline with bug fixes - session dir IS the bugfix session
+            # Forward parallel-research settings: PARALLEL_RESEARCH and RESEARCH_DEPTH
+            # are plain shell vars (NOT exported), so without this the child process
+            # would default PARALLEL_RESEARCH to "false" and silently disable all
+            # background prefetch for the bugfix run. -r must survive the recursion.
+            SKIP_BUG_FINDING=true \
+            PRD_FILE="$BUG_RESULTS_FILE" \
+            SCOPE="$BUGFIX_SCOPE" \
+            AGENT="$AGENT" \
+            PLAN_DIR="$CURRENT_BUGFIX_SESSION" \
+            PARALLEL_RESEARCH="$PARALLEL_RESEARCH" \
+            RESEARCH_DEPTH="$RESEARCH_DEPTH" \
+            "$0"
+
+            # Check if bugfix pipeline succeeded
+            if [[ $? -ne 0 ]]; then
+                print -P "%F{red}[ERROR]%f Bug fix pipeline failed. Session preserved for review: $(basename "$CURRENT_BUGFIX_SESSION")"
+            else
+                print -P "%F{green}[BUG HUNT]%f Bug fix session complete: $(basename "$CURRENT_BUGFIX_SESSION")"
+                print -P "%F{cyan}[INFO]%f Run again to check for more bugs"
+            fi
+            ;;
+        clean)
+            # EXPLICIT clean verdict: the agent declared {hasBugs:false, bugs:[]}.
+            # This is the ONLY path to "no issues" -- absence of a verdict cannot
+            # reach here (a missing/invalid verdict goes to the INCONSISTENT branch).
+            print -P "%F{green}[BUG HUNT]%f Explicit clean verdict (hasBugs=false, 0 bugs). Quality looks good!"
 
             # Leave an indicator so the user knows bugfix already ran clean on
             # this task set and need not be re-run. Records the tasks hash so a
@@ -4958,7 +5223,9 @@ ${EXPANDED_BUG_PROMPT}"
             {
                 print -r "No Issues Found"
                 print -r ""
-                print -r "Bug hunt ran on $NI_TS and found no issues (Critical, Major, or Minor)."
+                print -r "Bug hunt ran on $NI_TS and the agent EXPLICITLY declared no bugs"
+                print -r "(hasBugs=false, bugs=[]). This is the only condition that produces this"
+                print -r "marker -- a missing/invalid verdict is treated as INCONSISTENT, never clean."
                 print -r ""
                 print -r "  Session tested:    $NI_SESSION"
                 print -r "  Tasks hash:        $NI_HASH  (tasks.json, sha256 first 12)"
@@ -4968,52 +5235,47 @@ ${EXPANDED_BUG_PROMPT}"
             } > "$BUGFIX_DIR/NO_ISSUES_FOUND.md"
             print -P "%F{cyan}[BUG HUNT]%f No-issues marker: $BUGFIX_DIR/NO_ISSUES_FOUND.md"
 
-            # Commit the no-issues marker so the clean result is recorded,
-            # mirroring how the bug report is committed when bugs are found.
-            git add "$BUGFIX_DIR/NO_ISSUES_FOUND.md" 2>/dev/null
-            git commit -m "No issues found: $(basename "$CURRENT_BUGFIX_SESSION")" &>/dev/null || true
+            # Commit the no-issues marker + the clean verdict contract.
+            git add "$BUGFIX_DIR/NO_ISSUES_FOUND.md" "$BUG_RESULTS_JSON" 2>/dev/null
+            git commit -m "No issues found (explicit clean verdict): $(basename "$CURRENT_BUGFIX_SESSION")" &>/dev/null || true
 
-            # Clean up the session: drop the transcript and remove the now-empty dir.
+            # Clean up: drop the transcript and remove the now-empty session dir.
             rm -f "$BUG_HUNT_TRANSCRIPT" 2>/dev/null
             rmdir "$CURRENT_BUGFIX_SESSION" 2>/dev/null
-        fi
-    else
-        # Bug report exists - run the fix pipeline
-        # Previous "clean" / "inconsistent" markers are now stale; clear them
-        # so the bugfix directory reflects that bugs were found this round.
-        rm -f "$BUGFIX_DIR/NO_ISSUES_FOUND.md" "$BUGFIX_DIR/INCONSISTENT_BUG_HUNT.md"
-        print -P "%F{cyan}[BUG HUNT]%f Bug report generated: $BUG_RESULTS_FILE"
-        print -P "\n%F{yellow}[BUG FIX]%f Bugs found! Starting bug fix pipeline..."
-        print -P "%F{yellow}[BUG FIX]%f PRD: $BUG_RESULTS_FILE"
-        print -P "%F{yellow}[BUG FIX]%f Session: $(basename "$CURRENT_BUGFIX_SESSION")"
-        print -P "%F{yellow}[BUG FIX]%f Scope: $BUGFIX_SCOPE"
-
-        # Commit the bug report + its JSON contract before starting the fix cycle
-        git add "$BUG_RESULTS_FILE" "$BUG_RESULTS_JSON" 2>/dev/null
-        git commit -m "Add bug report: $(basename "$CURRENT_BUGFIX_SESSION")" &>/dev/null || true
-
-        # Re-run the pipeline with bug fixes - session dir IS the bugfix session
-        # Forward parallel-research settings: PARALLEL_RESEARCH and RESEARCH_DEPTH
-        # are plain shell vars (NOT exported), so without this the child process
-        # would default PARALLEL_RESEARCH to "false" and silently disable all
-        # background prefetch for the bugfix run. -r must survive the recursion.
-        SKIP_BUG_FINDING=true \
-        PRD_FILE="$BUG_RESULTS_FILE" \
-        SCOPE="$BUGFIX_SCOPE" \
-        AGENT="$AGENT" \
-        PLAN_DIR="$CURRENT_BUGFIX_SESSION" \
-        PARALLEL_RESEARCH="$PARALLEL_RESEARCH" \
-        RESEARCH_DEPTH="$RESEARCH_DEPTH" \
-        "$0"
-
-        # Check if bugfix pipeline succeeded
-        if [[ $? -ne 0 ]]; then
-            print -P "%F{red}[ERROR]%f Bug fix pipeline failed. Session preserved for review: $(basename "$CURRENT_BUGFIX_SESSION")"
-        else
-            print -P "%F{green}[BUG HUNT]%f Bug fix session complete: $(basename "$CURRENT_BUGFIX_SESSION")"
-            print -P "%F{cyan}[INFO]%f Run again to check for more bugs"
-        fi
-    fi
+            ;;
+        *)
+            # INVALID: no parseable, self-consistent TestResults verdict could be
+            # obtained from the agent's output OR from the forced-conversion step.
+            # This is NEVER clean. Keep the transcript as evidence and refuse to
+            # mark the run done. (This is the branch session 005 SHOULD have hit.)
+            BUG_VERDICT_REASON=$(echo "$VERDICT_LINE" | jq -r '.reason // "unknown"' 2>/dev/null)
+            print -P "%F{red}[BUG HUNT]%f + NO VALID VERDICT: the bug finder did not emit a parseable TestResults JSON ($BUG_VERDICT_REASON)."
+            print -P "%F{red}[BUG HUNT]%f Refusing to mark this run clean. There is no 'clean by default' -- a missing"
+            print -P "%F{red}[BUG HUNT]%f verdict is treated as a FAILURE, not as 'no bugs'. The run is NOT lost; recover it from:"
+            print -P "%F{red}[BUG HUNT]%f   $BUG_HUNT_TRANSCRIPT"
+            print -P "%F{red}[BUG HUNT]%f Hand-write a TestResults JSON to $BUG_RESULTS_JSON (or re-run) to resolve."
+            NI_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+            {
+                print -r "No Valid Bug-Hunt Verdict"
+                print -r ""
+                print -r "The bug finder ran on $NI_TS but produced no parseable, self-consistent"
+                print -r "TestResults JSON verdict -- neither in its file nor in its chat output,"
+                print -r "and the forced-conversion step could not produce one either."
+                print -r "Reason: $BUG_VERDICT_REASON"
+                print -r ""
+                print -r "This is NOT 'clean'. The orchestrator treats a missing verdict as a FAILURE"
+                print -r "and refuses to mark the run done. Recover the findings from the transcript"
+                print -r "and persist a TestResults JSON, then re-run:"
+                print -r "  transcript: $BUG_HUNT_TRANSCRIPT"
+                print -r "  expected:   $BUG_RESULTS_JSON"
+                print -r ""
+                print -r "Delete this file AND the transcript only after you confirm the run was clean."
+            } > "$BUGFIX_DIR/INCONSISTENT_BUG_HUNT.md"
+            git add "$BUGFIX_DIR/INCONSISTENT_BUG_HUNT.md" "$BUG_HUNT_TRANSCRIPT" 2>/dev/null
+            git commit -m "No valid bug-hunt verdict (missing/invalid JSON): $(basename "$CURRENT_BUGFIX_SESSION")" &>/dev/null || true
+            # Keep the session dir + transcript: they are the evidence. Do NOT mark clean.
+            ;;
+    esac
 else
     print -P "%F{cyan}[CONFIG]%f Bug finding skipped (SKIP_BUG_FINDING=true)"
 fi
@@ -5057,3 +5319,5 @@ if [[ "$SINGLE_SESSION" == "false" && -n "$SESSION_DIR" ]]; then
 fi
 
 print -P "%F{green}[SUCCESS]%f Workflow completed for session: $(basename "$SESSION_DIR")"
+
+
