@@ -100,6 +100,8 @@ START_PHASE=1
 START_MS=1
 START_TASK=1
 START_SUBTASK=1
+FOCUS_ONLY="${FOCUS_ONLY:-false}"        # --focus-only: skip prefix closure, jump to START_* (legacy jump-ahead)
+DRY_RECONCILE="${DRY_RECONCILE:-false}"  # --dry-reconcile: audit non-terminal items, then exit (no execution)
 PARALLEL_RESEARCH="${PARALLEL_RESEARCH:-false}"  # Optional parallel research for next item
 ONLY_VALIDATE="${ONLY_VALIDATE:-false}" # Run only the validation step
 ONLY_BUG_HUNT="${ONLY_BUG_HUNT:-false}" # Run only the bug finding step
@@ -141,6 +143,8 @@ while getopts "s:p:m:t:u:rv-:" opt; do
         subtask)     START_SUBTASK="${!OPTIND}"; OPTIND=$(( OPTIND + 1 )); MANUAL_START=true ;;
         subtask=*)   START_SUBTASK="${OPTARG#*=}"; MANUAL_START=true ;;
         parallel-research) PARALLEL_RESEARCH=true ;;
+        focus-only)      FOCUS_ONLY=true ;;
+        dry-reconcile)   DRY_RECONCILE=true ;;
         validate)    ONLY_VALIDATE=true ;;
         bug-hunt)    ONLY_BUG_HUNT=true ;;
         skip-bug-finding) SKIP_BUG_FINDING=true ;;
@@ -150,10 +154,10 @@ while getopts "s:p:m:t:u:rv-:" opt; do
         adopt-prd)        ADOPT_PRD=true ;;
         session)        TARGET_SESSION="${!OPTIND}"; OPTIND=$(( OPTIND + 1 )) ;;
         session=*)      TARGET_SESSION="${OPTARG#*=}" ;;
-        *) print "Usage: $0 [--scope=...] [--phase=N] [--milestone=N] [--task=N] [--subtask=N] [--parallel-research] [--validate] [--bug-hunt] [--skip-bug-finding] [--single-session] [--session=N] [--accept-prd-changes] [--adopt-prd]"; exit 1 ;;
+        *) print "Usage: $0 [--scope=...] [--phase=N] [--milestone=N] [--task=N] [--subtask=N] [--parallel-research] [--focus-only] [--dry-reconcile] [--validate] [--bug-hunt] [--skip-bug-finding] [--single-session] [--session=N] [--accept-prd-changes] [--adopt-prd]"; exit 1 ;;
       esac ;;
     *) print "Usage: $0 [-s phase|milestone|task|subtask] [-p N] [-m N] [-t N] [-u N] [-r] [-v]
-   Or: $0 [--scope=...] [--phase=N] [--milestone=N] [--task=N] [--subtask=N] [--parallel-research] [--validate] [--bug-hunt] [--skip-bug-finding] [--single-session] [--session=N] [--accept-prd-changes] [--adopt-prd]"; exit 1 ;;
+   Or: $0 [--scope=...] [--phase=N] [--milestone=N] [--task=N] [--subtask=N] [--parallel-research] [--focus-only] [--dry-reconcile] [--validate] [--bug-hunt] [--skip-bug-finding] [--single-session] [--session=N] [--accept-prd-changes] [--adopt-prd]"; exit 1 ;;
   esac
 done
 
@@ -3594,8 +3598,21 @@ handle_item_result() {
 # loops and out of recursive bugfix children).
 # Usage: run_item_and_check <id> <dirname> <phase> <ms> <task> <subtask>
 run_item_and_check() {
-    execute_item "$@"
-    local rc=$?
+    # No-gaps invariant: the cursor never advances past a non-terminal item.
+    # On rc=2 (issue) execute_item has reset THIS item to Planned (PRP deleted,
+    # feedback saved) and is asking for a retry — so we re-attempt the SAME item
+    # in place, bounded by execute_item's ISSUE_RETRY_MAX (it eventually returns
+    # rc=0 Complete or rc=1 Failed). We do NOT advance on rc=2. rc=3
+    # (dependency-defer) still advances: the item did no work and its pending
+    # producer, if any, is ahead in the walk.
+    local rc
+    while true; do
+        execute_item "$@"
+        rc=$?
+        [[ "$SHUTDOWN_REQUESTED" == "true" ]] && break
+        [[ $rc -eq 2 ]] || break
+        print -P "%F{cyan}[RETRY]%f $1 hit an implementation issue — re-attempting in place (no advance) per the no-gaps invariant."
+    done
     if ! handle_item_result "$rc" "$1"; then
         [[ -n "$RESEARCH_PID" ]] && kill -TERM "$RESEARCH_PID" 2>/dev/null
         print -P "%F{blue}[GIT]%f Persisting current state before halt..."
@@ -3754,8 +3771,8 @@ $issue_feedback
     while true; do
         # Check for shutdown before each attempt
         if [[ "$SHUTDOWN_REQUESTED" == "true" ]]; then
-            print -P "%F{yellow}[INTERRUPTED]%f Agent interrupted for $id - leaving in Implementing state for resume"
-            restore_tasks_json "Implementing"
+            print -P "%F{yellow}[INTERRUPTED]%f Agent interrupted for $id - rolling back to Planned (PRP + tree work preserved for resume)"
+            restore_tasks_json "Planned"
             rm -f "$agent_output_file"
             return 130
         fi
@@ -3783,8 +3800,8 @@ $issue_feedback
 
         # Exit 130 = SIGINT (Ctrl+C) - don't retry, leave in Implementing state
         if [[ $agent_exit_status -eq 130 ]] || [[ "$SHUTDOWN_REQUESTED" == "true" ]]; then
-            print -P "%F{yellow}[INTERRUPTED]%f Agent interrupted for $id - leaving in Implementing state for resume"
-            restore_tasks_json "Implementing"
+            print -P "%F{yellow}[INTERRUPTED]%f Agent interrupted for $id - rolling back to Planned (PRP + tree work preserved for resume)"
+            restore_tasks_json "Planned"
             rm -f "$agent_output_file"
             return 130
         fi
@@ -3924,31 +3941,54 @@ FEEDBACK_EOF
     # Agents should not modify tasks.json - only the orchestrator manages task status
     print -P "%F{cyan}[PROTECT]%f Restoring tasks.json (agents must not modify it directly)..."
 
-    # Now check for ACTUAL code changes (modified OR new untracked files, excluding tasks.json)
-    # git diff HEAD only shows modified tracked files, so we also need to check for new untracked files
-    local modified_files=$(git diff HEAD --name-only -- ':!**/tasks.json' 2>/dev/null)
-    local untracked_files=$(git ls-files --others --exclude-standard -- ':!**/tasks.json' 2>/dev/null)
-
-    if [[ -z "$modified_files" && -z "$untracked_files" ]]; then
-        # No file changes - check if agent reported success (work was already done)
-        if [[ "$agent_reported_success" == "true" ]]; then
-            print -P "%F{green}[OK]%f Agent reported success for $id (work already complete, no changes needed)"
-            CURRENT_PROCESSING_STATUS="Complete"
-            restore_tasks_json "Complete"
-            # Clean up issue tracking files on success
-            rm -f "$dirname/.issue_retry_count" "$dirname/issue_feedback.md"
+    # Completion is gated on the agent's explicit self-certification:
+    # {"result":"success"} == "I ran the tests, they pass, this item is done".
+    # A non-empty git diff is NOT sufficient proof — code can be written without
+    # being tested. Validation runs only end-of-run by design, so the per-task
+    # gate is the implementing agent's own success signal. Files-changed is kept
+    # only as a sanity check (no changes + no success => no-op => Failed).
+    if [[ "$agent_reported_success" == "true" ]]; then
+        print -P "%F{green}[OK]%f Agent confirmed success for $id"
+        CURRENT_PROCESSING_STATUS="Complete"
+        restore_tasks_json "Complete"
+        rm -f "$dirname/.issue_retry_count" "$dirname/issue_feedback.md"
+    else
+        # No explicit success. If files changed, give the agent ONE chance to
+        # confirm (it may have done the work without emitting the result JSON);
+        # otherwise this is a no-op => Failed.
+        local modified_files=$(git diff HEAD --name-only -- ':!**/tasks.json' 2>/dev/null)
+        local untracked_files=$(git ls-files --others --exclude-standard -- ':!**/tasks.json' 2>/dev/null)
+        if [[ -n "$modified_files" || -n "$untracked_files" ]]; then
+            print -P "%F{yellow}[VERIFY]%f $id changed files but emitted no success signal — prompting agent to confirm (run tests, emit result)..."
+            local verify_out=$(mktemp)
+            setopt pipefail
+            $IMPL_AGENT --session-id "prd-impl-$(basename "$dirname")" -p "For $(get_scope_name) $id you modified files but did not emit a final result. Run this item's tests now. If they pass, output exactly: {\"result\":\"success\"}. If something is genuinely wrong, output: {\"result\":\"issue\",\"message\":\"...\"} and explain." < /dev/null 2>&1 | tee "$verify_out" >/dev/null
+            unsetopt pipefail
+            if [[ "$SHUTDOWN_REQUESTED" == "true" ]]; then
+                rm -f "$verify_out"
+                print -P "%F{yellow}[INTERRUPTED]%f Re-prompt interrupted for $id - rolling back to Planned"
+                restore_tasks_json "Planned"
+                return 130
+            fi
+            if grep -q '"result"[[:space:]]*:[[:space:]]*"success"' "$verify_out" 2>/dev/null; then
+                print -P "%F{green}[OK]%f Agent confirmed success for $id on re-prompt"
+                rm -f "$verify_out"
+                CURRENT_PROCESSING_STATUS="Complete"
+                restore_tasks_json "Complete"
+                rm -f "$dirname/.issue_retry_count" "$dirname/issue_feedback.md"
+            else
+                print -P "%F{red}[FAILED]%f $id: agent changed files but could not confirm success on re-prompt - marking Failed"
+                rm -f "$verify_out"
+                CURRENT_PROCESSING_STATUS="Failed"
+                restore_tasks_json "Failed"
+                return 1
+            fi
         else
-            print -P "%F{red}[FAILED]%f No changes produced for $id - marking as Failed and continuing"
+            print -P "%F{red}[FAILED]%f No changes and no success signal for $id - marking as Failed and continuing"
             CURRENT_PROCESSING_STATUS="Failed"
             restore_tasks_json "Failed"
             return 1
         fi
-    else
-        # Changes exist - mark as complete
-        CURRENT_PROCESSING_STATUS="Complete"
-        restore_tasks_json "Complete"
-        # Clean up issue tracking files on success
-        rm -f "$dirname/.issue_retry_count" "$dirname/issue_feedback.md"
     fi
 
     # Persist this item's substance (source changes + plan/ work dir + Complete
@@ -4665,10 +4705,15 @@ else
     print -P "%F{cyan}[CONFIG]%f Parallel research: %F{yellow}disabled%f"
 fi
 [[ "$SKIP_BUG_FINDING" == "true" ]] && print -P "%F{cyan}[CONFIG]%f Bug finding: %F{yellow}skipped%f" || print -P "%F{cyan}[CONFIG]%f Bug finder agent: %F{yellow}$BUG_FINDER_AGENT%f"
-print -P "%F{cyan}[CONFIG]%f Starting positions: Phase=$START_PHASE"
-[[ $SCOPE != "phase" ]] && print -P "%F{cyan}[CONFIG]%f Starting positions: Milestone=$START_MS"
-[[ $SCOPE == "task" || $SCOPE == "subtask" ]] && print -P "%F{cyan}[CONFIG]%f Starting positions: Task=$START_TASK"
-[[ $SCOPE == "subtask" ]] && print -P "%F{cyan}[CONFIG]%f Starting positions: Subtask=$START_SUBTASK"
+if [[ "$FOCUS_ONLY" == "true" ]]; then
+    print -P "%F{cyan}[CONFIG]%f Prefix closure: %F{yellow}SKIPPED (--focus-only)%f — jumping to start, prior non-terminal items left as-is"
+    print -P "%F{cyan}[CONFIG]%f Starting positions: Phase=$START_PHASE"
+    [[ $SCOPE != "phase" ]] && print -P "%F{cyan}[CONFIG]%f Starting positions: Milestone=$START_MS"
+    [[ $SCOPE == "task" || $SCOPE == "subtask" ]] && print -P "%F{cyan}[CONFIG]%f Starting positions: Task=$START_TASK"
+    [[ $SCOPE == "subtask" ]] && print -P "%F{cyan}[CONFIG]%f Starting positions: Subtask=$START_SUBTASK"
+else
+    print -P "%F{cyan}[CONFIG]%f Prefix closure: %F{green}enabled%f (no-gaps invariant) — walking from P1 to close any non-terminal items before advancing"
+fi
 
 # Validate tasks file before proceeding
 if [[ ! -f "$TASKS_FILE" ]]; then
@@ -4708,6 +4753,29 @@ if [[ "$total_phases" -eq 0 ]]; then
     exit 0
 fi
 
+# --- Dry Reconcile: list non-terminal items a run would close, then exit ---
+# Honors the no-gaps invariant: every item below is something a normal run
+# (which now walks from the start, closing the prefix first) would drive to
+# Complete/Failed. Use this to audit a half-finished tree before committing a
+# run to backfilling it. Document order == closure order.
+if [[ "$DRY_RECONCILE" == "true" ]]; then
+    print -P "%B%F{cyan}[RECONCILE]%f%b Non-terminal items (document order = closure order):"
+    print -P ""
+    jq -r '
+      def walk:
+        (.status // empty) as $st |
+        (select($st == "Planned" or $st == "Researching" or $st == "Ready" or $st == "Implementing")
+         | "\($st)\t\(.id // "")\t\(.title // "")"),
+        ((.milestones // [])[] | walk),
+        ((.tasks // [])[] | walk),
+        ((.subtasks // [])[] | walk);
+      (.backlog // [])[] | walk
+    ' "$TASKS_FILE" 2>/dev/null | awk -F'\t' 'NF>=2 { printf "  %-13s %-20s %s\n", $1, $2, $3 }'
+    print -P ""
+    print -P "%F{cyan}[RECONCILE]%f (Implementing/Ready/Researching behind the cursor are the gaps; Planned is normal not-yet-started work.)"
+    exit 0
+fi
+
 # Outer loop: Always iterate through phases
 if [[ "$SKIP_EXECUTION_LOOP" == "true" ]]; then
     print -P "%F{cyan}[SESSION]%f Skipping implementation loop (baseline/validation path)."
@@ -4721,8 +4789,9 @@ for (( phase_idx=0; phase_idx<$total_phases; phase_idx++ )); do
         PHASE_NUM=$((phase_idx+1))  # Fallback to index-based
     fi
 
-    # Skip if we haven't reached the start phase yet
-    [[ $PHASE_NUM -lt $START_PHASE ]] && continue
+    # --focus-only: skip phases before the start point (legacy jump-ahead). By
+    # default the no-gaps invariant walks from the start so the prefix is closed.
+    [[ "$FOCUS_ONLY" == "true" && $PHASE_NUM -lt $START_PHASE ]] && continue
 
     # For phase scope, process and continue
     if [[ $SCOPE == "phase" ]]; then
@@ -4744,8 +4813,8 @@ for (( phase_idx=0; phase_idx<$total_phases; phase_idx++ )); do
             MS_NUM=$((ms_idx+1))  # Fallback to index-based
         fi
 
-        # Skip milestones until we reach the start milestone of the start phase
-        if [[ $PHASE_NUM -eq $START_PHASE && $MS_NUM -lt $START_MS ]]; then
+        # --focus-only: skip milestones before the start point. Default: walk all.
+        if [[ "$FOCUS_ONLY" == "true" && $PHASE_NUM -eq $START_PHASE && $MS_NUM -lt $START_MS ]]; then
             continue
         fi
 
@@ -4770,8 +4839,8 @@ for (( phase_idx=0; phase_idx<$total_phases; phase_idx++ )); do
                 TASK_NUM=$((task_idx+1))  # Fallback to index-based
             fi
 
-            # Skip tasks until we reach the start task of the start milestone/phase
-            if [[ $PHASE_NUM -eq $START_PHASE && $MS_NUM -eq $START_MS && $TASK_NUM -lt $START_TASK ]]; then
+            # --focus-only: skip tasks before the start point. Default: walk all.
+            if [[ "$FOCUS_ONLY" == "true" && $PHASE_NUM -eq $START_PHASE && $MS_NUM -eq $START_MS && $TASK_NUM -lt $START_TASK ]]; then
                 continue
             fi
 
@@ -4796,8 +4865,8 @@ for (( phase_idx=0; phase_idx<$total_phases; phase_idx++ )); do
                     SUBTASK_NUM=$((subtask_idx+1))  # Fallback to index-based
                 fi
 
-                # Skip subtasks until we reach the start subtask of the start task/milestone/phase
-                if [[ $PHASE_NUM -eq $START_PHASE && $MS_NUM -eq $START_MS && $TASK_NUM -eq $START_TASK && $SUBTASK_NUM -lt $START_SUBTASK ]]; then
+                # --focus-only: skip subtasks before the start point. Default: walk all.
+                if [[ "$FOCUS_ONLY" == "true" && $PHASE_NUM -eq $START_PHASE && $MS_NUM -eq $START_MS && $TASK_NUM -eq $START_TASK && $SUBTASK_NUM -lt $START_SUBTASK ]]; then
                     continue
                 fi
 
