@@ -2640,11 +2640,27 @@ Simulate the "User" persona defined in the PRD.
 **IMPORTANT: Use these EXACT file names:**
 1. Write the validation script to \`./validate.sh\` (this exact path, current directory)
 2. Write the bug tracker report to \`./validation_report.md\` (this exact path, current directory)
+3. Write your structured verdict to \`./validation_result.json\` (this exact path, current directory)
 
 The validation script should be executable, practical, and give complete confidence in the codebase.
 If validation passes, the user should have 100% confidence their application works correctly in production.
 
-**CLEANUP NOTE:** These files (validate.sh and validation_report.md) are temporary and will be deleted after validation completes.
+**Structured verdict (\`validation_result.json\`) - CRITICAL:**
+The orchestrator decides whether to run the fixer from this file DETERMINISTICALLY
+-- it does NOT re-read your prose report to guess. It MUST be valid JSON:
+\`\`\`json
+{ "hasIssues": true, "issueCount": 3, "summary": "Brief one-line summary." }
+\`\`\`
+- \`hasIssues\`: true if ANY issue (critical, major, OR minor) is listed in the
+  report. false ONLY when the report lists zero issues.
+- \`issueCount\`: the exact number of issues listed in validation_report.md.
+  MUST be 0 when hasIssues is false.
+A missing, malformed, or self-contradictory verdict is treated as "issues found"
+and the fixer runs anyway -- so emit it correctly and keep it consistent with
+your report. (A cheap LLM-classifier gate here once misread a "PASS with minor
+notes" report as clean and silently dropped real findings.)
+
+**CLEANUP NOTE:** These files (validate.sh, validation_report.md, validation_result.json) are temporary and will be deleted after validation completes.
 
 ## FORBIDDEN OPERATIONS - CRITICAL
 
@@ -2658,7 +2674,7 @@ If validation passes, the user should have 100% confidence their application wor
 - Source code files - you are validating, not implementing
 
 ### YOUR OUTPUT:
-You write ONLY to \`./validate.sh\` and \`./validation_report.md\`.
+You write ONLY to \`./validate.sh\`, \`./validation_report.md\`, and \`./validation_result.json\`.
 Nothing else. Do not modify any other files.
 EOF
 
@@ -4953,48 +4969,43 @@ if [[ -f "validation_report.md" ]]; then
 
     REPORT_CONTENT=$(cat validation_report.md)
 
-    # Check if report requires action using a restricted agent
-    # Classifier agent disables tools and sessions (see CLASSIFIER_AGENT above)
-    CHECK_PROMPT="Here is the validation report.
-
-    CONTENT:
-    $REPORT_CONTENT
-
-    INSTRUCTION:
-    - If the report shows ANY failures, bugs, or issues: output DIRTY
-    - If the report shows passing status and no issues: output CLEAN
-    - Output ONLY the single word."
-
-    local RESULT=""
-    local CLEAN_RESULT=""
-    local classify_attempt=0
-    local classify_max=4
-    local user_prompt="$CHECK_PROMPT"
-
-    # Retry loop: handles invalid responses AND transient failures (mirrors the
-    # PRD-change classifier above; prevents silent empty-reply fallthrough).
-    while [[ $classify_attempt -lt $classify_max ]]; do
-        ((classify_attempt++))
-        RESULT=$($CLASSIFIER_AGENT --system-prompt "You are a binary classifier. Output only CLEAN or DIRTY." "$user_prompt" < /dev/null)
-        CLEAN_RESULT=$(echo "$RESULT" | tr -d '[:space:]')
-
-        if [[ "$CLEAN_RESULT" == "CLEAN" || "$CLEAN_RESULT" == "DIRTY" ]]; then
-            break
-        fi
-
-        if [[ -z "$RESULT" ]] || echo "$RESULT" | grep -qE '(Connection error|API Error|API error|API request failed|fetch failed|network error|timeout|timed out|ETIMEDOUT|ECONNREFUSED|ECONNRESET|EAI_AGAIN|socket hang up|stream error|overloaded|rate limit|429|503|502|service unavailable|aborted|disposed)'; then
-            print -P "%F{yellow}[RETRY]%f Checker transient failure (attempt $classify_attempt/$classify_max). Retrying in 3s..."
-            sleep 3
+    # Decide whether the fixer runs DETERMINISTICALLY, from the structured
+    # verdict the validation agent wrote to validation_result.json.
+    #
+    # Design intent: validation issues are ALWAYS fixed inline, right here, by
+    # the fixer agent -- that is the entire reason the fixer exists. It is never
+    # silently skipped when issues exist.
+    #
+    # This replaces an earlier CLEAN/DIRTY LLM-classifier gate that proved
+    # lossy: a cheap no-tools model keyed off "passing status" in a report that
+    # actually listed minor issues and returned CLEAN, so the fixer never ran
+    # and the findings evaporated. Same lesson the bug-hunt stage already
+    # learned (see resolve_bug_verdict): the agent's own structured verdict is
+    # the contract, and a missing/malformed verdict is NEVER treated as "clean"
+    # -- it defaults to "run the fixer". Absence of a clean signal can never
+    # suppress a fix.
+    #
+    # Safe default: if validation_result.json is absent or unparseable, RUN the
+    # fixer. The ONLY path that skips the fixer is an explicit, well-formed
+    # verdict declaring no issues (hasIssues==false AND issueCount==0).
+    RUN_FIXER="true"
+    VAL_HAS_ISSUES="missing"
+    VAL_ISSUE_COUNT="-1"
+    if [[ -f "validation_result.json" ]]; then
+        VAL_HAS_ISSUES=$(jq -r '.hasIssues // "missing"' "validation_result.json" 2>/dev/null)
+        VAL_ISSUE_COUNT=$(jq -r '.issueCount // -1' "validation_result.json" 2>/dev/null)
+        if [[ "$VAL_HAS_ISSUES" == "false" && "$VAL_ISSUE_COUNT" == "0" ]]; then
+            # Explicit, self-consistent clean verdict: nothing to fix.
+            RUN_FIXER="false"
+            print -P "%F{cyan}[STATUS]%f Validation verdict: CLEAN (hasIssues=false, issueCount=0). No fixer needed."
         else
-            print -P "%F{yellow}[RETRY]%f Invalid checker output: '$RESULT'. Retrying..."
-            user_prompt="ERROR: You replied with '$RESULT'. You MUST output exactly one word: CLEAN or DIRTY."
-            sleep 1
+            print -P "%F{cyan}[STATUS]%f Validation verdict: ISSUES (hasIssues=$VAL_HAS_ISSUES, issueCount=$VAL_ISSUE_COUNT). Fixer will run."
         fi
-    done
+    else
+        print -P "%F{yellow}[STATUS]%f No validation_result.json verdict found. Defaulting to RUN fixer (never silently skip)."
+    fi
 
-    print -P "%F{cyan}[STATUS]%f Report status: $CLEAN_RESULT"
-
-    if [[ "$CLEAN_RESULT" == "DIRTY" ]]; then
+    if [[ "$RUN_FIXER" == "true" ]]; then
         print -P "\n%F{red}[FIX]%f Issues found. Starting Fixer Agent..."
         FIX_PROMPT="The validation report found issues. Please fix them.
 
@@ -5034,6 +5045,7 @@ fi
 PRESERVED_REPORT=""
 if [[ -n "$SESSION_DIR" ]] && [[ -d "$SESSION_DIR" ]]; then
     [[ -f "./validation_report.md" ]] && cp -f "./validation_report.md" "$SESSION_DIR/validation_report.md" && PRESERVED_REPORT="$SESSION_DIR/validation_report.md"
+    [[ -f "./validation_result.json" ]] && cp -f "./validation_result.json" "$SESSION_DIR/validation_result.json"
     [[ -f "./validate.sh" ]] && cp -f "./validate.sh" "$SESSION_DIR/validate.sh"
 fi
 
@@ -5048,9 +5060,9 @@ if [[ "${FIX_INCOMPLETE:-0}" == "1" ]]; then
 else
     print -P "%F{blue}[CLEANUP]%f Removing validation artifacts from working tree (preserved in session dir)..."
     # Ask agent to delete the files (in case they were created elsewhere)
-    run_with_retry $AGENT --no-session -p "Delete the validation artifacts: remove ./validate.sh and ./validation_report.md from the current directory. These are temporary files that should not be committed." < /dev/null
+    run_with_retry $AGENT --no-session -p "Delete the validation artifacts: remove ./validate.sh, ./validation_report.md, and ./validation_result.json from the current directory. These are temporary files that should not be committed." < /dev/null
     # Manual deletion as backup (in case agent didn't delete them)
-    rm -f "./validate.sh" "./validation_report.md" 2>/dev/null
+    rm -f "./validate.sh" "./validation_report.md" "./validation_result.json" 2>/dev/null
     [[ -n "$PRESERVED_REPORT" ]] && print -P "%F{cyan}[CLEANUP]%f Validation report preserved at: $PRESERVED_REPORT"
 fi
 
