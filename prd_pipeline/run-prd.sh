@@ -3635,7 +3635,10 @@ cleanup_deterministic() {
     for e in dist/ build/ node_modules/ venv/ .env .DS_Store '*.log' '*.tmp' '*.bak' '*.swp'; do
         grep -qxF "$e" .gitignore 2>/dev/null || { echo "$e" >> .gitignore; ((added++)) }
     done
-    print -P "%F{blue}[CLEANUP]%f $id: moved $moved doc(s), added $added .gitignore entr(y/ies)."
+    local doc_word entry_word
+    (( moved == 1 )) && doc_word="doc" || doc_word="docs"
+    (( added == 1 )) && entry_word="entry" || entry_word="entries"
+    print -P "%F{blue}[CLEANUP]%f $id: moved $moved $doc_word, added $added .gitignore $entry_word."
 }
 
 # Wraps execute_item so the four scope loops don't each repeat the return-code /
