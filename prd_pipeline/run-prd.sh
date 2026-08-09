@@ -3592,6 +3592,36 @@ handle_item_result() {
 }
 
 # Execute one work item and enforce the non-implementation halt streak.
+# --- Deterministic per-item cleanup (no LLM) ---
+# Cleanup is pure file reorg: move stray untracked .md docs from the project
+# root into $SESSION_DIR/docs/, and ensure standard + common-temp .gitignore
+# entries exist. It deletes nothing (so the entire "NEVER DELETE" guardrail class
+# is moot — no risk to pipeline state). It runs BEFORE smart_commit so doc moves
+# land in the substance commit (one commit, not two), and only when the item
+# actually produced real changes (see the guard at the call site in execute_item).
+cleanup_deterministic() {
+    local id=$1 moved=0 added=0 f base e
+    mkdir -p "$SESSION_DIR/docs"
+    # Stray untracked .md in the project ROOT → docs/. Root-level only (no '/');
+    # PRP.md lives under plan/, so the no-slash filter excludes it automatically.
+    while IFS= read -r f; do
+        [[ -z "$f" ]] && continue
+        [[ "$f" == */* ]] && continue
+        base="${f:t}"
+        case "$base" in
+            README*|PRD.md|PRP.md|CONTRIBUTING.md|LICENSE*|CHANGELOG*) continue ;;
+        esac
+        mv -- "$f" "$SESSION_DIR/docs/" 2>/dev/null && { print -P "%F{cyan}[CLEANUP]%f moved stray doc $base → docs/"; ((moved++)) }
+    done < <(git ls-files --others --exclude-standard '*.md' 2>/dev/null)
+    # Standard build/deps/env + common-temp patterns, so scratch never reaches a
+    # commit (smart_commit does `git add -A`). Append-if-missing; never deletes.
+    touch .gitignore 2>/dev/null
+    for e in dist/ build/ node_modules/ venv/ .env .DS_Store '*.log' '*.tmp' '*.bak' '*.swp'; do
+        grep -qxF "$e" .gitignore 2>/dev/null || { echo "$e" >> .gitignore; ((added++)) }
+    done
+    print -P "%F{blue}[CLEANUP]%f $id: moved $moved doc(s), added $added .gitignore entr(y/ies)."
+}
+
 # Wraps execute_item so the four scope loops don't each repeat the return-code /
 # streak logic. On a detected systematic blocker it stops background research,
 # persists current state, and exits the whole run (exit propagates out of the
@@ -3991,21 +4021,16 @@ FEEDBACK_EOF
         fi
     fi
 
-    # Persist this item's substance (source changes + plan/ work dir + Complete
-    # status) NOW, before the cleanup agent runs. Cleanup is a long, interruptible
-    # LLM call; committing first guarantees a force-interrupt here can no longer
-    # leave the item "Complete on disk but uncommitted" — the state that makes a
-    # resume skip it and orphan its plan/ dir. The cleanup agent's doc reorg is
-    # committed by the smart_commit further below. (If nothing changed, smart_commit
-    # is a no-op.)
-    smart_commit
+    # Deterministic cleanup BEFORE smart_commit: move stray docs + ensure gitignore
+    # so everything lands in ONE substance commit (no second cleanup commit). Skip
+    # entirely when the item produced no real changes (excluding the tasks.json
+    # status flip, which is always present) — no work, no cleanup, no churn.
+    local _real_changes=""
+    _real_changes=$(git diff HEAD --name-only -- ':!**/tasks.json' 2>/dev/null)
+    [[ -z "$_real_changes" ]] && _real_changes=$(git ls-files --others --exclude-standard -- ':!**/tasks.json' 2>/dev/null)
+    [[ -n "$_real_changes" ]] && cleanup_deterministic "$id"
 
-    print -P "%F{blue}[CLEANUP]%f Cleaning up $id..."
-    run_with_retry $AGENT --no-session -p "$CLEANUP_PROMPT" < /dev/null || print -P "%F{yellow}[WARN]%f Cleanup failed, proceeding to commit..."
-
-    # Restore tasks.json again after cleanup (cleanup agent might also modify it)
-    restore_tasks_json "Complete"
-
+    # Persist substance + any cleanup doc moves + the Complete status in one commit.
     smart_commit
 
     # Check if graceful shutdown was requested
