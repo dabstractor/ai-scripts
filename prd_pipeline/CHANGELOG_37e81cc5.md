@@ -1370,3 +1370,568 @@ Turns the silent failure into a loud, recoverable one so a future misbehaving ag
 **Validation:** signal-count tested against the two real reports — the dense High/Medium/Low report scores 9 (caught); a genuinely-clean transcript scores 0 (no false positive); missing/empty transcripts score 0 (graceful). `zsh -n` clean. The sparse Minor-only transcript scores 1 (below the backstop threshold) but is fully handled at the source by item AG (Minor now triggers file-writing), and would in any case be recoverable from the captured transcript.
 
 **Why two layers:** item AG makes the agent write the file reliably (fixes both incidents at the source); item AH guarantees that if an agent *still* mis-gates, the report is neither lost nor silently marked clean.
+
+---
+
+## Changes Since Commit fc727a4 (Deterministic Verdicts, No-Gaps Execution & Deterministic Cleanup)
+
+**Base commit:** `fc727a4` — "docs(prd): add distributed PRD and resilience log"
+**New HEAD:** `6ee0256` — "fix(prd): pluralize cleanup log message correctly"
+**Date range:** 2026-07-23 through 2026-08-08 (8 commits touching `run-prd.sh`)
+**Files changed:** `prd_pipeline/run-prd.sh` (+953 lines, −240 lines vs `fc727a4`)
+
+**Theme:** The end-of-run decision stages were rebuilt around **agent-authored structured JSON verdicts parsed deterministically by the orchestrator**, eliminating the lossy LLM "CLEAN/DIRTY" classifier and the file-presence / prose-regex heuristics that silently dropped real findings (the false-negatives documented in the prior `fc727a4` section, items AG/AH). The execution loop gained a **no-gaps invariant** — the cursor never advances past a non-terminal item, with a hard **HALT gate** if any item is `Failed` before validation runs — and per-item completion now requires the implementing agent's **explicit self-certification** ("files changed → Complete" is gone). Per-item cleanup became a **deterministic file reorg with no LLM call**. PRD `@path` include resolution became **markdown-aware** (fenced and inline code are never treated as directives) and gained **per-file hash manifests** so a "PRD changed" can name the exact component file. Two new flags — `--focus-only` and `--dry-reconcile` — expose the prefix-closure model. A rule enforced everywhere a verdict is read: **a missing/malformed/contradictory verdict is never treated as "clean"** — it is a failure that must be resolved, not a success.
+
+---
+
+### A. PRD `@path` Include Resolution Is Now Markdown-Aware (fenced + inline code) — `de264c1`
+
+**Problem solved / Root cause:** An `@<path>` token shown *inside a fenced code block* (``` ``` ``` / `~~~`) or wrapped in *inline backticks* (`` `@ARCHITECTURE.md` ``) as **documentation** was being expanded as an include directive. If the literal text happened to resolve to a file, the documented example's content got spliced into the resolved PRD; if it did not, a spurious `[PRD INCLUDE] File not found:` warning fired. Both corrupt the resolved PRD and therefore the PRD hash/snapshot/delta machinery.
+
+**Solution / Mechanism — two parts:*
+
+1. **Fenced-block passthrough in `resolve_prd_content()`** (the per-file reader). A new `in_fence` toggle; the delimiter line and every line *inside* a fence are emitted verbatim and never passed to `expand_inline_includes`:
+
+```bash
+    local line in_fence=0 bt=$'\140'
+    # Fenced code blocks (``` or ~~~, up to 3 leading spaces) pass through
+    # verbatim, so @<path> tokens shown inside one as documentation are never
+    # treated as include directives. The delimiter line toggles the state.
+    local fence_re="^[[:space:]]{0,3}(${bt}${bt}${bt}+|~~~+)"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" =~ $fence_re ]]; then
+            print -r -- "$line"
+            (( in_fence )) && in_fence=0 || in_fence=1
+            continue
+        fi
+        if (( in_fence )); then
+            print -r -- "$line"
+            continue
+        fi
+        expand_inline_includes "$line" "$root" "$file_path" $(( depth + 1 ))
+    done < "$file_path"
+```
+   (`bt=$'\140'` is a literal backtick; the regex matches ```` ```+ ```` or `~~~+` with up to 3 leading spaces — CommonMark fence rules.)
+
+2. **Inline-code-span awareness in `expand_inline_includes()`** (the per-line tokenizer). An `@` sitting inside an inline code span is documentation, not a directive. It tracks a running backtick count across the already-consumed prefix and keeps the token literal when odd. **Also:** the match-offset locals were renamed `$mbegin`/`$mend` → `$cap_begin`/`$cap_end` and copied *immediately* after the `=~`, because zsh repopulates the reserved `$mbegin`/`$mend` arrays on **every** `=~` (including the downstream "looks like a doc" warning match), which clobbered the saved offsets before the line slice:
+
+```bash
+    local result="" tok include_path before_at pre pre_bt
+    local cap_begin cap_end
+    local bt=$'\140' bt_count=0
+    while [[ "$line" =~ @([A-Za-z0-9._~/-]+) ]]; do
+        tok="${match[1]}"
+        cap_begin=$MBEGIN
+        cap_end=$MEND
+        pre="${line[1,cap_begin-1]}"
+        result+="$pre"
+        before_at=""
+        (( cap_begin > 1 )) && before_at="${line[cap_begin-1,cap_begin-1]}"
+
+        pre_bt="${pre//[^$bt]/}"
+        bt_count=$(( bt_count + ${#pre_bt} ))
+        if (( bt_count % 2 )); then
+            # Inside an inline code span → keep literal, no warning.
+            result+="@$tok"
+        elif [[ -n "$before_at" ]] && [[ "$before_at" == [A-Za-z0-9._~/-] ]]; then
+            result+="@$tok"   # mid-token '@' (email/user@host)
+        else
+            # ... existing project-root-relative file resolution ...
+        fi
+        line="${line[cap_end+1,-1]}"
+    done
+```
+   The `bt_count` trick is correct because the shrinking `$line` buffer is always a suffix of the original line, so the per-iteration `pre` prefixes sum to the true running backtick count. Pure parameter expansion (no `=~`) is used inside the inline-code branch so `$match/$MBEGIN/$MEND` stay intact.
+
+**Behavior:** fenced-code documentation lines pass through byte-for-byte; inline `` `@x` `` tokens pass through literally and silently; genuine bare `@path` tokens still expand.
+
+**Impact:** the resolved PRD (and thus `prd_snapshot.md`, the PRD hash, and the delta/comparison machinery — items B, H) is stable against `@path` tokens that appear as documentation. The sister project must replicate both the fence toggle and the inline-backtick counter, plus the `cap_begin`/`cap_end` offset-rename.
+
+---
+
+### B. PRD Per-File Hash Manifests + Precise "What Changed" Reports — `572aa29`
+
+**Problem solved / Root cause:** when a *distributed* PRD (`PRD.md` + `@include` companion docs) changed between sessions, the `[SESSION]` message only said "PRD has changed" — it could not name *which* companion doc actually changed, so the user had to diff the whole tree.
+
+**Solution / Mechanism — a per-file sha256 manifest written next to every snapshot, plus a comparison helper.**
+
+**New artifact:** file `prd_manifest.txt`, written into each session dir alongside `prd_snapshot.md`. Format — one line per component file (main PRD first, then every `@include` recursively resolved), order-preserving, deduped:
+```
+<sha256(12)> <path-relative-to-PWD>
+```
+
+**New/changed functions (full):**
+
+`write_resolved_prd()` now also refreshes the manifest after writing the snapshot:
+```bash
+write_resolved_prd() {
+    local dest=$1
+    resolve_prd_content "$PRD_FILE" > "$dest"
+    write_prd_manifest "${dest:h}"
+}
+```
+
+`collect_prd_includes()` — fills the global `_PRD_INCLUDES_FOUND` array (absolute, order-preserving, deduped; main PRD first) by re-resolving with `PRD_INCLUDE_MARKERS=1` and scraping the `<!-- @include: PATH -->` markers:
+```bash
+collect_prd_includes() {
+    typeset -ga _PRD_INCLUDES_FOUND
+    _PRD_INCLUDES_FOUND=()
+    [[ -f "$PRD_FILE" ]] || return 0
+    local root="${PRD_FILE:A:h}"
+    _PRD_INCLUDES_FOUND+=("${PRD_FILE:A}")
+    local resolved tok inc_path
+    resolved=$(PRD_INCLUDE_MARKERS=1 resolve_prd_content "$PRD_FILE" 2>/dev/null) || resolved=""
+    while IFS= read -r tok; do
+        [[ -z "$tok" ]] && continue
+        inc_path="$tok"
+        inc_path="${inc_path/#\~/$HOME}"
+        [[ "$inc_path" != /* && "$inc_path" != \$* ]] && inc_path="$root/$inc_path"
+        [[ -f "$inc_path" ]] && _PRD_INCLUDES_FOUND+=("${inc_path:A}")
+    done < <(print -r -- "$resolved" | sed -nE 's/.*<!-- @include: ([^ ]+) -->.*/\1/p')
+    local -A seen=(); local out=() p
+    for p in "${_PRD_INCLUDES_FOUND[@]}"; do
+        (( ${+seen[$p]} )) && continue
+        seen[$p]=1; out+=("$p")
+    done
+    _PRD_INCLUDES_FOUND=("${out[@]}")
+}
+```
+
+`write_prd_manifest <session_dir>` — writes the manifest (called automatically by `write_resolved_prd`):
+```bash
+write_prd_manifest() {
+    local session_dir=$1
+    [[ -n "$session_dir" && -d "$session_dir" ]] || return 0
+    collect_prd_includes || return 0
+    local manifest="$session_dir/prd_manifest.txt" p rel h
+    : > "$manifest"
+    for p in "${_PRD_INCLUDES_FOUND[@]}"; do
+        [[ -f "$p" ]] || continue
+        if [[ "$p" == "$PWD"/* ]]; then rel="${p#$PWD/}"; else rel="$p"; fi
+        h=$(sha256sum "$p" 2>/dev/null | cut -c1-12)
+        [[ -n "$h" ]] && print -r "$h $rel" >> "$manifest"
+    done
+}
+```
+
+`prd_change_report <session_dir>` — prints (to stdout, for inline inclusion) which components changed. **If a manifest exists:** load baseline hashes into an associative array `baseline[rel]=hash`, then for each current component print `%F{yellow}+%f new:`, `%F{red}~%f changed:`, and (for baseline entries no longer on disk) `%F{red}-%f removed:`; if nothing changed, print `%F{cyan}(no component file changed — diff is elsewhere in the resolved content)%f`. **Fallback (older sessions without a manifest):** list every component with `[main PRD]`/`[@include]` tags and flag those edited by mtime since the snapshot, noting "change may be a pull/checkout that reset mtimes" when none show.
+
+**Wired into both PRD-changed branches** — immediately after each "PRD has changed" line (in both the `PRD_CHANGED_SESSION_INCOMPLETE` and `PRD_CHANGED_SESSION_COMPLETE` cases):
+```bash
+            print -P "%F{cyan}[SESSION]%f The resolved PRD = the main PRD + any @include companion docs. Changed component(s):"
+            prd_change_report "$CURRENT_SESSION_DIR"
+```
+
+**Impact:** "PRD changed" now enumerates the exact component file(s) (`+ new` / `~ changed` / `- removed`). `prd_manifest.txt` is a new artifact written into every session dir at snapshot time. The sister project must add all three functions, the `write_prd_manifest` call in `write_resolved_prd`, the `prd_manifest.txt` format, and the two `prd_change_report` call sites.
+
+---
+
+### C. No-Gaps Invariant + `--focus-only` + `--dry-reconcile` — `c740592`
+
+**Problem solved / Root cause:** previously the four scope loops **skipped** any phase/milestone/task/subtask whose number was below `START_*`:
+```bash
+    [[ $PHASE_NUM -lt $START_PHASE ]] && continue
+```
+So an interrupted/half-finished run restarted at a chosen start point and left every *earlier* non-terminal item behind — a permanent gap. (The start-skip was the old "jump ahead" behavior.)
+
+**Solution:** the cursor now walks from the beginning and never advances past a non-terminal item; the old jump-ahead is opt-in.
+
+**New environment variables / flags:**
+- **`FOCUS_ONLY`** (env `FOCUS_ONLY`, default `false`); long-arg `--focus-only` → `FOCUS_ONLY=true`. Restores the legacy jump-ahead: skip prefix closure, jump straight to `START_*`, leave prior non-terminal items as-is.
+- **`DRY_RECONCILE`** (env `DRY_RECONCILE`, default `false`); long-arg `--dry-reconcile` → `DRY_RECONCILE=true`. Audit-only: print every non-terminal item in document order (the exact set a normal run would close) and `exit 0` with no execution.
+
+Both are added to the `getopts` long-arg `case` *and* to both `Usage:` strings (the per-arg one and the summary one).
+
+**1. The four skip conditions are now gated on `FOCUS_ONLY`** (phase shown; milestone/task/subtask follow the identical `[[ "$FOCUS_ONLY" == "true" && … ]]` pattern):
+```bash
+    # --focus-only: skip phases before the start point (legacy jump-ahead). By
+    # default the no-gaps invariant walks from the start so the prefix is closed.
+    [[ "$FOCUS_ONLY" == "true" && $PHASE_NUM -lt $START_PHASE ]] && continue
+```
+So by default (no `--focus-only`) every phase/milestone/task/subtask is visited — the prefix gets closed first.
+
+**2. In-place retry on `rc=2` (the no-gaps loop).** `run_item_and_check` changed from a single call into a bounded re-attempt loop. `execute_item` returns `rc=2` when an item reported an implementation *issue* and reset **that same item** to Planned (PRP deleted, feedback saved); the wrapper now re-attempts the **same** item in place rather than advancing, bounded by `execute_item`'s `ISSUE_RETRY_MAX` (which eventually yields `rc=0` Complete or `rc=1` Failed). `rc=3` (dependency-defer) still advances. Full new body:
+```bash
+run_item_and_check() {
+    local rc
+    while true; do
+        execute_item "$@"
+        rc=$?
+        [[ "$SHUTDOWN_REQUESTED" == "true" ]] && break
+        [[ $rc -eq 2 ]] || break
+        print -P "%F{cyan}[RETRY]%f $1 hit an implementation issue — re-attempting in place (no advance) per the no-gaps invariant."
+    done
+    if ! handle_item_result "$rc" "$1"; then
+        [[ -n "$RESEARCH_PID" ]] && kill -TERM "$RESEARCH_PID" 2>/dev/null
+        print -P "%F{blue}[GIT]%f Persisting current state before halt..."
+        smart_commit
+        exit 1
+    fi
+    return 0
+}
+```
+
+**3. Config logging** now reports prefix-closure state instead of just start positions:
+```bash
+if [[ "$FOCUS_ONLY" == "true" ]]; then
+    print -P "%F{cyan}[CONFIG]%f Prefix closure: %F{yellow}SKIPPED (--focus-only)%f — jumping to start, prior non-terminal items left as-is"
+    print -P "%F{cyan}[CONFIG]%f Starting positions: Phase=$START_PHASE"
+    [[ $SCOPE != "phase" ]] && print -P "%F{cyan}[CONFIG]%f Starting positions: Milestone=$START_MS"
+    [[ $SCOPE == "task" || $SCOPE == "subtask" ]] && print -P "%F{cyan}[CONFIG]%f Starting positions: Task=$START_TASK"
+    [[ $SCOPE == "subtask" ]] && print -P "%F{cyan}[CONFIG]%f Starting positions: Subtask=$START_SUBTASK"
+else
+    print -P "%F{cyan}[CONFIG]%f Prefix closure: %F{green}enabled%f (no-gaps invariant) — walking from P1 to close any non-terminal items before advancing"
+fi
+```
+
+**4. Dry-reconcile block** — inserted after the "no phases" guard, before the outer loop. A recursive `jq` walk over `.backlog` prints `status<TAB>id<TAB>title` for every `Planned|Researching|Ready|Implementing` item (document order = closure order), formatted by awk, then `exit 0`:
+```bash
+if [[ "$DRY_RECONCILE" == "true" ]]; then
+    print -P "%B%F{cyan}[RECONCILE]%f%b Non-terminal items (document order = closure order):"
+    print -P ""
+    jq -r '
+      def walk:
+        (.status // empty) as $st |
+        (select($st == "Planned" or $st == "Researching" or $st == "Ready" or $st == "Implementing")
+         | "\($st)\t\(.id // "")\t\(.title // "")"),
+        ((.milestones // [])[] | walk),
+        ((.tasks // [])[] | walk),
+        ((.subtasks // [])[] | walk);
+      (.backlog // [])[] | walk
+    ' "$TASKS_FILE" 2>/dev/null | awk -F'\t' 'NF>=2 { printf "  %-13s %-20s %s\n", $1, $2, $3 }'
+    print -P ""
+    print -P "%F{cyan}[RECONCILE]%f (Implementing/Ready/Researching behind the cursor are the gaps; Planned is normal not-yet-started work.)"
+    exit 0
+fi
+```
+
+**Behavior:** a default run walks P1→… closing the prefix; `--focus-only` restores the old jump-ahead; `--dry-reconcile` lists the gaps and exits without executing.
+
+**Impact:** a restarted run no longer strands earlier non-terminal items. The sister project must flip the four skip conditions to `FOCUS_ONLY`-gated, add the `run_item_and_check` retry loop, the two flags + usage strings, the config block, and the dry-reconcile `jq` block.
+
+---
+
+### D. Per-Item Completion Requires Agent Self-Certification; One-Shot Re-Prompt; Interrupt → Planned Rollback — `c740592`
+
+**Problem solved / Root cause:** the old completion test in `execute_item`'s post-agent region was **"any git diff (modified OR new untracked, excluding `tasks.json`) ⇒ Complete"**. Code can be written without ever being tested, so this routinely marked untested / no-op work as Complete. (The `agent_reported_success` signal existed but was only consulted on the *no-changes* branch.)
+
+**Before:**
+```bash
+    if [[ -z "$modified_files" && -z "$untracked_files" ]]; then
+        if [[ "$agent_reported_success" == "true" ]]; then
+            ... mark Complete ...
+        else
+            ... "No changes produced" → Failed ...
+        fi
+    else
+        # Changes exist - mark as complete
+        CURRENT_PROCESSING_STATUS="Complete"; restore_tasks_json "Complete"; ...
+    fi
+```
+
+**After — explicit self-certification first; files-changed demoted to a sanity check with a one-shot re-prompt:**
+```bash
+    if [[ "$agent_reported_success" == "true" ]]; then
+        print -P "%F{green}[OK]%f Agent confirmed success for $id"
+        CURRENT_PROCESSING_STATUS="Complete"; restore_tasks_json "Complete"
+        rm -f "$dirname/.issue_retry_count" "$dirname/issue_feedback.md"
+    else
+        local modified_files=$(git diff HEAD --name-only -- ':!**/tasks.json' 2>/dev/null)
+        local untracked_files=$(git ls-files --others --exclude-standard -- ':!**/tasks.json' 2>/dev/null)
+        if [[ -n "$modified_files" || -n "$untracked_files" ]]; then
+            print -P "%F{yellow}[VERIFY]%f $id changed files but emitted no success signal — prompting agent to confirm (run tests, emit result)..."
+            local verify_out=$(mktemp)
+            setopt pipefail
+            $IMPL_AGENT --session-id "prd-impl-$(basename "$dirname")" -p "For $(get_scope_name) $id you modified files but did not emit a final result. Run this item's tests now. If they pass, output exactly: {\"result\":\"success\"}. If something is genuinely wrong, output: {\"result\":\"issue\",\"message\":\"...\"} and explain." < /dev/null 2>&1 | tee "$verify_out" >/dev/null
+            unsetopt pipefail
+            if [[ "$SHUTDOWN_REQUESTED" == "true" ]]; then
+                rm -f "$verify_out"
+                print -P "%F{yellow}[INTERRUPTED]%f Re-prompt interrupted for $id - rolling back to Planned"
+                restore_tasks_json "Planned"; return 130
+            fi
+            if grep -q '"result"[[:space:]]*:[[:space:]]*"success"' "$verify_out" 2>/dev/null; then
+                # confirmed → Complete
+            else
+                # "agent changed files but could not confirm success on re-prompt" → Failed (return 1)
+            fi
+        else
+            print -P "%F{red}[FAILED]%f No changes and no success signal for $id - marking as Failed and continuing"
+            CURRENT_PROCESSING_STATUS="Failed"; restore_tasks_json "Failed"; return 1
+        fi
+    fi
+```
+
+**Decision table (new):**
+
+| agent emitted `{"result":"success"}` | → **Complete** |
+| no success, files changed, re-prompt yields `success` | → **Complete** |
+| no success, files changed, re-prompt yields no `success` | → **Failed** |
+| no success, no files changed | → **Failed** ("no-op") |
+
+The re-prompt uses `$IMPL_AGENT` (default `piznt`) with a resumable session id `prd-impl-<dirname>`, reading the success JSON out of `verify_out` via `grep`.
+
+**Interrupt rollback (3 sites, all in this commit).** A Ctrl-C / `SHUTDOWN_REQUESTED` during an item used to `restore_tasks_json "Implementing"` (leave it mid-flight for resume). It now rolls **back to `Planned`** so the item is re-driven from a clean state on resume (PRP + tree work preserved, but not stranded half-implemented). Two sites inside the attempt loop + the re-prompt site — all changed `restore_tasks_json "Implementing"` → `restore_tasks_json "Planned"`:
+```bash
+            print -P "%F{yellow}[INTERRUPTED]%f Agent interrupted for $id - rolling back to Planned (PRP + tree work preserved for resume)"
+            restore_tasks_json "Planned"
+            rm -f "$agent_output_file"
+            return 130
+```
+(the third site is the re-prompt path: `"Re-prompt interrupted for $id - rolling back to Planned"`).
+
+**Impact:** an item can no longer reach Complete without a passing signal from the implementing agent; interruptions re-drive from `Planned`. The sister project must replace the gate logic, add the re-prompt, and flip all three interrupt sites to `Planned`.
+
+---
+
+### E. Deterministic Per-Item Cleanup Replaces the LLM Cleanup Agent (execute_item only) — `1a9fc08`, `6ee0256`
+
+**Problem solved / Root cause:** after each item, the pipeline ran an **LLM cleanup agent** (`$AGENT --no-session -p "$CLEANUP_PROMPT"`) to reorganize stray docs — a long, interruptible, model-dependent call whose only job was pure file reorg, run *after* the substance commit (so it produced a second "cleanup" commit), and able to delete things (risk to the NEVER-DELETE guardrails).
+
+**Solution / Mechanism — a deterministic, LLM-free function** that moves stray docs + ensures `.gitignore` entries, runs **before** `smart_commit` (one substance commit), and only when the item actually produced real changes:
+
+```bash
+cleanup_deterministic() {
+    local id=$1 moved=0 added=0 f base e
+    mkdir -p "$SESSION_DIR/docs"
+    # Stray untracked .md in the project ROOT → docs/. Root-level only (no '/');
+    # PRP.md lives under plan/, so the no-slash filter excludes it automatically.
+    while IFS= read -r f; do
+        [[ -z "$f" ]] && continue
+        [[ "$f" == */* ]] && continue
+        base="${f:t}"
+        case "$base" in
+            README*|PRD.md|PRP.md|CONTRIBUTING.md|LICENSE*|CHANGELOG*) continue ;;
+        esac
+        mv -- "$f" "$SESSION_DIR/docs/" 2>/dev/null && { print -P "%F{cyan}[CLEANUP]%f moved stray doc $base → docs/"; ((moved++)) }
+    done < <(git ls-files --others --exclude-standard '*.md' 2>/dev/null)
+    # Standard build/deps/env + common-temp patterns, so scratch never reaches a
+    # commit (smart_commit does `git add -A`). Append-if-missing; never deletes.
+    touch .gitignore 2>/dev/null
+    for e in dist/ build/ node_modules/ venv/ .env .DS_Store '*.log' '*.tmp' '*.bak' '*.swp'; do
+        grep -qxF "$e" .gitignore 2>/dev/null || { echo "$e" >> .gitignore; ((added++)) }
+    done
+    local doc_word entry_word
+    (( moved == 1 )) && doc_word="doc" || doc_word="docs"
+    (( added == 1 )) && entry_word="entry" || entry_word="entries"
+    print -P "%F{blue}[CLEANUP]%f $id: moved $moved $doc_word, added $added .gitignore $entry_word."
+}
+```
+
+It **deletes nothing** — it only `mv`s root-level untracked `*.md` (excluding `README*|PRD.md|PRP.md|CONTRIBUTING.md|LICENSE*|CHANGELOG*`, and the no-`/` filter means `PRP.md` under `plan/` is never touched) into `$SESSION_DIR/docs/`, and append-if-missing the listed `.gitignore` entries.
+
+**Call site (in `execute_item`)** — replaces the old substance-commit + LLM-cleanup + restore + second-commit sequence:
+```bash
+    local _real_changes=""
+    _real_changes=$(git diff HEAD --name-only -- ':!**/tasks.json' 2>/dev/null)
+    [[ -z "$_real_changes" ]] && _real_changes=$(git ls-files --others --exclude-standard -- ':!**/tasks.json' 2>/dev/null)
+    [[ -n "$_real_changes" ]] && cleanup_deterministic "$id"
+
+    smart_commit
+```
+So: (a) the per-item LLM `CLEANUP_PROMPT` call is gone from `execute_item`; (b) cleanup runs *before* `smart_commit` (one substance commit, not two); (c) cleanup is skipped entirely when there are no real changes (the `tasks.json` status flip alone never triggers it).
+
+**`6ee0256`** pluralizes the summary line correctly (`doc`/`docs`, `entry`/`entries`) — the `doc_word`/`entry_word` lines above are the post-fix final state.
+
+⚠️ **Scope note — do NOT over-apply:** the LLM `CLEANUP_PROMPT` call **still exists in the Phase-0 task-breakdown path** (~line 4729: `run_with_retry $AGENT --no-session -p "$CLEANUP_PROMPT"`). Only the *per-item* (`execute_item`) cleanup was replaced. The sister project must leave the breakdown cleanup as-is. `$SESSION_DIR/docs/` is a new per-item destination for stray docs.
+
+---
+
+### F. HALT Gate: Stop the Whole Run If Any Item Is `Failed` Before Validation — `de264c1`
+
+**Problem solved / Root cause:** a single `Failed` item whose downstream dependents merely *deferred* (so the ISSUE_STREAK mid-loop halt — which needs a streak — never tripped) used to fall through to end-of-run validation, which re-reported the known failures, after which the old cleanup/commit path marched on as if nothing was wrong — implementation effectively stamped "complete" on top of known failures.
+
+**Solution / Mechanism — a hard gate immediately after the execution loop** (inside the `SKIP_EXECUTION_LOOP != true` branch, before validation):
+```bash
+if [[ "$SKIP_EXECUTION_LOOP" != "true" ]]; then
+    _failed_count=$(jq '[.. | objects | select(.status? == "Failed")] | length' "$TASKS_FILE" 2>/dev/null)
+    if [[ "${_failed_count:-0}" -gt 0 ]]; then
+        print -P ""
+        print -P "%F{red}%B[HALT]%b%f %BImplementation incomplete: $_failed_count item(s) in Failed status.%b"
+        print -P "%F{red}[HALT]%f Validation will not run on top of known failures."
+        print -P "%F{red}[HALT]%f Failed items:"
+        jq -r '[.. | objects | select(.status? == "Failed")] | .[] | "  - \(.id // "?")  \(.title // "")"' "$TASKS_FILE" 2>/dev/null | head -20
+        print -P "%F{cyan}[HALT]%f Fix the root cause, then retry a failed item with:  tsk -f \"$TASKS_FILE\" next-failed --retry"
+        [[ -n "$RESEARCH_PID" ]] && kill -TERM "$RESEARCH_PID" 2>/dev/null
+        print -P "%F{blue}[GIT]%f Persisting current state before halt..."
+        smart_commit
+        exit 1
+    fi
+fi
+```
+
+**Behavior:** if ≥1 item is `Failed`, the run kills background research, persists state via `smart_commit`, prints the failed ids (capped at 20 via `head -20`), and `exit 1` — **validation never runs**. Skipped entirely in validation-only / bug-hunt-only modes (`SKIP_EXECUTION_LOOP == true`).
+
+**Impact:** validation and the bug hunt never run on a known-incomplete implementation. The sister project must add this gate exactly where shown (after the four scope loops close, before the validation block) and only when the execution loop actually ran.
+
+---
+
+### G. Validation: Agent JSON Verdict Replaces the LLM CLEAN/DIRTY Classifier; Fixer Gets a Watchdog Budget + Incomplete-Fix Preservation — `414975f`, `de264c1`
+
+**Problem solved / Root cause** (the validation analog of the bug-hunt false-negative): the post-validation decision of "does the fixer run?" was an LLM CLEAN/DIRTY classifier — a no-tools `$CLASSIFIER_AGENT` (default `pizc`) keyed off "passing status" in the report, inside a 4-try retry loop. A cheap model read a "PASS with minor notes" report as CLEAN and the fixer never ran, so the findings evaporated. Same lesson as the bug-hunt stage: the agent's structured verdict is the contract, and absence of a clean signal can never suppress a fix.
+
+**Layer 1 — the validation agent now writes a structured verdict (`414975f`).** `VALIDATION_PROMPT` gained a **third required output file** and a verdict block. The output-files section changed:
+
+*Before:*
+```
+**IMPORTANT: Use these EXACT file names:**
+1. Write the validation script to `./validate.sh` ...
+2. Write the bug tracker report to `./validation_report.md` ...
+...
+**CLEANUP NOTE:** These files (validate.sh and validation_report.md) are temporary ...
+...
+You write ONLY to `./validate.sh` and `./validation_report.md`.
+```
+*After:*
+```
+**IMPORTANT: Use these EXACT file names:**
+1. Write the validation script to `./validate.sh` ...
+2. Write the bug tracker report to `./validation_report.md` ...
+3. Write your structured verdict to `./validation_result.json` (this exact path, current directory)
+...
+**Structured verdict (`validation_result.json`) - CRITICAL:**
+The orchestrator decides whether to run the fixer from this file DETERMINISTICALLY
+-- it does NOT re-read your prose report to guess. It MUST be valid JSON:
+```json
+{ "hasIssues": true, "issueCount": 3, "summary": "Brief one-line summary." }
+```
+- `hasIssues`: true if ANY issue (critical, major, OR minor) is listed in the
+  report. false ONLY when the report lists zero issues.
+- `issueCount`: the exact number of issues listed in validation_report.md.
+  MUST be 0 when hasIssues is false.
+A missing, malformed, or self-contradictory verdict is treated as "issues found"
+and the fixer runs anyway -- so emit it correctly and keep it consistent with
+your report. (A cheap LLM-classifier gate here once misread a "PASS with minor
+notes" report as clean and silently dropped real findings.)
+...
+**CLEANUP NOTE:** These files (validate.sh, validation_report.md, validation_result.json) are temporary ...
+...
+You write ONLY to `./validate.sh`, `./validation_report.md`, and `./validation_result.json`.
+```
+
+**Layer 2 — the orchestrator decides deterministically (`414975f`).** The entire `CHECK_PROMPT` / classifier retry loop was **deleted** and replaced with `jq` over `validation_result.json`. **Safe default: a missing / unparseable / contradictory verdict RUNS the fixer** — the *only* path that skips it is an explicit `hasIssues==false && issueCount==0`:
+```bash
+    RUN_FIXER="true"
+    VAL_HAS_ISSUES="missing"
+    VAL_ISSUE_COUNT="-1"
+    if [[ -f "validation_result.json" ]]; then
+        VAL_HAS_ISSUES=$(jq -r '.hasIssues // "missing"' "validation_result.json" 2>/dev/null)
+        VAL_ISSUE_COUNT=$(jq -r '.issueCount // -1' "validation_result.json" 2>/dev/null)
+        if [[ "$VAL_HAS_ISSUES" == "false" && "$VAL_ISSUE_COUNT" == "0" ]]; then
+            RUN_FIXER="false"
+            print -P "%F{cyan}[STATUS]%f Validation verdict: CLEAN (hasIssues=false, issueCount=0). No fixer needed."
+        else
+            print -P "%F{cyan}[STATUS]%f Validation verdict: ISSUES (hasIssues=$VAL_HAS_ISSUES, issueCount=$VAL_ISSUE_COUNT). Fixer will run."
+        fi
+    else
+        print -P "%F{yellow}[STATUS]%f No validation_result.json verdict found. Defaulting to RUN fixer (never silently skip)."
+    fi
+    if [[ "$RUN_FIXER" == "true" ]]; then
+        ... run fixer ...
+    fi
+```
+**Removed:** `$CHECK_PROMPT`, the `$CLASSIFIER_AGENT` system-prompt call here, the `classify_attempt`/`classify_max=4` retry loop, and the `if [[ "$CLEAN_RESULT" == "DIRTY" ]]` branch. (`CLASSIFIER_AGENT` is still defined and still used by the bug-hunt FORCE step — see item H.)
+
+**Layer 3 — fixer watchdog budget + incomplete-fix preservation (`de264c1`).**
+- **New env var `FIX_TIMEOUT`** (default `14400` = 4h), declared near `VALIDATION_TIMEOUT`:
+  ```bash
+  # The validation-driven fixer re-runs lint/typecheck/the full test suite and
+  # rebuilds while iterating on EVERY reported issue — strictly more work than
+  # inspecting, so it gets a bigger watchdog budget than validation itself. ...
+  FIX_TIMEOUT="${FIX_TIMEOUT:-14400}"
+  ```
+- The fixer is invoked with `PI_AGENT_TIMEOUT=$FIX_TIMEOUT run_with_retry_stdin "$FIX_PROMPT" $IMPL_AGENT --no-session || fix_rc=$?` and its exit classified: `0` → "Fixes applied."; `124` (watchdog) → `FIX_INCOMPLETE=1`, "exceeded the watchdog budget"; anything else → `FIX_INCOMPLETE=1`, "fixer failed".
+- **Artifact preservation** (root-caused from a real loss: the watchdog once killed the fixer mid-fix, then this step `rm`'d the only copy of `validation_report.md`). Before any deletion, `validation_report.md`, `validation_result.json`, and `validate.sh` are `cp -f`'d into `$SESSION_DIR/` (only when a session dir exists; `PRESERVED_REPORT` records the report path). Then:
+  - if `FIX_INCOMPLETE==1`: keep the artifacts in cwd too (immediately visible) and **skip the final `smart_commit`** so partial work is not stamped as a clean "fixed" commit;
+  - else: the agent is asked to delete the three files (with an `rm -f` backup) and the preserved path is logged.
+
+The final-commit guard:
+```bash
+if [[ "${FIX_INCOMPLETE:-0}" == "1" ]]; then
+    print -P "%F{yellow}[GIT]%f Skipping auto-commit (fixer did not complete). Partial changes remain in the working tree — review and commit manually."
+else
+    print -P "%F{blue}[GIT]%f Committing final changes with smart commit..."
+    smart_commit
+fi
+```
+
+**Impact:** the fixer can no longer be silently suppressed; it gets enough time; and an interrupted fix never destroys its own report. The sister project must add the `validation_result.json` verdict to the prompt, replace the classifier with the `jq` gate, add `FIX_TIMEOUT`, the `fix_rc`/`FIX_INCOMPLETE` handling, the artifact-preservation `cp`s, and the guarded final commit.
+
+---
+
+### H. Bug Hunt: Deterministic JSON Verdict, Transcript Capture, Forced Conversion, No "Clean by Default" — `5bd1af5`, `15dd00a`, `572aa29`, `de264c1`
+
+This completes and **supersedes** the transcript *signal-count regex scanner* backstop from the prior `fc727a4` section (items AG/AH). The prose regex is gone; the agent's **emitted JSON** is the single source of truth, parsed by the orchestrator. The whole bug-hunt block was rewritten across four commits; the net final state is below.
+
+**Commit roles in this feature:**
+- `5bd1af5` — introduced transcript capture (`CAPTURE_STDOUT`), `BUG_HUNT_TRANSCRIPT`, the `INCONSISTENT_BUG_HUNT.md` marker, and the first prompt→JSON rewrite.
+- `15dd00a` — **intermediate only, fully superseded in the final file.** It refined the (now-removed) regex scanner into a two-tier `BUG_CLAIM_PAT`/`BUG_STRUCT_PAT` system (explicit bug-claims ⇒ 1 ⇒ inconsistent; structural/emoji-severity markers ⇒ ≥2 ⇒ inconsistent; a `BUG_NEG` filter stripped template echoes + negative statements). **None of this code survives** — `de264c1` deleted the entire regex approach and replaced it with the deterministic JSON resolver. Documented here only so the commit is accounted for; the sister project implements the JSON system, not this scanner.
+- `572aa29` — `render_bug_results_md()`, `BUG_RESULTS_JSON`, and the prompt's strict TestResults schema.
+- `de264c1` — `resolve_bug_verdict()`, the FORCE step, and the final `case found|clean|invalid`.
+
+**New env / paths:**
+- `BUG_RESULTS_JSON="$CURRENT_BUGFIX_SESSION/bug_hunt_result.json"` — the agent's **only** required output (TestResults JSON).
+- `BUG_HUNT_TRANSCRIPT="$CURRENT_BUGFIX_SESSION/bug-hunt-transcript.log"` — captured combined stdout+stderr.
+- **`CAPTURE_STDOUT`** — an *opt-in* env var consumed by `run_with_retry_stdin`. When set, the agent runs `eval "${(q)@}" < "$tmp" 2>&1 | tee "$CAPTURE_STDOUT"` with `exit_status=$pipestatus[1]` (the agent's status; tee's is intentionally ignored). Other call sites are unaffected. It exists so a report the agent writes only to chat (and never to the file) is still recoverable:
+  ```bash
+        if [[ -n "$CAPTURE_STDOUT" ]]; then
+            eval "${(q)@}" < "$tmp" 2>&1 | tee "$CAPTURE_STDOUT"
+            exit_status=$pipestatus[1]
+        else
+            eval "${(q)@}" < "$tmp"
+            exit_status=$?
+        fi
+  ```
+
+**`BUG_FINDING_PROMPT` rewritten (`5bd1af5`, `572aa29`).** Phase 4 changed from "Documentation as Bug Report" (a markdown template the agent filled in *only* for Critical/Major) to "Report Findings as a Structured JSON VERDICT". The agent now writes ONE file — `$BUG_RESULTS_JSON` — **every run**, clean or not. The prompt is expanded with both variables:
+```bash
+EXPANDED_BUG_PROMPT=$(echo "$BUG_FINDING_PROMPT" | BUG_RESULTS_FILE="$BUG_RESULTS_FILE" BUG_RESULTS_JSON="$BUG_RESULTS_JSON" envsubst '$BUG_RESULTS_FILE:$BUG_RESULTS_JSON')
+```
+The required schema (a concrete valid example is given in-prompt, with `severity`/`reproduction`/`location` fields):
+```json
+{ "hasBugs": true,
+  "bugs": [ { "id":"BUG-001", "severity":"critical", "title":"...",
+              "description":"...", "reproduction":"...", "location":"src/path:123" } ],
+  "summary":"...", "recommendations":["..."] }
+```
+and for a clean hunt: `{ "hasBugs": false, "bugs": [], "summary": "...", "recommendations": [] }`.
+The prompt's new "Output Rules - CRITICAL" mandates: always write the file (clean or not); `hasBugs` MUST equal (bugs non-empty) — cross-checked; use **exactly** `critical`/`major`/`minor` with an explicit **High→Critical / Medium→Major / Low→Minor** map (the taxonomy-mismatch fix); record **every** issue including minor; write only valid JSON to that one path (the orchestrator renders the markdown); plus a 3-point final self-check. The FORBIDDEN list's `**/TEST_RESULTS.md` line now reads "(the orchestrator renders these from your JSON; do not write them yourself)", and the agent is explicitly told it must NOT write `TEST_RESULTS.md` or `NO_ISSUES_FOUND.md`.
+
+**The run** launches the finder with `CAPTURE_STDOUT="$BUG_HUNT_TRANSCRIPT"`, and resume-detection now accepts **either** a rendered `TEST_RESULTS.md` **or** the raw JSON contract as an existing result.
+
+**`render_bug_results_md()` (`572aa29`)** — the **orchestrator** (not the agent) now owns `TEST_RESULTS.md`. A `python3` heredoc renders the TestResults JSON into the markdown the downstream bug-fix breakdown consumes (it indexes sections by h2/h3). It tolerates a ```` ```json ```` fence and missing optional fields, groups bugs by `critical`/`major`/`minor`, and emits the `# Bug Fix Requirements` / Overview / per-severity / Testing Summary / Recommendations structure. Signature: `render_bug_results_md <json_path> <out_md_path>`; `sys.exit(1)` on invalid JSON.
+
+**`resolve_bug_verdict()` (`de264c1`)** — the deterministic verdict resolver (`python3` heredoc). **Strict rule:** `clean` iff the agent *explicitly* declared `{hasBugs:false, bugs:[]}`; `found` iff `bugs` is non-empty; `invalid` otherwise (missing / malformed / `hasBugs:true` with empty bugs / empty bugs with no explicit `false`). **Source priority:** (1) the JSON file if it holds a valid TestResults object; (2) the LAST `{...}` / ```` ```json ```` block in the transcript that validates as `{bugs:[…]}` — preferring objects carrying an explicit `hasBugs` key, **last-in-document wins** (the agent's final output). A prefilter (`bugs`/`hasBugs`/`has_bugs` must appear within the next 400 chars of a `{`) keeps a prose transcript with stray braces fast. **Severities are canonicalized** via a dict (`high`/`p0`/`blocker`/`fatal`/`severe`→`critical`; `medium`/`p1`/`moderate`/`normal`→`major`; `low`/`p2`/`trivial`/`cosmetic`/`polish`/`nice`/`info`→`minor`, etc.); uncanonicalizable severities default to `minor`. On `found`/`clean` it **rewrites the canonicalized object** to the JSON file (durable record). It prints exactly one JSON line to stdout:
+```json
+{"verdict":"found|clean|invalid","bug_count":N,"source":"file|transcript|none","reason":"..."}
+```
+Signature: `resolve_bug_verdict <transcript_path> <json_file_path>`.
+
+**The FORCE step (`de264c1`).** If the first resolve returns `invalid` and the transcript is non-empty, a single no-tools call (`$CLASSIFIER_AGENT --system-prompt "$FORCE_SYS"`) is fed the transcript via stdin and told to output **only** the TestResults JSON. The system prompt embeds the full schema + the severity map + "You MUST list EVERY issue the report describes; do not omit any.":
+```
+FORCE_SYS="You convert a bug-hunt report into a STRICT JSON object and output ONLY that JSON -- no prose, no code fences. Schema: {\"hasBugs\":boolean,\"bugs\":[{\"id\":string,\"severity\":\"critical\"|\"major\"|\"minor\",\"title\":string,\"description\":string,\"reproduction\":string,\"location\":string}],\"summary\":string,\"recommendations\":[string]}. Map the report's own severity scale onto critical/major/minor (High/P0/blocker->critical, Medium/P1/should-fix->major, Low/P2/minor/trivial/polish->minor). If the report describes NO real defects, output {\"hasBugs\":false,\"bugs\":[],\"summary\":\"...\",\"recommendations\":[]}. You MUST list EVERY issue the report describes; do not omit any."
+```
+The transcript is passed via a temp `FORCE_BODY_FILE` (it can exceed `MAX_ARG_STRLEN`); its `FORCE_OUT` is re-resolved with `resolve_bug_verdict`. If it still yields no verdict, the run falls through to the `invalid` branch.
+
+**The `case "$BUG_VERDICT"` (final):**
+- **`found`** — clear stale `NO_ISSUES_FOUND.md` and `INCONSISTENT_BUG_HUNT.md`; `render_bug_results_md "$BUG_RESULTS_JSON" "$BUG_RESULTS_FILE"`; `git add` **both** the md and the JSON; commit `"Add bug report: <session>"`; recurse the pipeline (`SKIP_BUG_FINDING=true PRD_FILE="$BUG_RESULTS_FILE" SCOPE=… PLAN_DIR="$CURRENT_BUGFIX_SESSION" PARALLEL_RESEARCH=… RESEARCH_DEPTH=… "$0"`).
+- **`clean`** — the **only** path to "no issues": agent explicitly declared `hasBugs:false, bugs:[]`. Writes `NO_ISSUES_FOUND.md` (wording now "the agent EXPLICITLY declared no bugs … a missing/invalid verdict is treated as INCONSISTENT, never clean"), `git add` the marker + the JSON contract, commit `"No issues found (explicit clean verdict): <session>"`, then `rm` the transcript and `rmdir` the session.
+- **`*` (invalid)** — **never clean.** Prints red "NO VALID VERDICT … Refusing to mark this run clean. There is no 'clean by default' …", writes `INCONSISTENT_BUG_HUNT.md` (full recovery instructions: transcript path + expected JSON path), `git add` the marker + the transcript, commit `"No valid bug-hunt verdict (missing/invalid JSON): <session>"`, and **keeps** the session dir + transcript as evidence.
+
+**Removed (the prior-section backstop, now superseded):** the transcript signal-count regex scanner (and `15dd00a`'s two-tier refinement of it), the threshold-≥2 INCONSISTENT trigger, and the old `BUG_RESULTS_FILE` file-presence ⇒ clean branch.
+
+**Impact:** the bug hunt can no longer silently lose findings or falsely mark itself clean. The durable artifacts are `bug_hunt_result.json` (always), `bug-hunt-transcript.log` (kept until the run resolves clean/invalid), `TEST_RESULTS.md` (rendered, found only), and the `NO_ISSUES_FOUND.md` / `INCONSISTENT_BUG_HUNT.md` markers. The sister project must reproduce: the two new paths + `CAPTURE_STDOUT` in `run_with_retry_stdin`, the prompt rewrite + `envsubst`, `render_bug_results_md`, `resolve_bug_verdict` (with the canonicalization dict and the clean-only-on-explicit-`false` rule), the FORCE step, and the three-way `case`.
+
+---
+
+## Commit History (this section)
+
+Commits touching `run-prd.sh`, oldest → newest (all are pipeline code; none are docs-only):
+
+- `5bd1af5` fix(prd): catch orphaned bug reports  *(bug-hunt JSON verdict, transcript capture, INCONSISTENT marker — item H)*
+- `15dd00a` fix(prd): detect freeform bug findings in transcript  *(intermediate two-tier regex scanner — **fully superseded by `de264c1` in the final file**; documented in item H for completeness)*
+- `572aa29` feat(prd): precise prd diffs and strict json schema  *(per-file manifests + change reports — item B; `render_bug_results_md` + `BUG_RESULTS_JSON` + prompt schema — item H)*
+- `de264c1` fix(prd): enforce explicit verdicts and gate on failures  *(markdown-aware includes — item A; HALT gate — item F; `FIX_TIMEOUT` + incomplete-fix preservation — item G; `resolve_bug_verdict` + FORCE step + final bug-hunt `case` — item H)*
+- `c740592` fix(prd): require self-certification over file diffs  *(no-gaps invariant + `--focus-only`/`--dry-reconcile` — item C; self-cert completion gate + re-prompt + interrupt→Planned rollback — item D)*
+- `1a9fc08` fix(prd): replace agent cleanup with deterministic reorg  *(deterministic per-item cleanup — item E)*
+- `414975f` fix(prd): replace validation classifier with agent verdict  *(validation JSON verdict gate + prompt — item G)*
+- `6ee0256` fix(prd): pluralize cleanup log message correctly  *(pluralization in `cleanup_deterministic` — item E)*

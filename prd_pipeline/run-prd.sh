@@ -188,6 +188,14 @@ CLASSIFIER_AGENT="${CLASSIFIER_AGENT:-pizc}"
 # and pokes at the implementation. Wants strong reasoning, so defaults to pizr
 # (pi + --thinking xhigh), matching BREAKDOWN_AGENT/BUG_FINDER_AGENT.
 VALIDATION_AGENT="${VALIDATION_AGENT:-pizr}"
+# DEPRECATED / UNUSED: the bug hunt used to hand a missing-JSON verdict off to
+# a separate "force" agent (strong reasoning, default pizr) that converted the
+# transcript into JSON. That recovery is now done by nudging the bug finder's
+# OWN session to re-emit its verdict as JSON (see the NUDGE LOOP in the bug-hunt
+# stage) -- higher fidelity, since the agent holds its own findings in context
+# and converts its own report. The variable is kept for backwards compatibility
+# with env overrides but no longer drives any behavior.
+FORCE_AGENT="${FORCE_AGENT:-pizr}"
 TASKS_FILE="${TASKS_FILE:-tasks.json}"
 PRD_FILE="${PRD_FILE:-PRD.md}"
 PLAN_DIR="${PLAN_DIR:-plan}"
@@ -5142,6 +5150,13 @@ if [[ "$SKIP_BUG_FINDING" == "false" ]]; then
     # writes (or fails to write) the disposition files itself.
     BUG_RESULTS_JSON="$CURRENT_BUGFIX_SESSION/bug_hunt_result.json"
     BUG_HUNT_TRANSCRIPT="$CURRENT_BUGFIX_SESSION/bug-hunt-transcript.log"
+    # Session id for the bug finder so its session is RESUMABLE. The bug finder
+    # reliably hunts bugs but unreliably emits its JSON verdict; when that
+    # happens we nudge THIS SAME session to re-emit the verdict (see the nudge
+    # loop below) instead of handing off to a fresh agent. A persistent session
+    # means the agent still holds its own findings in context, so the nudge
+    # converts its OWN report losslessly. Matches the prd-prp-/prd-impl- pattern.
+    BUG_HUNT_SESSION_ID="prd-bughunt-$(basename "$CURRENT_BUGFIX_SESSION")"
 
     # --- Check for failed tasks from previous session ---
     # Priority: previous bugfix session > main session
@@ -5221,7 +5236,12 @@ ${EXPANDED_BUG_PROMPT}"
         # (a real past failure — a report written only to chat, or to a
         # differently-named file), the transcript lets us detect and recover it
         # below instead of marking the run clean and losing real bugs.
-        CAPTURE_STDOUT="$BUG_HUNT_TRANSCRIPT" run_with_retry_stdin "$EXPANDED_BUG_PROMPT" $BUG_FINDER_AGENT --no-session
+        # Run UNDER A SESSION (prd-bughunt-<session>) so a missing JSON verdict
+        # can be recovered by re-prompting THIS session (nudge loop below) rather
+        # than failing the run. The agent holds its findings in context, making
+        # the nudge a lossless self-conversion. stdin prompt + --session-id is the
+        # same pattern PRP creation uses.
+        CAPTURE_STDOUT="$BUG_HUNT_TRANSCRIPT" run_with_retry_stdin "$EXPANDED_BUG_PROMPT" $BUG_FINDER_AGENT --session-id "$BUG_HUNT_SESSION_ID"
     fi
     # --- Resolve the verdict DETERMINISTICALLY from the agent's own output ---
     #
@@ -5241,41 +5261,85 @@ ${EXPANDED_BUG_PROMPT}"
     # regex could not see severity markers inside table cells, so it scored 1
     # signal < threshold 2 and declared "quality looks good". There is no more
     # prose regex -- the model's own structured verdict is the contract, and if
-    # it will not emit one we FORCE one (below) before ever considering "clean".
+    # it will not emit one we NUUDGE its own session for one (below) before ever
+    # considering "clean".
     VERDICT_LINE=$(resolve_bug_verdict "$BUG_HUNT_TRANSCRIPT" "$BUG_RESULTS_JSON" 2>/dev/null)
     BUG_VERDICT=$(echo "$VERDICT_LINE" | jq -r '.verdict // "invalid"' 2>/dev/null)
     BUG_VERDICT_COUNT=$(echo "$VERDICT_LINE" | jq -r '.bug_count // 0' 2>/dev/null)
     BUG_VERDICT_SOURCE=$(echo "$VERDICT_LINE" | jq -r '.source // "none"' 2>/dev/null)
 
-    # FORCE STEP: if the agent never emitted a parseable TestResults verdict,
-    # convert its transcript into one with a single no-tools call whose ONLY job
-    # is to output the JSON. This is the "force explicit declaration" step. It
-    # recovers a freeform/table/emoji-severity report into the structured
-    # verdict so we never depend on the bug finder styling its output correctly.
-    # If the force step ALSO fails to produce a verdict, we fall through to the
-    # INCONSISTENT branch (never clean).
-    if [[ "$BUG_VERDICT" == "invalid" && -s "$BUG_HUNT_TRANSCRIPT" ]]; then
+    # NUDGE LOOP -- recover a missing JSON verdict by re-prompting the SAME
+    # bug-finder session (mandatory). The bug finder does the hunting well but
+    # often forgets to emit its TestResults JSON verdict -- it writes a prose /
+    # table / emoji-severity report instead (the exact failure that once
+    # stranded 3 real bugs and shipped them). The agent already did the analysis
+    # and holds every finding in its session context, so the highest-fidelity
+    # recovery is to NUDGE IT AGAIN -- not to hand the transcript to a different
+    # agent (the old FORCE step) and not to fail the run. We keep nudging until
+    # it emits valid JSON or the request errors out; never stop telling it to
+    # give JSON. On error-out (or a truly empty transcript with nothing to
+    # recover) we fall through to the INCONSISTENT branch, which is never clean.
+    if [[ "$BUG_VERDICT" == "invalid" && -n "$BUG_HUNT_SESSION_ID" && -s "$BUG_HUNT_TRANSCRIPT" ]]; then
         BUG_VERDICT_REASON=$(echo "$VERDICT_LINE" | jq -r '.reason // "?"' 2>/dev/null)
-        print -P "%F{yellow}[BUG HUNT]%f No parseable JSON verdict in agent output ($BUG_VERDICT_REASON). Forcing a structured verdict..."
-        FORCE_SYS="You convert a bug-hunt report into a STRICT JSON object and output ONLY that JSON -- no prose, no code fences. Schema: {\"hasBugs\":boolean,\"bugs\":[{\"id\":string,\"severity\":\"critical\"|\"major\"|\"minor\",\"title\":string,\"description\":string,\"reproduction\":string,\"location\":string}],\"summary\":string,\"recommendations\":[string]}. Map the report's own severity scale onto critical/major/minor (High/P0/blocker->critical, Medium/P1/should-fix->major, Low/P2/minor/trivial/polish->minor). If the report describes NO real defects, output {\"hasBugs\":false,\"bugs\":[],\"summary\":\"...\",\"recommendations\":[]}. You MUST list EVERY issue the report describes; do not omit any."
-        FORCE_BODY_FILE=$(mktemp -t prd-bugforce.XXXXXX)
-        FORCE_OUT=$(mktemp -t prd-bugforce-out.XXXXXX)
-        {
-            print -r "Below is the transcript of a bug-hunt run that did NOT emit its required JSON verdict. Convert its findings into the JSON object described in your instructions. Output ONLY the JSON object."
-            print -r ""
-            print -r "TRANSCRIPT:"
-            cat "$BUG_HUNT_TRANSCRIPT"
-        } > "$FORCE_BODY_FILE"
-        # CLASSIFIER_AGENT (pizc) = no-tools, no-session, watchdog-wrapped; reads
-        # the prompt via stdin (the transcript can exceed MAX_ARG_STRLEN).
-        if $CLASSIFIER_AGENT --system-prompt "$FORCE_SYS" < "$FORCE_BODY_FILE" > "$FORCE_OUT" 2>/dev/null; then
-            VERDICT_LINE=$(resolve_bug_verdict "$FORCE_OUT" "$BUG_RESULTS_JSON" 2>/dev/null)
+        print -P "%F{yellow}[BUG HUNT]%f No parseable JSON verdict ($BUG_VERDICT_REASON). Nudging the bug finder to re-emit its verdict as JSON..."
+        nudge_attempt=0
+        # Identical instruction every iteration -- the agent just needs to do
+        # what it already knows how to. Short (well under MAX_ARG_STRLEN), so -p
+        # is safe and no stdin temp file is needed.
+        NUDGE_PROMPT='Your previous response did NOT contain a parseable TestResults JSON verdict, so I could not read your findings. You MUST output your verdict as JSON NOW.
+
+Do BOTH of these:
+1. Write the JSON object to this exact file path: '"$BUG_RESULTS_JSON"'
+2. Emit the SAME JSON as a fenced ```json block as the LAST thing in your reply.
+
+Schema (every field is required):
+```json
+{
+  "hasBugs": true,
+  "bugs": [
+    {"id": "BUG-001", "severity": "critical", "title": "...", "description": "...", "reproduction": "...", "location": "file:line"}
+  ],
+  "summary": "...",
+  "recommendations": []
+}
+```
+
+Rules:
+- severity MUST be one of: "critical", "major", "minor" (lowercase, exactly those words).
+- hasBugs MUST be true if you list ANY bugs; it MUST be false only when the bugs array is empty.
+- List EVERY issue you found during the hunt. Do not omit any. If you genuinely found none, emit {"hasBugs": false, "bugs": [], "summary": "...", "recommendations": []}.
+- Output ONLY valid JSON in the file (no surrounding prose), and emit that same JSON as the final fenced block in your reply.
+
+Output your JSON verdict now.'
+        # The ONLY two stop conditions are: a valid verdict, or the request
+        # erroring out (non-zero exit). A non-zero exit is the request erroring
+        # out -- stop nudging and fall through to INCONSISTENT. Otherwise keep
+        # nudging forever; this is mandatory and intentional.
+        while [[ "$BUG_VERDICT" == "invalid" ]]; do
+            ((nudge_attempt++))
+            print -P "%F{cyan}[BUG HUNT]%f Nudge attempt $nudge_attempt -- asking $BUG_FINDER_AGENT (same session $BUG_HUNT_SESSION_ID) to emit JSON..."
+            # Re-prompt the SAME session so the agent converts its own report
+            # losslessly. tee -a PRESERVES the original prose transcript (the bug
+            # descriptions) -- resolve_bug_verdict still sees it and picks the
+            # LAST valid object. pipefail gives us the agent exit status, not tee.
+            setopt pipefail
+            $BUG_FINDER_AGENT --session-id "$BUG_HUNT_SESSION_ID" -p "$NUDGE_PROMPT" < /dev/null 2>&1 | tee -a "$BUG_HUNT_TRANSCRIPT" >/dev/null
+            nudge_rc=$?
+            unsetopt pipefail
+            if [[ $nudge_rc -ne 0 ]]; then
+                print -P "%F{red}[BUG HUNT]%f Nudge request errored out (exit $nudge_rc) on attempt $nudge_attempt. Stopping nudge loop."
+                break
+            fi
+            VERDICT_LINE=$(resolve_bug_verdict "$BUG_HUNT_TRANSCRIPT" "$BUG_RESULTS_JSON" 2>/dev/null)
             BUG_VERDICT=$(echo "$VERDICT_LINE" | jq -r '.verdict // "invalid"' 2>/dev/null)
             BUG_VERDICT_COUNT=$(echo "$VERDICT_LINE" | jq -r '.bug_count // 0' 2>/dev/null)
             BUG_VERDICT_SOURCE=$(echo "$VERDICT_LINE" | jq -r '.source // "none"' 2>/dev/null)
-            [[ "$BUG_VERDICT" != "invalid" ]] && print -P "%F{green}[BUG HUNT]%f Forced structured verdict obtained: $BUG_VERDICT ($BUG_VERDICT_COUNT bug(s))"
-        fi
-        rm -f "$FORCE_BODY_FILE" "$FORCE_OUT"
+            if [[ "$BUG_VERDICT" != "invalid" ]]; then
+                print -P "%F{green}[BUG HUNT]%f Nudge succeeded on attempt $nudge_attempt: verdict=$BUG_VERDICT ($BUG_VERDICT_COUNT bug(s), source: $BUG_VERDICT_SOURCE)"
+            else
+                print -P "%F{yellow}[BUG HUNT]%f Still no valid JSON after nudge attempt $nudge_attempt. Nudging again."
+            fi
+        done
     fi
 
     case "$BUG_VERDICT" in
