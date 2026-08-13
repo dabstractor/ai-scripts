@@ -801,6 +801,20 @@ ISSUE_RETRY_MAX="${ISSUE_RETRY_MAX:-3}"
 COMMIT_RETRY_MAX="${COMMIT_RETRY_MAX:-5}"
 COMMIT_RETRY_DELAY="${COMMIT_RETRY_DELAY:-10}"
 
+# In-flight background-commit tracking. smart_commit stages everything
+# synchronously, then launches stagecoach (via run_commit_with_retry) in the
+# BACKGROUND so the pipeline can proceed to the next item's research/implementation
+# while the commit message is generated. stagecoach snapshots the index the
+# instant it starts (deterministic, no LLM round-trip), so by the time the next
+# smart_commit runs the snapshot is long since captured — there is no risk of a
+# later `git add -A` being swept into an earlier commit. COMMIT_BG_PID is the
+# background subshell running the retry loop; COMMIT_BG_LOG captures its output.
+# await_inflight_commit serializes successive commits (never two stagecoaches
+# racing on the repo) and also runs from the EXIT trap so a commit in flight at
+# exit is never lost.
+COMMIT_BG_PID=""
+COMMIT_BG_LOG=""
+
 # --- PRD Selector Functions (mdsel integration) ---
 
 # Check if mdsel is available (either as command or via node)
@@ -4490,8 +4504,68 @@ run_commit_with_retry() {
     done
 }
 
+# Block until the in-flight background commit (if any) finishes, then report its
+# result. No-op when nothing is running. Called at the top of smart_commit (to
+# serialize: never two stagecoaches racing on the repo — commit generation is
+# seconds vs the minutes/hours of research+impl between two commits, so this
+# almost never actually blocks) and from the EXIT trap (so a commit in flight
+# when the script ends is never lost). Also called before the bug-hunt stage's
+# direct `git commit`s and before re-exec, for the same reason.
+await_inflight_commit() {
+    [[ -z "$COMMIT_BG_PID" ]] && return 0
+    if kill -0 "$COMMIT_BG_PID" 2>/dev/null; then
+        print -P "%F{blue}[GIT]%f Waiting for in-flight background commit (PID $COMMIT_BG_PID) to finish..."
+        wait "$COMMIT_BG_PID" 2>/dev/null
+        local rc=$?
+        if [[ $rc -eq 0 ]]; then
+            print -P "%F{green}[GIT]%f Background commit completed (PID $COMMIT_BG_PID)."
+        else
+            print -P "%F{red}[GIT]%f Background commit FAILED (PID $COMMIT_BG_PID, exit $rc). Log tail:"
+            [[ -f "$COMMIT_BG_LOG" ]] && tail -n 20 "$COMMIT_BG_LOG" 2>/dev/null
+        fi
+    fi
+    COMMIT_BG_PID=""
+    [[ -f "$COMMIT_BG_LOG" ]] && rm -f "$COMMIT_BG_LOG"
+    COMMIT_BG_LOG=""
+}
+
+# Launch stagecoach (with its bounded retry loop) in the background and return
+# immediately. The caller (smart_commit) has ALREADY staged everything, so
+# stagecoach snapshots the index the instant it starts and we are free to proceed
+# to the next operation while the commit message is generated. Retries on failure
+# (and the fallback plain `git commit`) live inside the background subshell via
+# run_commit_with_retry; stagecoach is so much faster than research/implementation
+# there is virtually no chance of it ever committing the wrong files. See
+# await_inflight_commit for serialization.
+launch_commit_async() {
+    await_inflight_commit   # never two stagecoaches at once
+    COMMIT_BG_LOG=$(mktemp -t prd-commit.XXXXXX.log 2>/dev/null)
+    ( run_commit_with_retry ) >"$COMMIT_BG_LOG" 2>&1 &
+    COMMIT_BG_PID=$!
+    print -P "%F{blue}[GIT]%f Commit generation launched in background (PID $COMMIT_BG_PID); proceeding without blocking."
+}
+
+# On exit, never abandon an in-flight background commit — the staged work would
+# be lost. Blocks until stagecoach finishes (or the retry loop falls back to a
+# plain git commit). Skipped only on a FORCED shutdown (second Ctrl+C), where the
+# user explicitly asked for immediate exit; the background commit is then left
+# orphaned and lands on its own if it can. (exec does NOT trigger EXIT, so
+# await_inflight_commit is also called explicitly before every exec "$0".)
+_exit_await_commit() {
+    [[ "$FORCE_SHUTDOWN" == "true" ]] && return 0
+    await_inflight_commit
+}
+trap _exit_await_commit EXIT
+
 # Protects tasks.json and the plan directory from AI "cleanup"
 smart_commit() {
+    # Serialize: wait for any prior background stagecoach to finish before we
+    # touch the index again. Commit generation is seconds vs the minutes/hours
+    # between two smart_commit calls, so this is almost always a no-op — but it
+    # guarantees we never stage new work while a previous commit is still being
+    # assembled (which could otherwise race on HEAD/index and lose data).
+    await_inflight_commit
+
     print -P "%F{blue}[GIT]%f Staging changes..."
     git add -A
 
@@ -4534,7 +4608,10 @@ smart_commit() {
     if git diff --staged --quiet; then
         print -P "%F{yellow}[GIT]%f No staged changes to commit."
     else
-        run_commit_with_retry
+        # Launch stagecoach in the background: the staged work is snapshotted
+        # the instant it starts, so message generation can run while the pipeline
+        # advances to the next item. Retries/fallback stay inside run_commit_with_retry.
+        launch_commit_async
     fi
 }
 
@@ -5105,6 +5182,10 @@ if [[ "$SKIP_BUG_FINDING" == "false" ]]; then
     BUGFIX_DIR="${SESSION_DIR}/bugfix"
     mkdir -p "$BUGFIX_DIR"
 
+    # Ensure any background commit from the validation stage has landed before we
+    # run git operations here (stagecoach generation may still be in flight).
+    await_inflight_commit
+
     # Find or create bug hunt session
     # Check for actionable bug hunt session (has tasks in Planned/Researching/Ready/Implementing)
     get_latest_bugfix_session() {
@@ -5475,6 +5556,11 @@ if [[ "$SINGLE_SESSION" == "false" && -n "$SESSION_DIR" ]]; then
 
             print -P "%F{green}[SESSION]%f Created delta session: $(basename "$NEW_SESSION_DIR")"
             print -P "%F{cyan}[SESSION]%f Re-running pipeline for delta session..."
+
+            # Ensure the in-flight background commit has landed before replacing
+            # this process — exec does NOT fire the EXIT trap, so without this
+            # the commit could be orphaned/SIGHUP'd and the staged work lost.
+            await_inflight_commit
 
             # Re-exec to process the new session
             exec "$0" "$@"
