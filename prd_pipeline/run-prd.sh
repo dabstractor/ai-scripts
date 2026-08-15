@@ -32,6 +32,18 @@ unalias() { builtin unalias "$@" 2>/dev/null || true }
 # Ensure aliases are expanded in the script
 setopt aliases
 
+# The user's aliases.zsh sets `alias python3="uv run"` (handy at the REPL,
+# harmful here): this script drives python via heredocs for its OWN internal
+# JSON processing (resolve_bug_verdict, render_bug_results_md). Through the
+# alias those become `uv run - ...`, which depends on a project venv and can
+# crash outright -- e.g. a uv-cache permission error produced empty stdout,
+# silently zeroed the bug-hunt verdict, and killed a run that had a perfectly
+# parseable bug_hunt_result.json on disk. Drop the alias for the rest of this
+# script so `python3` is the real interpreter. (Runs before the functions that
+# use it are parsed, so their bodies capture the un-aliased name; `unalias`
+# also survives a same-named function should one appear later.)
+unalias python3 2>/dev/null || true
+
 # --- 2. Subcommands ---
 
 # Alias 'status' -> 'task' for git muscle memory (git status / prd status)
@@ -5348,6 +5360,19 @@ ${EXPANDED_BUG_PROMPT}"
     BUG_VERDICT=$(echo "$VERDICT_LINE" | jq -r '.verdict // "invalid"' 2>/dev/null)
     BUG_VERDICT_COUNT=$(echo "$VERDICT_LINE" | jq -r '.bug_count // 0' 2>/dev/null)
     BUG_VERDICT_SOURCE=$(echo "$VERDICT_LINE" | jq -r '.source // "none"' 2>/dev/null)
+    # Coerce: anything that is not an EXPLICIT found/clean is "invalid" so the
+    # nudge loop engages. This is what the "nudge indefinitely until parseable"
+    # contract demands. It specifically covers resolve_bug_verdict itself
+    # failing: when it crashes (e.g. the python3->"uv run" alias blew up on a
+    # uv-cache permission error), VERDICT_LINE is EMPTY, jq on empty input
+    # returns empty -- NOT the // "invalid" default -- so BUG_VERDICT became "",
+    # the `== "invalid"` nudge gate was false, and the run died INCONSISTENT
+    # with a parseable file on disk. An empty/unparseable verdict == "not yet
+    # parseable" -> nudge.
+    if [[ "$BUG_VERDICT" != "found" && "$BUG_VERDICT" != "clean" ]]; then
+        BUG_VERDICT=invalid
+        [[ -z "$VERDICT_LINE" ]] && print -P "%F{red}[BUG HUNT]%f resolve_bug_verdict emitted nothing (python3 unavailable/crashed). Verdict forced to 'invalid'; will nudge."
+    fi
 
     # NUDGE LOOP -- recover a missing JSON verdict by re-prompting the SAME
     # bug-finder session (mandatory). The bug finder does the hunting well but
@@ -5356,11 +5381,25 @@ ${EXPANDED_BUG_PROMPT}"
     # stranded 3 real bugs and shipped them). The agent already did the analysis
     # and holds every finding in its session context, so the highest-fidelity
     # recovery is to NUDGE IT AGAIN -- not to hand the transcript to a different
-    # agent (the old FORCE step) and not to fail the run. We keep nudging until
-    # it emits valid JSON or the request errors out; never stop telling it to
-    # give JSON. On error-out (or a truly empty transcript with nothing to
-    # recover) we fall through to the INCONSISTENT branch, which is never clean.
-    if [[ "$BUG_VERDICT" == "invalid" && -n "$BUG_HUNT_SESSION_ID" && -s "$BUG_HUNT_TRANSCRIPT" ]]; then
+    # agent (the old FORCE step) and not to fail the run. We nudge INDEFINITELY
+    # -- the ONLY exit condition is a valid verdict; we never give up, because
+    # giving up is exactly how real bugs get stranded and shipped. Two earlier
+    # gates here both violated that contract and have been removed:
+    #   * -s "$BUG_HUNT_TRANSCRIPT": required the transcript to exist. But the
+    #     transcript is just a local stdout capture -- the findings live in the
+    #     pi session (looked up by id). On a resume (bug hunt skipped because
+    #     bug_hunt_result.json already exists) or when CAPTURE_STDOUT produced
+    #     no output, the transcript was absent and the nudge never started, so a
+    #     recoverable invalid verdict became a permanent INCONSISTENT failure.
+    #   * break on nudge_rc != 0: the agent frequently exits non-zero AFTER it
+    #     has already written a valid JSON file (transient provider teardown,
+    #     pipefail catching tee/stderr). The old code broke BEFORE re-resolving,
+    #     so a successful nudge that fixed the file was thrown away and the run
+    #     died INCONSISTENT with a perfectly parseable bug_hunt_result.json on
+    #     disk. (Confirmed in session 009: valid JSON written, run still failed.)
+    # The loop below re-resolves on EVERY iteration regardless of exit code and
+    # only ever leaves holding a valid verdict.
+    if [[ "$BUG_VERDICT" == "invalid" && -n "$BUG_HUNT_SESSION_ID" ]]; then
         BUG_VERDICT_REASON=$(echo "$VERDICT_LINE" | jq -r '.reason // "?"' 2>/dev/null)
         print -P "%F{yellow}[BUG HUNT]%f No parseable JSON verdict ($BUG_VERDICT_REASON). Nudging the bug finder to re-emit its verdict as JSON..."
         nudge_attempt=0
@@ -5392,31 +5431,55 @@ Rules:
 - Output ONLY valid JSON in the file (no surrounding prose), and emit that same JSON as the final fenced block in your reply.
 
 Output your JSON verdict now.'
-        # The ONLY two stop conditions are: a valid verdict, or the request
-        # erroring out (non-zero exit). A non-zero exit is the request erroring
-        # out -- stop nudging and fall through to INCONSISTENT. Otherwise keep
-        # nudging forever; this is mandatory and intentional.
+        # Nudge INDEFINITELY: the ONLY way out is a valid verdict (or a
+        # user-requested shutdown). A non-zero agent exit does NOT stop us --
+        # the agent often exits non-zero AFTER successfully writing the JSON
+        # file, so we MUST re-resolve every iteration regardless of exit code
+        # (this is the bug that stranded a confirmed critical finding in session
+        # 009: the nudge wrote a valid bug_hunt_result.json, but a
+        # break-on-non-zero skipped the re-resolve and the run died INCONSISTENT
+        # with a parseable file on disk). A capped backoff on errors keeps a
+        # hard-down provider from tight-spinning, but we never give up -- losing
+        # real bugs is worse than retrying.
+        nudge_backoff=5
         while [[ "$BUG_VERDICT" == "invalid" ]]; do
+            # Honor a graceful-shutdown request so the user is never trapped in
+            # the indefinite loop. Falling through lands in the INCONSISTENT
+            # branch, which preserves the transcript for resume.
+            [[ "$SHUTDOWN_REQUESTED" == "true" ]] && { print -P "%F{yellow}[BUG HUNT]%f Shutdown requested -- leaving nudge loop (verdict still invalid)."; break; }
             ((nudge_attempt++))
             print -P "%F{cyan}[BUG HUNT]%f Nudge attempt $nudge_attempt -- asking $BUG_FINDER_AGENT (same session $BUG_HUNT_SESSION_ID) to emit JSON..."
             # Re-prompt the SAME session so the agent converts its own report
             # losslessly. tee -a PRESERVES the original prose transcript (the bug
-            # descriptions) -- resolve_bug_verdict still sees it and picks the
-            # LAST valid object. pipefail gives us the agent exit status, not tee.
+            # descriptions) and CREATES the file if absent (append mode) -- so
+            # nudging works even when no transcript was captured up front.
+            # resolve_bug_verdict still sees it and picks the LAST valid object.
+            # pipefail gives us the agent exit status, not tee.
             setopt pipefail
             $BUG_FINDER_AGENT --session-id "$BUG_HUNT_SESSION_ID" -p "$NUDGE_PROMPT" < /dev/null 2>&1 | tee -a "$BUG_HUNT_TRANSCRIPT" >/dev/null
             nudge_rc=$?
             unsetopt pipefail
-            if [[ $nudge_rc -ne 0 ]]; then
-                print -P "%F{red}[BUG HUNT]%f Nudge request errored out (exit $nudge_rc) on attempt $nudge_attempt. Stopping nudge loop."
-                break
-            fi
+            # ALWAYS re-resolve -- never break on a non-zero exit (see above).
             VERDICT_LINE=$(resolve_bug_verdict "$BUG_HUNT_TRANSCRIPT" "$BUG_RESULTS_JSON" 2>/dev/null)
             BUG_VERDICT=$(echo "$VERDICT_LINE" | jq -r '.verdict // "invalid"' 2>/dev/null)
             BUG_VERDICT_COUNT=$(echo "$VERDICT_LINE" | jq -r '.bug_count // 0' 2>/dev/null)
             BUG_VERDICT_SOURCE=$(echo "$VERDICT_LINE" | jq -r '.source // "none"' 2>/dev/null)
+            # Same coercion as the initial resolve: empty/error -> invalid, so a
+            # transient resolve failure keeps nudging instead of looping forever
+            # on an empty verdict.
+            [[ "$BUG_VERDICT" != "found" && "$BUG_VERDICT" != "clean" ]] && BUG_VERDICT=invalid
             if [[ "$BUG_VERDICT" != "invalid" ]]; then
                 print -P "%F{green}[BUG HUNT]%f Nudge succeeded on attempt $nudge_attempt: verdict=$BUG_VERDICT ($BUG_VERDICT_COUNT bug(s), source: $BUG_VERDICT_SOURCE)"
+                break
+            fi
+            # Still invalid. If the request itself errored (non-zero exit), back
+            # off (capped) so a down provider isn't hammered; if it just emitted
+            # non-JSON, re-nudge promptly. Either way: nudge again, never stop.
+            if [[ $nudge_rc -ne 0 ]]; then
+                print -P "%F{yellow}[BUG HUNT]%f Nudge exited non-zero ($nudge_rc), still no valid JSON after attempt $nudge_attempt. Backing off ${nudge_backoff}s, then nudging again (never gives up)."
+                sleep $nudge_backoff
+                nudge_backoff=$(( nudge_backoff * 2 ))
+                (( nudge_backoff > 60 )) && nudge_backoff=60
             else
                 print -P "%F{yellow}[BUG HUNT]%f Still no valid JSON after nudge attempt $nudge_attempt. Nudging again."
             fi
