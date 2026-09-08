@@ -188,7 +188,7 @@ BREAKDOWN_AGENT="${BREAKDOWN_AGENT:-pizr}"
 # Implementation agent: WRITES CODE - the per-task/subtask PRP-execute step, plus
 # the post-validation Fix step. Defaults to pizt = glm-5-turbo (faster codegen).
 # To run implementation on the same model as planning: IMPL_AGENT=$AGENT ...
-IMPL_AGENT="${IMPL_AGENT:-piznt}"
+IMPL_AGENT="${IMPL_AGENT:-pizf}"
 # Binary classifier (no tools, no session) for COSMETIC/SUBSTANTIVE & CLEAN/DIRTY.
 # MUST be a single-token function name (pizc), not a multi-word string: zsh does
 # not word-split `$VAR` in command position, so "pi -p ..." would be treated as
