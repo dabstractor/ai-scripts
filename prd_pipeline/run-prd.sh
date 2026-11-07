@@ -115,6 +115,12 @@ START_SUBTASK=1
 FOCUS_ONLY="${FOCUS_ONLY:-false}"        # --focus-only: skip prefix closure, jump to START_* (legacy jump-ahead)
 DRY_RECONCILE="${DRY_RECONCILE:-false}"  # --dry-reconcile: audit non-terminal items, then exit (no execution)
 PARALLEL_RESEARCH="${PARALLEL_RESEARCH:-false}"  # Optional parallel research for next item
+# Tmux live agent panes: open a viewer pane beside the pipeline for every MAJOR
+# agent invocation (research/breakdown/delta/impl/verify/validation/fixer/bug
+# hunt) when running inside tmux. "auto" (default) = on iff $TMUX is set;
+# "off"/"no-tmux-panes" disables; "on"/"--tmux-panes" forces (creates panes via
+# the tmux server even if this script itself wasn't launched from a pane).
+PRD_TMUX_PANES="${PRD_TMUX_PANES:-auto}"
 ONLY_VALIDATE="${ONLY_VALIDATE:-false}" # Run only the validation step
 ONLY_BUG_HUNT="${ONLY_BUG_HUNT:-false}" # Run only the bug finding step
 SINGLE_SESSION="${SINGLE_SESSION:-false}" # Disable auto-flow between sessions
@@ -132,6 +138,14 @@ ACCEPT_PRD_CHANGES="${ACCEPT_PRD_CHANGES:-false}"
 # for integrating run-prd.sh into existing projects after writing the PRD.
 ADOPT_PRD="${ADOPT_PRD:-false}"
 MANUAL_START=false
+# Standalone working plan (delta-equivalent) instead of a full-project PRD
+# baseline. --plan <file> / PLAN_FILE points PRD_FILE at the plan and
+# enables STANDALONE_PLAN mode: the plan is broken down DIRECTLY (there is
+# no baseline PRD to diff a delta from), and a changed/new plan creates a
+# new plan session that uses the plan as-is instead of generating a
+# diff-based delta PRD. For projects with no PRD.md.
+PLAN_FILE="${PLAN_FILE:-}"
+STANDALONE_PLAN="${STANDALONE_PLAN:-false}"
 
 while getopts "s:p:m:t:u:rv-:" opt; do
   case $opt in
@@ -144,15 +158,15 @@ while getopts "s:p:m:t:u:rv-:" opt; do
     v) ONLY_VALIDATE=true ;;
     -)
       case "${OPTARG}" in
-        scope)       SCOPE="${!OPTIND}"; OPTIND=$(( OPTIND + 1 )) ;;
+        scope)       SCOPE="${@[$OPTIND]}"; OPTIND=$(( OPTIND + 1 )) ;;
         scope=*)     SCOPE="${OPTARG#*=}" ;;
-        phase)       START_PHASE="${!OPTIND}"; OPTIND=$(( OPTIND + 1 )); MANUAL_START=true ;;
+        phase)       START_PHASE="${@[$OPTIND]}"; OPTIND=$(( OPTIND + 1 )); MANUAL_START=true ;;
         phase=*)     START_PHASE="${OPTARG#*=}"; MANUAL_START=true ;;
-        milestone)   START_MS="${!OPTIND}"; OPTIND=$(( OPTIND + 1 )); MANUAL_START=true ;;
+        milestone)   START_MS="${@[$OPTIND]}"; OPTIND=$(( OPTIND + 1 )); MANUAL_START=true ;;
         milestone=*) START_MS="${OPTARG#*=}"; MANUAL_START=true ;;
-        task)        START_TASK="${!OPTIND}"; OPTIND=$(( OPTIND + 1 )); MANUAL_START=true ;;
+        task)        START_TASK="${@[$OPTIND]}"; OPTIND=$(( OPTIND + 1 )); MANUAL_START=true ;;
         task=*)      START_TASK="${OPTARG#*=}"; MANUAL_START=true ;;
-        subtask)     START_SUBTASK="${!OPTIND}"; OPTIND=$(( OPTIND + 1 )); MANUAL_START=true ;;
+        subtask)     START_SUBTASK="${@[$OPTIND]}"; OPTIND=$(( OPTIND + 1 )); MANUAL_START=true ;;
         subtask=*)   START_SUBTASK="${OPTARG#*=}"; MANUAL_START=true ;;
         parallel-research) PARALLEL_RESEARCH=true ;;
         focus-only)      FOCUS_ONLY=true ;;
@@ -164,12 +178,16 @@ while getopts "s:p:m:t:u:rv-:" opt; do
         no-auto-flow)   SINGLE_SESSION=true ;;
         accept-prd-changes) ACCEPT_PRD_CHANGES=true ;;
         adopt-prd)        ADOPT_PRD=true ;;
-        session)        TARGET_SESSION="${!OPTIND}"; OPTIND=$(( OPTIND + 1 )) ;;
+        tmux-panes)       PRD_TMUX_PANES=on ;;
+        no-tmux-panes)    PRD_TMUX_PANES=off ;;
+        session)        TARGET_SESSION="${@[$OPTIND]}"; OPTIND=$(( OPTIND + 1 )) ;;
         session=*)      TARGET_SESSION="${OPTARG#*=}" ;;
-        *) print "Usage: $0 [--scope=...] [--phase=N] [--milestone=N] [--task=N] [--subtask=N] [--parallel-research] [--focus-only] [--dry-reconcile] [--validate] [--bug-hunt] [--skip-bug-finding] [--single-session] [--session=N] [--accept-prd-changes] [--adopt-prd]"; exit 1 ;;
+        plan)           PLAN_FILE="${@[$OPTIND]}"; OPTIND=$(( OPTIND + 1 )) ;;
+        plan=*)         PLAN_FILE="${OPTARG#*=}" ;;
+        *) print "Usage: $0 [--scope=...] [--phase=N] [--milestone=N] [--task=N] [--subtask=N] [--parallel-research] [--focus-only] [--dry-reconcile] [--validate] [--bug-hunt] [--skip-bug-finding] [--single-session] [--session=N] [--plan=FILE] [--accept-prd-changes] [--adopt-prd] [--tmux-panes|--no-tmux-panes]"; exit 1 ;;
       esac ;;
     *) print "Usage: $0 [-s phase|milestone|task|subtask] [-p N] [-m N] [-t N] [-u N] [-r] [-v]
-   Or: $0 [--scope=...] [--phase=N] [--milestone=N] [--task=N] [--subtask=N] [--parallel-research] [--focus-only] [--dry-reconcile] [--validate] [--bug-hunt] [--skip-bug-finding] [--single-session] [--session=N] [--accept-prd-changes] [--adopt-prd]"; exit 1 ;;
+   Or: $0 [--scope=...] [--phase=N] [--milestone=N] [--task=N] [--subtask=N] [--parallel-research] [--focus-only] [--dry-reconcile] [--validate] [--bug-hunt] [--skip-bug-finding] [--single-session] [--session=N] [--plan=FILE] [--accept-prd-changes] [--adopt-prd] [--tmux-panes|--no-tmux-panes]"; exit 1 ;;
   esac
 done
 
@@ -210,6 +228,16 @@ VALIDATION_AGENT="${VALIDATION_AGENT:-pizr}"
 FORCE_AGENT="${FORCE_AGENT:-pizr}"
 TASKS_FILE="${TASKS_FILE:-tasks.json}"
 PRD_FILE="${PRD_FILE:-PRD.md}"
+# An explicitly supplied standalone plan wins over the default PRD and
+# switches the pipeline into standalone-plan mode (see Parameter Parsing).
+if [[ -n "$PLAN_FILE" ]]; then
+    PRD_FILE="$PLAN_FILE"
+    STANDALONE_PLAN=true
+    if [[ ! -f "$PRD_FILE" || ! -s "$PRD_FILE" ]]; then
+        print -P "%F{red}[ERROR]%f --plan file not found (or empty): $PRD_FILE"
+        exit 1
+    fi
+fi
 PLAN_DIR="${PLAN_DIR:-plan}"
 CURRENT_PROCESSING_ID=""  # Set by execute_item for smart_commit protection
 CURRENT_PROCESSING_STATUS=""  # The status to apply to current item after restore (Complete/Failed)
@@ -224,6 +252,207 @@ CURRENT_PROCESSING_STATUS=""  # The status to apply to current item after restor
 # run_item_and_check below, and check_dependencies_satisfied.
 ISSUE_STREAK=0
 ISSUE_STREAK_MAX="${ISSUE_STREAK_MAX:-3}"
+
+# --- Deterministic task-ID canonicalization ---
+#
+# WHY THIS EXISTS: the breakdown model sometimes emits numbering that
+# CONTINUES across siblings instead of resetting per parent — e.g. task T2's
+# subtasks numbered S4,S5,S6 because T1 ended at S3. The execution loops
+# address items by ARRAY INDEX derived from the ID's numeric components
+# (get_item_title / get_item_description / get_item_prd_selectors all do
+# jq .backlog[p].milestones[m].tasks[t].subtasks[n-1]), so non-canonical
+# numbering silently mis-addresses every downstream lookup: titles/descriptions
+# come back empty, selectors grab the wrong PRD sections, and the run fails or
+# implements the wrong item.
+#
+# The numbering is a DETERMINISTIC label — the item's 1-based position within
+# its parent — so we never trust the model for it and never re-ask. We
+# renumber positionally (P1.. per backlog, M1.. per phase, T1.. per milestone,
+# S1.. per task) and rewrite EVERY reference to the old IDs across the whole
+# document: id fields, dependencies arrays, and free-text mentions in
+# title/description/context_scope, so cross-references stay coherent. Item
+# work directories under $SESSION_DIR named after old IDs (dots stripped, per
+# generate_dirname) are renamed to match, keeping PRP.md/research/issue
+# feedback aligned with the new IDs.
+#
+# Reference rewriting uses ONE single-pass alternation, longest ID first, with
+# token-boundary guards — a replacement can never be re-matched by a shorter
+# rule, so swaps/cascades (T1<->T2 reordering) are handled safely. Idempotent:
+# an already-canonical file is left untouched on disk (no write at all).
+#
+# References in SHORTHAND form ("T2.S1", "S4") cannot be rewritten
+# deterministically (ambiguous across parents) — which is why the breakdown
+# prompts now mandate full dotted IDs everywhere.
+#
+# Usage: canonicalize_task_ids <tasks_file> [session_dir] [quiet]
+#   quiet: suppress the no-op "already canonical" line (used from
+#   restore_tasks_json, which runs per item and must not spam).
+canonicalize_task_ids() {
+    local file=$1
+    local sdir=${2:-}
+    local mode=${3:-}
+    [[ -f "$file" ]] || return 0
+    python3 - "$file" "$sdir" "$mode" <<'CANONPYEOF'
+import json, os, re, sys
+
+path = sys.argv[1]
+session_dir = sys.argv[2] if len(sys.argv) > 2 else ""
+quiet = len(sys.argv) > 3 and sys.argv[3] == "quiet"
+
+try:
+    with open(path, encoding="utf-8") as fh:
+        data = json.load(fh)
+except Exception as exc:
+    # Leave the file untouched; the caller's corruption/recovery path owns it.
+    print("[IDS] ERROR: %s is not parseable JSON (%s) - leaving it untouched" % (path, exc))
+    sys.exit(1)
+
+backlog = data.get("backlog") if isinstance(data, dict) else None
+if not isinstance(backlog, list):
+    if not quiet:
+        print("[IDS] no backlog array in %s - nothing to canonicalize" % path)
+    sys.exit(0)
+
+# Pass 1: assign canonical positional IDs; build old->new mapping.
+ids = []        # canonical ids in document order
+mapping = {}    # old id string -> new id string
+duplicates = []
+
+def reg(old, new):
+    ids.append(new)
+    if isinstance(old, str) and old:
+        if old in mapping and mapping[old] != new:
+            duplicates.append(old)
+        mapping[old] = new
+    return new
+
+for pi, phase in enumerate(backlog, 1):
+    if not isinstance(phase, dict):
+        continue
+    phase["id"] = reg(phase.get("id"), "P%d" % pi)
+    for mi, ms in enumerate(phase.get("milestones") or [], 1):
+        if not isinstance(ms, dict):
+            continue
+        ms["id"] = reg(ms.get("id"), "%s.M%d" % (phase["id"], mi))
+        for ti, task in enumerate(ms.get("tasks") or [], 1):
+            if not isinstance(task, dict):
+                continue
+            task["id"] = reg(task.get("id"), "%s.T%d" % (ms["id"], ti))
+            for si, sub in enumerate(task.get("subtasks") or [], 1):
+                if not isinstance(sub, dict):
+                    continue
+                sub["id"] = reg(sub.get("id"), "%s.S%d" % (task["id"], si))
+
+changes = {o: n for o, n in mapping.items() if o != n}
+idset = set(ids)
+
+def find_dangling(node, owner):
+    out = []
+    if isinstance(node, dict):
+        here = node.get("id") or owner
+        deps = node.get("dependencies")
+        if isinstance(deps, list):
+            for d in deps:
+                if isinstance(d, str) and d not in idset:
+                    out.append((here, d))
+        for v in node.values():
+            out.extend(find_dangling(v, here))
+    elif isinstance(node, list):
+        for x in node:
+            out.extend(find_dangling(x, owner))
+    return out
+
+if not changes:
+    if not quiet:
+        print("[IDS] task IDs already canonical (%d items) - no changes" % len(ids))
+        for owner, dep in find_dangling(data, "?"):
+            print("[IDS] WARNING: %s depends on %r which does not exist" % (owner, dep))
+    sys.exit(0)
+
+# Pass 2: rewrite every old-ID reference anywhere in the document (ids,
+# dependencies, prose) in ONE pass. Alternation is ordered longest-first, so
+# at any position the longest old ID wins; because re.sub never rescans
+# replaced text, a produced new ID can never be corrupted by a later rule
+# (handles swap/cascade renumbering). Boundaries: not preceded by a token
+# char; not followed by a digit (so P1 never corrupts P10, while P1.M1.T1
+# still matches inside a dangling P1.M1.T1.S99).
+alts = sorted(changes, key=len, reverse=True)
+pat = re.compile(
+    r"(?<![A-Za-z0-9_.])(" + "|".join(re.escape(a) for a in alts) + r")(?![0-9])"
+)
+stats = [0]
+
+def fix(s):
+    def repl(m):
+        stats[0] += 1
+        return changes[m.group(1)]
+    return pat.sub(repl, s)
+
+def walk(node):
+    if isinstance(node, str):
+        return fix(node)
+    if isinstance(node, list):
+        return [walk(x) for x in node]
+    if isinstance(node, dict):
+        return {k: walk(v) for k, v in node.items()}
+    return node
+
+data = walk(data)
+
+# Atomic write: never leave a half-written tasks.json behind.
+tmp = path + ".ids.tmp"
+try:
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, ensure_ascii=False, indent=2)
+        fh.write("\n")
+    os.replace(tmp, path)
+except Exception as exc:
+    print("[IDS] ERROR: could not rewrite %s (%s) - original left untouched" % (path, exc))
+    try:
+        os.remove(tmp)
+    except OSError:
+        pass
+    sys.exit(1)
+
+print("[IDS] renumbered %d id(s), rewrote %d reference(s):" % (len(changes), stats[0]))
+for old in sorted(changes, key=lambda s: (s.count("."), s)):
+    print("[IDS]   %s -> %s" % (old, changes[old]))
+
+# Keep item work dirs (PRP.md, research/, issue feedback) aligned with the new
+# IDs. Two-phase (park at a temp name, then move into place) so a swap/cascade
+# of dir names can never collide with itself.
+if session_dir and os.path.isdir(session_dir):
+    renames = []
+    for old, new in sorted(changes.items()):
+        od = os.path.join(session_dir, old.replace(".", ""))
+        nd = os.path.join(session_dir, new.replace(".", ""))
+        if od != nd and os.path.isdir(od):
+            renames.append((od, nd))
+    parked = []
+    for od, nd in renames:
+        td = od + ".idsmoving"
+        try:
+            os.rename(od, td)
+            parked.append((td, od, nd))
+        except OSError as exc:
+            print("[IDS] WARNING: could not stage item dir %s (%s)" % (od, exc))
+    for td, od, nd in parked:
+        if os.path.exists(nd):
+            print("[IDS] WARNING: item dir %s already exists; restored %s to its old name" % (nd, od))
+            try:
+                os.rename(td, od)
+            except OSError:
+                pass
+            continue
+        os.rename(td, nd)
+        print("[IDS] moved item dir %s -> %s" % (os.path.basename(od), os.path.basename(nd)))
+
+for old in duplicates:
+    print("[IDS] WARNING: old id %r appeared more than once - its references were ambiguous" % old)
+for owner, dep in find_dangling(data, "?"):
+    print("[IDS] WARNING: %s depends on %r which does not exist" % (owner, dep))
+CANONPYEOF
+}
 
 # Robust tasks.json restoration that re-applies all legitimate status changes
 # This is CRITICAL - agents often corrupt tasks.json despite being forbidden
@@ -270,6 +499,12 @@ restore_tasks_json() {
         done
     fi
 
+    # Step 2.5: Canonicalize task IDs (defensive, quiet). Every commit we
+    # make is already canonical, but a legacy session committed before this
+    # safeguard existed can restore non-canonical IDs from HEAD; renumber now
+    # so steps 3-4 (and the caller) address items by canonical ID.
+    canonicalize_task_ids "$TASKS_FILE" "$SESSION_DIR" quiet
+
     # Step 3: Re-apply current processing task's status
     if [[ -n "$CURRENT_PROCESSING_ID" && -n "$status_for_current" ]]; then
         print -P "%F{cyan}[PROTECT]%f Re-applying $CURRENT_PROCESSING_ID -> $status_for_current"
@@ -311,6 +546,603 @@ restore_tasks_json() {
 # fi
 PRP_AGENT_MCP_ARGS=""
 
+# --- Tmux live agent panes --------------------------------------------------
+#
+# When run-prd.sh executes inside tmux, every MAJOR agent invocation (research/
+# PRP creation, task breakdown, delta-PRD generation, implementation, verify
+# re-prompts, validation, fixer, bug hunt + nudges) opens a live viewer pane in
+# the SAME window, right next to the pipeline pane. The pane closes the moment
+# its invocation finishes; the small grunt-work steps that run between sessions
+# (stagecoach git commits, cleanup prompts, task updates, classifiers) get NO
+# pane, so the window drops back to the bare pipeline pane while they run, and
+# the next session opens a fresh pane when it starts. Parallel research "just
+# works": panes are per-invocation, so the background research supervisor and
+# the in-flight implementation each hold their own pane in the same window.
+#
+# HOW IT WORKS — the agent is NOT moved into the pane. The pipeline still runs
+# every agent as its own child process: stdin-fed prompt temp files, watchdog
+# timeouts, pipefail exit codes, and stdout capture (bug-hunt transcript,
+# implementation result greps) are all untouched. The pane is a READ-ONLY live
+# viewer rendered from pi's own on-disk record of the run:
+#   * session runs (--session-id ...): pi appends every message — thinking,
+#     tool calls, tool results — to
+#     ~/.pi/agent/sessions/<cwd-slug>/<timestamp>_<session-id>.jsonl
+#     incrementally as it works (same --session-id resumes append to the same
+#     file, so retry/nudge attempts continue in one pane). The viewer tails it.
+#   * sessionless runs (validation, fixer): these are the only major calls
+#     with no session file. When (and only when) panes are enabled they are
+#     upgraded to `pi --mode json` and their NDJSON event stream is redirected
+#     to a temp log the viewer tails (same renderer). Outside tmux they behave
+#     exactly as before (plain text to stdout).
+# A viewer never outlives the pipeline: it polls its parent pid and exits (and
+# closes its own pane) when the parent dies, so even a SIGKILLed run leaves no
+# stale panes.
+#
+# Config: PRD_TMUX_PANES=auto (default; on when $TMUX/$TMUX_PANE are set) | on
+# | off — or --tmux-panes / --no-tmux-panes on the command line. Layout: agent
+# panes split to the right of the pipeline pane (tmux main-vertical, pipeline
+# pane stays primary); pane title bars are enabled while agent panes exist and
+# restored when the last one closes. If the window already had multiple panes
+# before the run started, layout/border management is skipped (we never stomp a
+# hand-arranged window) — panes still open and close cleanly.
+
+PRD_TMUX_PANES_ON=false
+PRD_TMUX_WIN=""
+PRD_TMUX_BASE_PANES=0
+PRD_TMUX_BORDER_SAVED=""      # "" = borders never turned on; "unset" = restore by unsetting
+PRD_TMUX_BORDER_FMT_SET=false  # whether we set pane-border-format (restore/unset)
+PRD_TMUX_MAIN_TITLE_SAVED=""
+PRD_PANE_STATE=""             # file listing currently-open pane ids (shared with subshells)
+PRD_PANE_VIEWER="$HOME/.cache/prd-pipeline/prd-pane-view.py"
+PRD_PANE_CUR=""               # pane id opened by the most recent prd_pane_open
+PRD_PANE_LOG=""               # log file of the most recent prd_pane_open (log mode)
+typeset -a PRD_PANE_IDS        # in-process mirror of PRD_PANE_STATE
+
+# Project session dir pi uses for $PWD: <agentDir>/sessions/--<cwd with /-> -
+# see pi's getDefaultSessionDirPath(): `--${cwd.replace(/^[/\\]/,"").replace(/[/\\:]/g,"-")}--`
+_pi_sessions_dir() {
+    local base="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"
+    # pi expandTilde()s an env override; mirror that for a leading ~
+    [[ "$base" == \~* ]] && base="$HOME${base#\~}"
+    local s="$PWD"
+    s="${s#/}"
+    s="${s//:/-}"
+    s="${s//\//-}"
+    print -r -- "$base/sessions/--${s}--"
+}
+
+# Write the pane-viewer script to its cache path (atomic rename; concurrent
+# pipeline/child runs writing the same identical content are safe).
+prd_pane_viewer_install() {
+    local dir="${PRD_PANE_VIEWER:h}"
+    mkdir -p "$dir" 2>/dev/null || return 1
+    local tmp="$dir/.pane-view.$$.tmp"
+    cat > "$tmp" <<'PRD_PANE_VIEWER_EOF'
+#!/usr/bin/env python3
+"""prd-pane-view.py — live read-only viewer for a pi agent run, meant to run
+inside a tmux pane opened by run-prd.sh.
+
+Renders, as they are appended:
+  * a pi SESSION file (JSONL, one complete entry per line — type "message"), or
+  * a `pi --mode json` NDJSON event stream captured to a log file (complete
+    messages arrive as type "message_end"; the stream variants share the
+    renderer). Raw non-JSON lines (stderr etc.) are echoed truncated.
+
+Exits when the parent pipeline pid dies so panes never outlive the run, then
+closes its own tmux pane (guarded: never the window's last pane).
+Standard library only.
+"""
+import argparse
+import glob
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+
+RESET, DIM, BOLD = "\x1b[0m", "\x1b[2m", "\x1b[1m"
+RED, GREEN, BLUE = "\x1b[31m", "\x1b[32m", "\x1b[34m"
+MAGENTA, CYAN = "\x1b[35m", "\x1b[36m"
+
+
+def out(s=""):
+    sys.stdout.write(s + "\n")
+    sys.stdout.flush()
+
+
+def cols():
+    try:
+        return max(shutil.get_terminal_size((120, 40)).columns, 40)
+    except Exception:
+        return 120
+
+
+def oneline(s, n):
+    s = " ".join(str(s).split())
+    return s if len(s) <= n else s[: max(n - 1, 1)] + "\u2026"
+
+
+def wrap(text, width, max_lines=200):
+    lines = []
+    for raw in text.splitlines():
+        if not raw.strip():
+            lines.append("")
+            continue
+        cur = ""
+        for word in raw.split():
+            trial = (cur + " " + word).strip()
+            if len(trial) > width and cur:
+                lines.append(cur)
+                cur = word
+            else:
+                cur = trial
+        lines.append(cur)
+    return lines[:max_lines]
+
+
+def blocks(msg):
+    c = msg.get("content")
+    if isinstance(c, list):
+        return [b for b in c if isinstance(b, dict)]
+    return []
+
+
+def fmt_args(args, n):
+    if not isinstance(args, dict):
+        return oneline(args, n)
+    parts = []
+    for k in ("command", "path", "file", "pattern", "url"):
+        if args.get(k):
+            parts.append(oneline(args[k], n))
+    if not parts:
+        for k, v in list(args.items())[:3]:
+            parts.append("%s=%s" % (k, oneline(v, 40)))
+    return (" ".join(parts))[:n]
+
+
+def render_message(msg):
+    role = msg.get("role")
+    if role == "system":
+        return
+    w = cols() - 4
+    if role == "user":
+        texts = [b.get("text", "") for b in blocks(msg) if b.get("type") == "text"]
+        t = " ".join(texts)
+        if t:
+            out("%s\u25b8 prompt  %s%s" % (BLUE, oneline(t, w - 10), RESET))
+        return
+    if role == "toolResult":
+        name = msg.get("toolName", "tool")
+        err = bool(msg.get("isError"))
+        content = " ".join(
+            b.get("text", "") for b in blocks(msg) if b.get("type") == "text"
+        )
+        mark = RED + "\u2717" if err else GREEN + "\u2713"
+        out("  %s %s: %s%s" % (mark, name, oneline(content, w - 10), RESET))
+        return
+    if role == "assistant":
+        for b in blocks(msg):
+            t = b.get("type")
+            if t == "thinking":
+                out("%s  ~ %s%s" % (DIM, oneline(b.get("thinking", ""), w - 6), RESET))
+            elif t == "toolCall":
+                out(
+                    "%s  \u2192 %s %s%s"
+                    % (CYAN, b.get("name", "?"), fmt_args(b.get("arguments"), w - 8), RESET)
+                )
+            elif t == "text":
+                txt = (b.get("text") or "").strip()
+                if txt:
+                    for ln in wrap(txt, w - 2):
+                        out("  " + ln)
+
+
+def handle_line(line):
+    if not line.strip():
+        return
+    try:
+        d = json.loads(line)
+    except Exception:
+        out("%s  | %s%s" % (DIM, oneline(line, cols() - 6), RESET))
+        return
+    t = d.get("type")
+    if t in ("message", "message_end"):
+        render_message(d.get("message") or {})
+    elif t == "model_change":
+        out("%s  model: %s/%s%s" % (DIM, d.get("provider"), d.get("modelId"), RESET))
+    # everything else (deltas, custom metrics, session header, ...) is skipped
+
+
+class Follower:
+    """Incremental whole-line reader; tolerates truncation/replacement.
+    seek_end=True attaches at the current end (session files carry the whole
+    prior conversation of a resumed session — show only new activity);
+    seek_end=False reads from byte 0 (log files are born empty microseconds
+    before the pane opens; anything already in them must not be missed)."""
+
+    def __init__(self, path, seek_end=True):
+        self.path = path
+        self.seek_end = seek_end
+        self.f = None
+        self.pos = 0
+
+    def _open_at_end(self):
+        try:
+            self.f = open(self.path, "rb")
+        except OSError:
+            return False
+        self.pos = self.f.seek(0, os.SEEK_END) if self.seek_end else 0
+        if not self.seek_end:
+            self.f.seek(0)
+        return True
+
+    def poll(self):
+        if self.f is None:
+            if not self._open_at_end():
+                return []
+        try:
+            st = os.stat(self.path)
+        except OSError:
+            return []
+        try:
+            if st.st_ino != os.fstat(self.f.fileno()).st_ino or st.st_size < self.pos:
+                self.f.close()
+                self.f = None
+                self.pos = 0
+                if not self._open_at_end():
+                    return []
+        except OSError:
+            return []
+        if self.f.tell() != self.pos:
+            self.f.seek(self.pos)
+        data = self.f.read()
+        if not data:
+            return []
+        self.pos += len(data)
+        text = data.decode("utf-8", "replace")
+        lines = text.split("\n")
+        if text.endswith("\n"):
+            lines.pop()
+        else:
+            partial = lines.pop()
+            enc = len(partial.encode("utf-8", "replace"))
+            self.pos -= enc
+            self.f.seek(self.pos)
+        return lines
+
+
+def resolve_session_file(sdir, sid, timeout):
+    pat = os.path.join(sdir, "*_" + sid + ".jsonl")
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        cands = glob.glob(pat)
+        if cands:
+            return max(cands, key=os.path.getmtime)
+        time.sleep(0.25)
+    return None
+
+
+def parent_alive(pid):
+    if not pid:
+        return True
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return True
+
+
+def set_pane_title(label, elapsed):
+    pane = os.environ.get("TMUX_PANE")
+    if not pane:
+        return
+    mins = int(elapsed // 60)
+    tag = "%dm" % mins if mins else "<1m"
+    try:
+        subprocess.run(
+            ["tmux", "select-pane", "-t", pane, "-T", "%s \u00b7 %s" % (label, tag)],
+            capture_output=True,
+            timeout=5,
+        )
+    except Exception:
+        pass
+
+
+def close_own_pane():
+    """Kill this viewer's pane unless it is the window's last pane."""
+    pane = os.environ.get("TMUX_PANE")
+    if not pane:
+        return
+    try:
+        r = subprocess.run(
+            ["tmux", "list-panes", "-t", pane], capture_output=True, timeout=5
+        )
+        if r.stdout.count(b"\n") > 1:
+            subprocess.run(
+                ["tmux", "kill-pane", "-t", pane], capture_output=True, timeout=5
+            )
+    except Exception:
+        pass
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--label", required=True)
+    ap.add_argument("--parent-pid", type=int, default=0)
+    mx = ap.add_mutually_exclusive_group(required=True)
+    mx.add_argument("--session-id")
+    mx.add_argument("--log-file")
+    ap.add_argument("--sessions-dir", default="")
+    ap.add_argument("--discover-timeout", type=int, default=600)
+    a = ap.parse_args()
+
+    out(MAGENTA + BOLD + "\u2500\u2500 prd \u25b8 " + a.label + " \u2500\u2500" + RESET)
+    if a.session_id:
+        out(
+            "%s   session %s in %s%s"
+            % (DIM, a.session_id, a.sessions_dir or "?", RESET)
+        )
+        out("%s   waiting for session file\u2026%s" % (DIM, RESET))
+        path = resolve_session_file(a.sessions_dir, a.session_id, a.discover_timeout)
+        if not path:
+            out(
+                "%s   no session file appeared after %ss — closing.%s"
+                % (RED, a.discover_timeout, RESET)
+            )
+            close_own_pane()
+            return
+        out("%s   following %s%s" % (DIM, path, RESET))
+    else:
+        open(a.log_file, "a").close()  # ensure it exists
+        out("%s   following %s%s" % (DIM, a.log_file, RESET))
+        path = a.log_file
+
+    fol = Follower(path, seek_end=bool(a.session_id))
+    last_event = time.time()
+    last_beat = 0
+    last_title = 0.0
+    start = time.time()
+    while True:
+        got = False
+        for line in fol.poll():
+            got = True
+            handle_line(line)
+        if got:
+            last_event = time.time()
+        now = time.time()
+        if now - last_event >= 60 and int(now - last_event) // 60 != last_beat:
+            last_beat = int(now - last_event) // 60
+            out(
+                "%s\u00b7 waiting \u00b7 %dm since last event%s" % (DIM, last_beat, RESET)
+            )
+        if now - last_title >= 15:
+            last_title = now
+            set_pane_title(a.label, now - start)
+        if not parent_alive(a.parent_pid):
+            out("%s   pipeline exited — closing pane%s" % (DIM, RESET))
+            close_own_pane()
+            return
+        time.sleep(0.25)
+
+
+if __name__ == "__main__":
+    main()
+PRD_PANE_VIEWER_EOF
+    [[ $? -eq 0 ]] || { rm -f "$tmp" 2>/dev/null; return 1 }
+    mv -f "$tmp" "$PRD_PANE_VIEWER" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1 }
+    return 0
+}
+
+prd_pane_enabled() { [[ "$PRD_TMUX_PANES_ON" == "true" ]] }
+
+# One-time setup. Resolves the auto flag, captures the window that hosts the
+# pipeline pane, and installs the viewer. Called immediately below; safe to
+# fail (feature silently stays off).
+prd_pane_init() {
+    local mode="$PRD_TMUX_PANES"
+    case "$mode" in
+        auto|"") if [[ -n "$TMUX" && -n "$TMUX_PANE" ]] && (( $+commands[tmux] )); then
+                  mode=on
+              else
+                  mode=off
+              fi ;;
+        1|true|yes|on)  mode=on ;;
+        0|false|no|off) mode=off ;;
+        *) mode=off ;;
+    esac
+    [[ "$mode" == "on" ]] || return 1
+    (( $+commands[tmux] )) || return 1
+    if [[ -z "$TMUX_PANE" ]]; then
+        # --tmux-panes force-mode without a pane of our own: fall back to the
+        # tmux server's current window if one exists, else disable.
+        [[ -n "$TMUX" ]] || return 1
+        PRD_TMUX_WIN=$(tmux display-message -p '#{window_id}' 2>/dev/null)
+    else
+        PRD_TMUX_WIN=$(tmux display-message -p -t "$TMUX_PANE" '#{window_id}' 2>/dev/null)
+        PRD_TMUX_MAIN_TITLE_SAVED=$(tmux display-message -p -t "$TMUX_PANE" '#{pane_title}' 2>/dev/null)
+    fi
+    [[ -n "$PRD_TMUX_WIN" ]] || { PRD_TMUX_WIN=""; return 1 }
+    PRD_TMUX_BASE_PANES=$(tmux list-panes -t "$PRD_TMUX_WIN" -F x 2>/dev/null | wc -l)
+    local d
+    d=$(mktemp -d /tmp/prd-panes.XXXXXX 2>/dev/null) || return 1
+    PRD_PANE_STATE="$d/panes"
+    : > "$PRD_PANE_STATE" || return 1
+    prd_pane_viewer_install || return 1
+    if [[ -n "$TMUX_PANE" ]]; then
+        # Title the pipeline pane (shown in the border once agent panes exist)
+        tmux select-pane -t "$TMUX_PANE" -T "prd pipeline" 2>/dev/null
+    fi
+    PRD_TMUX_PANES_ON=true
+    return 0
+}
+
+# While agent panes exist: pipeline pane stays primary (main-vertical), agent
+# panes stack beside it. Skipped when the window was multi-pane before we
+# started (never stomp a hand-arranged layout).
+prd_pane_relayout() {
+    prd_pane_enabled || return 0
+    (( PRD_TMUX_BASE_PANES == 1 )) || return 0
+    local n w active
+    n=$(tmux list-panes -t "$PRD_TMUX_WIN" -F x 2>/dev/null | wc -l)
+    (( n > 1 )) || return 0
+    w=$(tmux display-message -p -t "$PRD_TMUX_WIN" '#{window_width}' 2>/dev/null)
+    active=$(tmux display-message -p -t "$PRD_TMUX_WIN" '#{pane_id}' 2>/dev/null)
+    # main-vertical makes the ACTIVE pane the main pane — make it ours first
+    [[ -n "$TMUX_PANE" ]] && tmux select-pane -t "$TMUX_PANE" 2>/dev/null
+    tmux select-layout -t "$PRD_TMUX_WIN" main-vertical 2>/dev/null
+    if [[ "$w" == <-> ]]; then
+        tmux set-window-option -t "$PRD_TMUX_WIN" main-pane-width $(( w * 45 / 100 )) 2>/dev/null
+    fi
+    # Put focus back where the user had it
+    [[ -n "$active" && "$active" != "$TMUX_PANE" ]] && tmux select-pane -t "$active" 2>/dev/null
+    return 0
+}
+
+prd_pane_borders_on() {
+    prd_pane_enabled || return 0
+    (( PRD_TMUX_BASE_PANES == 1 )) || return 0
+    [[ -z "$PRD_TMUX_BORDER_SAVED" ]] || return 0
+    local v
+    v=$(tmux show-window-options -v -t "$PRD_TMUX_WIN" pane-border-status 2>/dev/null)
+    if [[ -n "$v" ]]; then
+        PRD_TMUX_BORDER_SAVED="$v"
+    else
+        PRD_TMUX_BORDER_SAVED="unset"
+    fi
+    tmux set-window-option -t "$PRD_TMUX_WIN" pane-border-status top 2>/dev/null
+    tmux set-window-option -t "$PRD_TMUX_WIN" pane-border-format ' #{pane_title} ' 2>/dev/null
+    PRD_TMUX_BORDER_FMT_SET=true
+}
+
+prd_pane_borders_off() {
+    prd_pane_enabled || return 0
+    [[ -n "$PRD_TMUX_BORDER_SAVED" ]] || return 0
+    if [[ "$PRD_TMUX_BORDER_SAVED" == "unset" ]]; then
+        tmux set-window-option -u -t "$PRD_TMUX_WIN" pane-border-status 2>/dev/null
+    else
+        tmux set-window-option -t "$PRD_TMUX_WIN" pane-border-status "$PRD_TMUX_BORDER_SAVED" 2>/dev/null
+    fi
+    if [[ "$PRD_TMUX_BORDER_FMT_SET" == true ]]; then
+        tmux set-window-option -u -t "$PRD_TMUX_WIN" pane-border-format 2>/dev/null
+        PRD_TMUX_BORDER_FMT_SET=false
+    fi
+    PRD_TMUX_BORDER_SAVED=""
+}
+
+# Count of panes we still have open (from the shared state file).
+_prd_pane_count() {
+    [[ -n "$PRD_PANE_STATE" && -f "$PRD_PANE_STATE" ]] || { print 0; return }
+    wc -l < "$PRD_PANE_STATE" | tr -d ' '
+}
+
+# Close only the panes opened by THIS shell process (its in-process
+# PRD_PANE_IDS copy) — used by the background-research supervisor's TERM trap,
+# which must not touch the main shell's panes.
+prd_pane_close_mine() {
+    local _p
+    for _p in "${PRD_PANE_IDS[@]}"; do
+        [[ -n "$_p" ]] && prd_pane_close "$_p"
+    done
+    return 0
+}
+
+# Open a viewer pane.
+#   prd_pane_open <label> [session_id]
+#     session_id set    → viewer follows pi's session file for that id
+#     session_id empty  → viewer follows a fresh temp log (log mode; the runner
+#                         helpers redirect agent output into $PRD_PANE_LOG)
+# On success sets PRD_PANE_CUR (pane id) and PRD_PANE_LOG (log mode). All tmux
+# failures degrade silently to "no pane" — the pipeline itself never breaks.
+prd_pane_open() {
+    PRD_PANE_CUR=""
+    PRD_PANE_LOG=""
+    prd_pane_enabled || return 1
+    local label="$1" sid="$2"
+    local logf="" sdir=""
+    if [[ -n "$sid" ]]; then
+        sdir=$(_pi_sessions_dir)
+    else
+        logf=$(mktemp -t prd-pane-log.XXXXXX 2>/dev/null) || return 1
+    fi
+    local script="python3 ${(q)PRD_PANE_VIEWER} --label ${(q)label} --parent-pid $$"
+    if [[ -n "$sid" ]]; then
+        script+=" --sessions-dir ${(q)sdir} --session-id ${(q)sid}"
+    else
+        script+=" --log-file ${(q)logf}"
+    fi
+    local pane_id
+    pane_id=$(tmux split-window -t "$PRD_TMUX_WIN" -h -p 38 -P -F '#{pane_id}' "$script" 2>/dev/null) || {
+        [[ -n "$logf" ]] && rm -f "$logf" 2>/dev/null
+        return 1
+    }
+    [[ -n "$pane_id" ]] || { [[ -n "$logf" ]] && rm -f "$logf" 2>/dev/null; return 1; }
+    tmux select-pane -t "$pane_id" -T "$label" 2>/dev/null
+    [[ -n "$PRD_PANE_STATE" ]] && print -r -- "$pane_id" >> "$PRD_PANE_STATE"
+    PRD_PANE_IDS+=("$pane_id")
+    PRD_PANE_CUR="$pane_id"
+    PRD_PANE_LOG="$logf"
+    prd_pane_borders_on
+    prd_pane_relayout
+    # print -P would eat a literal '%' (pane ids are %N), so escape it
+    local _esc="${pane_id//\%/%%}"
+    print -P "%F{magenta}[PANE]%f ${label} \u2192 live view in pane %F{yellow}${_esc}%f"
+    return 0
+}
+
+# Close a pane opened by prd_pane_open (default: the most recent). Restores
+# borders/title when the last one closes; relayouts when others remain.
+prd_pane_close() {
+    local pane_id="${1:-$PRD_PANE_CUR}"
+    [[ -n "$pane_id" ]] || return 0
+    # Drop from the shared state file. grep -v exits 1 when it selects zero
+    # lines (i.e. we just closed the LAST tracked pane) — that is success here,
+    # so the mv must NOT be gated on grep's exit status.
+    if [[ -n "$PRD_PANE_STATE" && -f "$PRD_PANE_STATE" ]]; then
+        grep -F -x -v "$pane_id" "$PRD_PANE_STATE" > "$PRD_PANE_STATE.tmp" 2>/dev/null
+        mv -f "$PRD_PANE_STATE.tmp" "$PRD_PANE_STATE"
+    fi
+    PRD_PANE_IDS=("${(@)PRD_PANE_IDS:#$pane_id}")
+    [[ "$pane_id" == "$PRD_PANE_CUR" ]] && PRD_PANE_CUR=""
+    # Never kill the window's last pane
+    local n
+    n=$(tmux list-panes -t "$pane_id" -F x 2>/dev/null | wc -l)
+    (( n > 1 )) && tmux kill-pane -t "$pane_id" 2>/dev/null
+    if (( $(_prd_pane_count) == 0 )); then
+        prd_pane_borders_off
+        if [[ -n "$TMUX_PANE" && -n "$PRD_TMUX_MAIN_TITLE_SAVED" ]]; then
+            tmux select-pane -t "$TMUX_PANE" -T "$PRD_TMUX_MAIN_TITLE_SAVED" 2>/dev/null
+        fi
+    else
+        prd_pane_relayout
+    fi
+    return 0
+}
+
+# Close every pane we opened (EXIT trap / forced shutdown). Idempotent.
+prd_pane_cleanup_all() {
+    [[ -n "$PRD_PANE_STATE" && -f "$PRD_PANE_STATE" ]] || return 0
+    local pane_id
+    while IFS= read -r pane_id; do
+        [[ -n "$pane_id" ]] || continue
+        local n
+        n=$(tmux list-panes -t "$pane_id" -F x 2>/dev/null | wc -l)
+        (( n > 1 )) && tmux kill-pane -t "$pane_id" 2>/dev/null
+    done < "$PRD_PANE_STATE"
+    : > "$PRD_PANE_STATE"
+    prd_pane_borders_off
+    if [[ -n "$TMUX_PANE" && -n "$PRD_TMUX_MAIN_TITLE_SAVED" ]]; then
+        tmux select-pane -t "$TMUX_PANE" -T "$PRD_TMUX_MAIN_TITLE_SAVED" 2>/dev/null
+    fi
+    return 0
+}
+
+prd_pane_init && print -P "%F{cyan}[PANE]%f tmux live agent panes: %F{yellow}on%f (window $PRD_TMUX_WIN; disable: --no-tmux-panes)"
+
 # --- Session Management Functions ---
 
 # --- PRD Include Resolution (@path expansion) ---
@@ -349,23 +1181,36 @@ PRP_AGENT_MCP_ARGS=""
 #   PRD_INCLUDE_MAX_DEPTH  Max include nesting (default 10)
 #   PRD_INCLUDE_MARKERS    If non-empty, emit <!-- @include: path --> markers
 typeset -gA _PRD_INCLUDE_STACK
+typeset -g _PRD_INCLUDE_ENTRY=""
 
 resolve_prd_content() {
     local file_path=$1
     local depth=${2:-0}
     local root=${3:-}
     local max_depth=${PRD_INCLUDE_MAX_DEPTH:-10}
+    # Dynamically scoped: the file whose lines we are currently expanding.
+    # Initialized from the caller's value (dynamic scope) so a nested
+    # resolve_prd_content sees the file its INCLUDE TOKEN was found in; the
+    # nested call shadows it with its own file after passing the cycle gate.
+    local _PRD_INCLUDE_CURRENT="${_PRD_INCLUDE_CURRENT}"
 
     [[ ! -f "$file_path" ]] && return 0
 
     # Top-level entry: reset cycle stack and establish the include root.
     if (( depth == 0 )); then
         _PRD_INCLUDE_STACK=()
+        _PRD_INCLUDE_ENTRY="${file_path:A}"
         [[ -z "$root" ]] && root="${file_path:A:h}"
     fi
 
     local abs_path="${file_path:A}"
     if (( ${+_PRD_INCLUDE_STACK[$abs_path]} )); then
+        # Re-referencing the TOP-LEVEL entry file FROM THE ENTRY FILE ITSELF is
+        # a no-op by necessity — a docs-index table that lists the entry doc
+        # alongside its companions (e.g. spec/SPEC.md containing "@./SPEC.md").
+        # Skip silently; every other repeat reference — including a companion
+        # back-referencing the entry (a real A->B->A cycle) — still warns.
+        [[ "$abs_path" == "$_PRD_INCLUDE_ENTRY" && "$_PRD_INCLUDE_CURRENT" == "$_PRD_INCLUDE_ENTRY" ]] && return 0
         print -u2 -P "%F{red}[PRD INCLUDE]%f Cycle detected: $file_path already in include stack. Skipping."
         return 0
     fi
@@ -384,6 +1229,7 @@ resolve_prd_content() {
     fi
 
     _PRD_INCLUDE_STACK[$abs_path]=1
+    _PRD_INCLUDE_CURRENT="$abs_path"
     local line in_fence=0 bt=$'\140'
     # Fenced code blocks (``` or ~~~, up to 3 leading spaces) pass through
     # verbatim, so @<path> tokens shown inside one as documentation are never
@@ -923,12 +1769,12 @@ check_staged_prd_changes() {
     [[ ! -d ".git" ]] && return 0
     [[ ! -f "$PRD_FILE" ]] && return 0
 
-    # Check if PRD.md is in the staging area
-    if ! git diff --cached --name-only | grep -q "^PRD\.md$"; then
+    # Check if the PRD (or standalone plan) file is in the staging area
+    if ! git diff --cached --name-only | grep -qxF "$PRD_FILE"; then
         return 0  # PRD not staged, nothing to do
     fi
 
-    print -P "%F{yellow}[PRD CHECK]%f Detected staged changes to PRD.md"
+    print -P "%F{yellow}[PRD CHECK]%f Detected staged changes to $PRD_FILE"
 
     # Get the diff for analysis
     local PRD_DIFF=$(git diff --cached "$PRD_FILE")
@@ -983,10 +1829,10 @@ Output ONLY one word: COSMETIC or SUBSTANTIVE"
 
     if [[ "$CLEAN_RESULT" == "SUBSTANTIVE" ]]; then
         print -P "%F{red}[PRD CHECK]%f Substantive PRD changes detected!"
-        print -P "%F{yellow}[PRD CHECK]%f Removing PRD.md from staging area."
+        print -P "%F{yellow}[PRD CHECK]%f Removing $PRD_FILE from staging area."
         print -P "%F{yellow}[PRD CHECK]%f To apply PRD changes, commit other files first, then run the pipeline to handle PRD changes properly."
         git reset HEAD "$PRD_FILE" >/dev/null 2>&1
-        print -P "%F{green}[PRD CHECK]%f PRD.md unstaged. Other staged files remain."
+        print -P "%F{green}[PRD CHECK]%f $PRD_FILE unstaged. Other staged files remain."
     elif [[ "$CLEAN_RESULT" == "COSMETIC" ]]; then
         print -P "%F{green}[PRD CHECK]%f Cosmetic changes only. Updating snapshot..."
         # Find current session and update its snapshot
@@ -1019,6 +1865,33 @@ if [[ "$ADOPT_PRD" == "true" && ! -f "$PRD_FILE" ]]; then
     print -P "%F{cyan}[ADOPT]%f Synthesize a PRD describing the existing codebase first, then re-run"
     print -P "%F{cyan}[ADOPT]%f 'prd --adopt-prd' from the directory containing $PRD_FILE."
     exit 1
+fi
+
+# --- Standalone-plan auto-resume ---
+# This project has no PRD file, but its latest session was created from a
+# standalone plan (--plan). Re-enter standalone-plan mode with the recorded
+# plan file so a bare `prd` resume works exactly like a PRD project's bare
+# run. An explicit --plan/PLAN_FILE (already applied above) or an existing
+# PRD file wins; bugfix-mode children manage PRD_FILE themselves.
+if [[ "$STANDALONE_PLAN" != "true" && ! -f "$PRD_FILE" && "$SKIP_BUG_FINDING" != "true" ]]; then
+    _PM_NUM=$(get_latest_session_number 2>/dev/null)
+    if [[ "${_PM_NUM:-0}" -gt 0 ]]; then
+        _PM_DIR=$(get_session_dir "$_PM_NUM")
+        if [[ -n "$_PM_DIR" && -f "$_PM_DIR/.standalone_plan" ]]; then
+            _PM_PLAN=$(head -1 "$_PM_DIR/.standalone_plan" 2>/dev/null)
+            # Marker records the path as given at session creation (usually
+            # PWD-relative); fall back to $PWD-qualified if cwd changed.
+            if [[ -n "$_PM_PLAN" && ! -f "$_PM_PLAN" && -f "$PWD/$_PM_PLAN" ]]; then
+                _PM_PLAN="$PWD/$_PM_PLAN"
+            fi
+            if [[ -n "$_PM_PLAN" && -f "$_PM_PLAN" ]]; then
+                PRD_FILE="$_PM_PLAN"
+                STANDALONE_PLAN=true
+                print -P "%F{magenta}[PLAN]%f No PRD file found; latest session is a standalone-plan session."
+                print -P "%F{magenta}[PLAN]%f Resuming standalone-plan mode with: $_PM_PLAN"
+            fi
+        fi
+    fi
 fi
 
 # Initialize session variables
@@ -1105,6 +1978,10 @@ elif [[ -f "$PRD_FILE" ]]; then
             CURRENT_SESSION_NUM=1
             CURRENT_SESSION_DIR=$(create_session 1 "$(hash_prd_content "$PRD_FILE")")
             write_resolved_prd "$CURRENT_SESSION_DIR/prd_snapshot.md"
+            if [[ "$STANDALONE_PLAN" == "true" ]]; then
+                print -r -- "$PRD_FILE" > "$CURRENT_SESSION_DIR/.standalone_plan"
+                print -P "%F{magenta}[PLAN]%f Standalone-plan session: breaking down $PRD_FILE directly (no baseline PRD)."
+            fi
             if [[ "$ADOPT_PRD" == "true" ]]; then
                 ADOPT_BASELINE=true
                 date -Iseconds > "$CURRENT_SESSION_DIR/.adopted"
@@ -1170,15 +2047,26 @@ elif [[ -f "$PRD_FILE" ]]; then
                 PENDING_HASH=$(cat "$CURRENT_SESSION_DIR/.pending_delta_hash")
                 CURRENT_HASH=$(hash_prd_content "$PRD_FILE")
                 if [[ "$PENDING_HASH" == "$CURRENT_HASH" ]]; then
-                    print -P "%F{cyan}[SESSION]%f Processing queued delta..."
+                    if [[ "$STANDALONE_PLAN" == "true" ]]; then
+                        print -P "%F{cyan}[SESSION]%f Processing queued plan session..."
+                    else
+                        print -P "%F{cyan}[SESSION]%f Processing queued delta..."
+                    fi
                     rm "$CURRENT_SESSION_DIR/.pending_delta_hash"
                     PREV_SESSION_DIR="$CURRENT_SESSION_DIR"
                     CURRENT_SESSION_NUM=$((CURRENT_SESSION_NUM + 1))
                     CURRENT_SESSION_DIR=$(create_session $CURRENT_SESSION_NUM "$CURRENT_HASH")
-                    echo "$((CURRENT_SESSION_NUM - 1))" > "$CURRENT_SESSION_DIR/delta_from.txt"
                     write_resolved_prd "$CURRENT_SESSION_DIR/prd_snapshot.md"
-                    print -P "%F{green}[SESSION]%f Created delta session: $(basename "$CURRENT_SESSION_DIR")"
-                    CREATE_DELTA=true
+                    if [[ "$STANDALONE_PLAN" == "true" ]]; then
+                        # The plan IS the working document: no delta_from.txt,
+                        # no CREATE_DELTA (nothing to diff or regenerate).
+                        print -r -- "$PRD_FILE" > "$CURRENT_SESSION_DIR/.standalone_plan"
+                        print -P "%F{green}[SESSION]%f Created plan session: $(basename "$CURRENT_SESSION_DIR")"
+                    else
+                        echo "$((CURRENT_SESSION_NUM - 1))" > "$CURRENT_SESSION_DIR/delta_from.txt"
+                        print -P "%F{green}[SESSION]%f Created delta session: $(basename "$CURRENT_SESSION_DIR")"
+                        CREATE_DELTA=true
+                    fi
                 fi
             else
                 if [[ "$SKIP_BUG_FINDING" == "false" || "$ONLY_BUG_HUNT" == "true" || "$ONLY_VALIDATE" == "true" ]]; then
@@ -1278,16 +2166,24 @@ elif [[ -f "$PRD_FILE" ]]; then
                 print -P "%F{cyan}[INFO]%f PRD change noted but not actioned. Run without --validate to create the delta session."
                 SKIP_EXECUTION_LOOP=true
             else
-                print -P "%F{cyan}[SESSION]%f Creating delta session for changes..."
-
                 PREV_SESSION_DIR="$CURRENT_SESSION_DIR"
                 CURRENT_SESSION_NUM=$((CURRENT_SESSION_NUM + 1))
                 CURRENT_SESSION_DIR=$(create_session $CURRENT_SESSION_NUM "$(hash_prd_content "$PRD_FILE")")
-                echo "$((CURRENT_SESSION_NUM - 1))" > "$CURRENT_SESSION_DIR/delta_from.txt"
                 write_resolved_prd "$CURRENT_SESSION_DIR/prd_snapshot.md"
 
-                print -P "%F{green}[SESSION]%f Created delta session: $(basename "$CURRENT_SESSION_DIR")"
-                CREATE_DELTA=true
+                if [[ "$STANDALONE_PLAN" == "true" ]]; then
+                    # Standalone plan mode: the changed/new plan IS the working
+                    # document. Use it directly - no delta generation, and no
+                    # delta_from.txt (nothing to regenerate on resume).
+                    print -r -- "$PRD_FILE" > "$CURRENT_SESSION_DIR/.standalone_plan"
+                    print -P "%F{cyan}[PLAN]%f Creating new plan session (plan used directly, no delta generation)..."
+                    print -P "%F{green}[SESSION]%f Created plan session: $(basename "$CURRENT_SESSION_DIR")"
+                else
+                    print -P "%F{cyan}[SESSION]%f Creating delta session for changes..."
+                    echo "$((CURRENT_SESSION_NUM - 1))" > "$CURRENT_SESSION_DIR/delta_from.txt"
+                    print -P "%F{green}[SESSION]%f Created delta session: $(basename "$CURRENT_SESSION_DIR")"
+                    CREATE_DELTA=true
+                fi
             fi
             ;;
     esac
@@ -1515,6 +2411,15 @@ read -r -d '' TASK_BREAKDOWN_SYSTEM_PROMPT <<EOF || true
 *   **TASK:** Complete features within a Milestone. *Days to weeks.*
 *   **SUBTASK:** Atomic implementation steps. **0.5, 1, or 2 Story Points (SP).** (Max 2 SP, do not break subtasks down further than 2 SP unless required).
 
+> **ID NUMBERING — STRICT, POSITIONAL, NON-NEGOTIABLE.** The orchestrator addresses every item by array position derived from the ID numbers. Wrong numbering makes it look up the wrong item (or nothing) and the run FAILS. Each number is the item's 1-based position within its PARENT, and every level RESETS when the parent changes:
+>
+> *   Phases: \`P1\`, \`P2\`, ... in backlog order.
+> *   Milestones reset PER PHASE: \`P1.M1\`, \`P1.M2\`, ... then \`P2.M1\` — NEVER \`P2.M3\`.
+> *   Tasks reset PER MILESTONE: \`P1.M1.T1\`, \`P1.M1.T2\`, ... then \`P1.M2.T1\` — NEVER \`P1.M2.T3\`.
+> *   Subtasks reset PER TASK: \`P1.M1.T1.S1\`, \`P1.M1.T1.S2\`, ... then \`P1.M1.T2.S1\` — NEVER \`P1.M1.T2.S3\`.
+> *   No gaps, no continuing a sibling's numbering across the parent boundary. The FIRST subtask of EVERY task is \`S1\`; the FIRST task of EVERY milestone is \`T1\`; the FIRST milestone of EVERY phase is \`M1\`.
+> *   When referencing other items anywhere (\`dependencies\`, \`context_scope\`, descriptions), use the FULL dotted ID (e.g. \`P1.M1.T2.S1\`) — never shorthand like \`T2.S1\` or \`S4\`. Full IDs keep cross-references unambiguous and machine-rewritable; shorthand silently breaks them.
+
 ---
 
 ## CRITICAL CONSTRAINTS & STANDARD OF WORK (SOW)
@@ -1628,6 +2533,8 @@ Use your file writing tools to create \`./$TASKS_FILE\` with this structure:
 }
 \`\`\`
 
+**ID NUMBERING REMINDER:** In every \`id\`, each \`[#]\` is the item's 1-based position within its PARENT and RESETS with each new parent — first subtask of every task is \`S1\`, first task of every milestone is \`T1\`, first milestone of every phase is \`M1\`. See ID NUMBERING above; any other numbering fails the run.
+
 ## PRD SELECTOR REFERENCES
 
 The \`prd_selectors\` field references specific PRD sections that will be extracted for downstream agents.
@@ -1668,11 +2575,36 @@ EOF
 # entirely (the bare `PRD_CONTENT=$(cat delta_prd.md)` reassignment would be
 # dead code, since the variable was already consumed by the heredoc).
 build_task_breakdown_prompt() {
+# Standalone-plan framing: the input document is a delta-equivalent working
+# plan, not a full-project PRD. Tell the breakdown agent to decompose THE
+# PLAN against the codebase as it exists today, and (from plan session 2 on)
+# to build on the previous session's research instead of redoing it.
+local plan_mode_ctx=""
+if [[ "$STANDALONE_PLAN" == "true" ]]; then
+    plan_mode_ctx="
+**STANDALONE WORKING PLAN - NOT A FULL-PROJECT PRD:**
+The document above is a standalone working plan (delta-equivalent): it describes the specific changes to build on top of the codebase AS IT EXISTS TODAY.
+- Decompose THE PLAN ITSELF into the backlog. Do NOT decompose the whole project, and do NOT restate existing behavior as new work.
+- The current codebase is the implicit baseline: research it and reference existing implementations, patterns, and files rather than re-implementing them.
+- Keep the breakdown proportional to the plan's own scope."
+    local _prev_dir="$PREV_SESSION_DIR"
+    if [[ -z "$_prev_dir" && "${CURRENT_SESSION_NUM:-1}" -gt 1 ]]; then
+        _prev_dir=$(get_session_dir $((CURRENT_SESSION_NUM - 1)))
+    fi
+    if [[ -n "$_prev_dir" && -d "$_prev_dir" ]]; then
+        plan_mode_ctx+="
+
+**PREVIOUS SESSION:** $_prev_dir
+- Check $_prev_dir/architecture/ for existing research FIRST (priority over web searches).
+- Check $_prev_dir/docs/ for implementation notes. Reference completed work instead of re-researching."
+    fi
+fi
 read -r -d '' TASK_BREAKDOWN_PROMPT <<EOF
 # PROJECT INITIATION
 
 **INPUT DOCUMENTATION (PRD):**
 $PRD_CONTENT
+$plan_mode_ctx
 
 **PRD STRUCTURE INDEX:**
 Use these selectors in \`prd_selectors\` to reference specific sections for each subtask.
@@ -2341,7 +3273,7 @@ Clean up, organize files, and PREPARE FOR COMMIT. Check \`git diff\` for referen
 - **$SESSION_DIR/prd_snapshot.md** - PRD snapshot for this session (NEVER DELETE OR MOVE)
 - **$SESSION_DIR/delta_prd.md** - Delta PRD for incremental sessions (NEVER DELETE OR MOVE)
 - **$SESSION_DIR/delta_from.txt** - Delta session linkage (NEVER DELETE OR MOVE)
-- **PRD.md** - Product requirements document in project root (NEVER DELETE OR MOVE)
+- **$PRD_FILE** - Product requirements document / standalone plan file (NEVER DELETE OR MOVE)
 - **$SESSION_DIR/TEST_RESULTS.md** - Bug report file (NEVER DELETE OR MOVE)
 - Any file matching \`*tasks*.json\` pattern (NEVER DELETE OR MOVE)
 - Any file directly in $SESSION_DIR/ root (NEVER MOVE to subdirectories)
@@ -2367,12 +3299,12 @@ Then, MOVE (not delete) any markdown documentation files you created during impl
 **EXCEPTIONS - DO NOT MOVE THESE**:
 - PRP.md files (pipeline control files - must stay in place)
 - Files already inside $SESSION_DIR/P* directories
-- README.md, PRD.md, or any tracked project files
+- README.md, $PRD_FILE, or any tracked project files
 
 ## KEEP IN ROOT:
 Only these types of files should remain in the project root:
 - README.md and readme-adjacent files (CONTRIBUTING.md, LICENSE, etc.)
-- PRD.md (the human-edited source document)
+- $PRD_FILE (the human-edited source document / standalone plan)
 - Core config files (package.json, tsconfig.json, etc.)
 - Build and script files
 
@@ -2399,14 +3331,14 @@ We are preparing to commit. Ensure the repo is clean.
 **You are a CLEANUP agent. You organize files. You do NOT modify pipeline state.**
 
 ### NEVER MODIFY OR DELETE:
-- \`PRD.md\` - The product requirements document in the project root (NEVER DELETE, MOVE, OR TOUCH). Owned by humans.
+- \`$PRD_FILE\` - The product requirements document / standalone plan file in the project root (NEVER DELETE, MOVE, OR TOUCH). Owned by humans.
 - \`**/PRP.md\` - Plan Research Protocol files. NEVER delete, move, or overwrite. They are pipeline control files, NOT scratch files.
 - \`plan/\` - NEVER create, delete, or modify plan directories or anything inside them
 - \`**/tasks.json\` - NEVER touch any tasks.json file
 - \`**/prd_snapshot.md\` - NEVER touch any prd_snapshot.md file
 - \`**/TEST_RESULTS.md\` - NEVER touch bug report files
 
-**NEVER run \`rm\`, \`git rm\`, \`git clean\`, or \`mv\` against PRD.md, any PRP.md, or anything under plan/.** These are NOT "scratch" or "temporary" files and they are never "unused" - they are pipeline state. Do not delete them under any circumstances. The pipeline auto-restores them, so a deletion will not stick - but do not attempt it.
+**NEVER run \`rm\`, \`git rm\`, \`git clean\`, or \`mv\` against $PRD_FILE, any PRP.md, or anything under plan/.** These are NOT "scratch" or "temporary" files and they are never "unused" - they are pipeline state. Do not delete them under any circumstances. The pipeline auto-restores them, so a deletion will not stick - but do not attempt it.
 
 ### NEVER ADD TO .gitignore:
 - \`plan/\` or any subdirectory of plan
@@ -2482,13 +3414,13 @@ The PRD has changed while implementation is in progress. You need to update the 
 to incorporate these changes without losing progress on work already completed.
 
 ## Original PRD Snapshot (from session start):
-$(cat "$SESSION_DIR/prd_snapshot.md")
+$(cat "$SESSION_DIR/prd_snapshot.md" 2>/dev/null)
 
 ## Updated PRD (current):
 $(resolve_prd_content "$PRD_FILE")
 
 ## Current Tasks State:
-$(cat "$TASKS_FILE")
+$(cat "$TASKS_FILE" 2>/dev/null)
 
 ## Instructions:
 
@@ -2517,6 +3449,7 @@ Modify \`$TASKS_FILE\` following these rules:
 - **Add new phases/milestones/tasks/subtasks** for new requirements
 - **Update descriptions** for modified requirements
 - **Mark obsolete** tasks for removed requirements (status: "Obsolete")
+- **Number new items positionally** - milestone/task/subtask numbers RESET within their parent: the first subtask of every task is \`S1\`, the first task of every milestone is \`T1\`. NEVER continue a sibling's numbering across the parent boundary
 
 ### 5. MAINTAIN COHERENCE
 Ensure the updated task hierarchy still makes sense:
@@ -2929,6 +3862,7 @@ Create a SINGLE phase with ONE milestone containing ONE task per bug. Each bug =
 5. **NO research tasks** - Bug reports already contain the research
 6. **NO documentation tasks** - Just fix the bugs
 7. **Critical bugs first** - Order tasks by severity
+8. **IDs are positional and reset per parent** - The first subtask of EVERY task is `S1`, the first task of EVERY milestone is `T1`, the first milestone of EVERY phase is `M1`. NEVER continue numbering across siblings (no `S4` after `S3` in the next task). Reference other items only by their FULL dotted ID (`P1.M1.T1.S1`), never shorthand
 
 ## BUG REPORT SELECTOR REFERENCES
 
@@ -3264,7 +4198,7 @@ The previous PRP defines what will exist when your item begins implementation.
 
         # Pin a deterministic session id per item so the retry below resumes THIS item.
         local research_sid="prd-research-$(basename "$cdir")"
-        run_agent_stdin "$PRP_CREATE_PROMPT Create a PRP for $(get_scope_name) $cid of the PRD.
+        PRD_PANE_LABEL="research $cid" PRD_PANE_SESSION="$research_sid" run_agent_stdin "$PRP_CREATE_PROMPT Create a PRP for $(get_scope_name) $cid of the PRD.
 
 CRITICAL OUTPUT PATHS (use these EXACT paths):
 - PRP file: $cdir/PRP.md
@@ -3290,7 +4224,7 @@ $issue_feedback
 
         if [[ ! -f "$cdir/PRP.md" ]]; then
             print -P "%F{yellow}[PARALLEL]%f PRP.md not found for $cid, retrying..."
-            $AGENT --session-id "$research_sid" -p "You didn't write the file. Make sure you write the file to $cdir/PRP.md" < /dev/null
+            PRD_PANE_LABEL="research $cid (retry)" PRD_PANE_SESSION="$research_sid" run_with_retry $AGENT --session-id "$research_sid" -p "You didn't write the file. Make sure you write the file to $cdir/PRP.md" < /dev/null
         fi
         if [[ ! -f "$cdir/PRP.md" ]]; then
             print -P "%F{red}[PARALLEL]%f Background research FAILED for $cid - no PRP created"
@@ -3348,7 +4282,10 @@ start_background_research() {
     print -P "%F{cyan}[PARALLEL]%f Starting background research for $id (depth ${#CHAIN_IDS[@]}: ${CHAIN_IDS[*]})..."
 
     # Launch the supervisor subshell. RESEARCH_PID tracks the whole chain.
-    ( run_research_supervisor "$prev_id" "$prev_dirname" ) &
+    # TERM trap: on graceful shutdown (or a hung-supervisor kill) close the
+    # panes THIS subshell opened before dying — otherwise its research pane
+    # lingers, frozen, until the whole pipeline exits.
+    ( trap 'prd_pane_close_mine; exit 143' TERM; run_research_supervisor "$prev_id" "$prev_dirname" ) &
     RESEARCH_PID=$!
     print -P "%F{cyan}[PARALLEL]%f Background research started (PID: $RESEARCH_PID, items: ${CHAIN_IDS[*]})"
 }
@@ -3661,6 +4598,8 @@ cleanup_deterministic() {
         case "$base" in
             README*|PRD.md|PRP.md|CONTRIBUTING.md|LICENSE*|CHANGELOG*) continue ;;
         esac
+        # Never sweep the active PRD / standalone plan file, whatever its name
+        [[ "$base" == "${PRD_FILE:t}" ]] && continue
         mv -- "$f" "$SESSION_DIR/docs/" 2>/dev/null && { print -P "%F{cyan}[CLEANUP]%f moved stray doc $base → docs/"; ((moved++)) }
     done < <(git ls-files --others --exclude-standard '*.md' 2>/dev/null)
     # Standard build/deps/env + common-temp patterns, so scratch never reaches a
@@ -3796,7 +4735,7 @@ execute_item() {
             print -P "%F{yellow}[ISSUE RETRY]%f Including feedback from previous implementation attempt"
         fi
 
-        run_with_retry_stdin "$PRP_CREATE_PROMPT Create a PRP for $(get_scope_name) $id of the PRD. Store it at $dirname/PRP.md.
+        PRD_PANE_LABEL="research $id" PRD_PANE_SESSION="prd-prp-$(basename "$dirname")" run_with_retry_stdin "$PRP_CREATE_PROMPT Create a PRP for $(get_scope_name) $id of the PRD. Store it at $dirname/PRP.md.
 
 SCOPE: Write ONLY this item's PRP ($id). You were asked for ONE PRP. Writing PRPs for other items in this session is allowed ONLY after you clear the MULTI-PRP BATCHING POLICY in the prompt (full task tree + full PRD + thorough per-item research for EVERY PRP you write). When in doubt, write one.
 <item_title>$(get_item_title $phase_num $ms_num $task_num $subtask_num)</item_title>
@@ -3819,7 +4758,7 @@ $issue_feedback
         fi
         if [[ ! -f "$dirname/PRP.md" ]]; then
             print -P "%F{yellow}[RETRY]%f PRP.md not found. Retrying..."
-            $AGENT --session-id "prd-prp-$(basename "$dirname")" -p "You didn't write the file. Make sure you write the file to $dirname/PRP.md" < /dev/null
+            PRD_PANE_LABEL="research $id (retry)" PRD_PANE_SESSION="prd-prp-$(basename "$dirname")" run_with_retry $AGENT --session-id "prd-prp-$(basename "$dirname")" -p "You didn't write the file. Make sure you write the file to $dirname/PRP.md" < /dev/null
         fi
         # Check again for interruption
         if [[ "$SHUTDOWN_REQUESTED" == "true" ]]; then
@@ -3872,9 +4811,11 @@ $issue_feedback
         # these invisible in session history and un-resumable.
         # Use pipefail to get the agent's exit status, not tee's
         setopt pipefail
+        prd_pane_open "impl $id" "prd-impl-$(basename "$dirname")"
         $IMPL_AGENT --session-id "prd-impl-$(basename "$dirname")" -p "$PRP_EXECUTE_PROMPT Execute the PRP for $(get_scope_name) $id. The PRP file is located at: $dirname/PRP.md. READ IT NOW." < /dev/null 2>&1 | tee "$agent_output_file"
         agent_exit_status=$?
         unsetopt pipefail
+        prd_pane_close
 
         # Success - break out of retry loop
         if [[ $agent_exit_status -eq 0 ]]; then
@@ -4045,8 +4986,10 @@ FEEDBACK_EOF
             print -P "%F{yellow}[VERIFY]%f $id changed files but emitted no success signal — prompting agent to confirm (run tests, emit result)..."
             local verify_out=$(mktemp)
             setopt pipefail
+            prd_pane_open "impl $id (verify)" "prd-impl-$(basename "$dirname")"
             $IMPL_AGENT --session-id "prd-impl-$(basename "$dirname")" -p "For $(get_scope_name) $id you modified files but did not emit a final result. Run this item's tests now. If they pass, output exactly: {\"result\":\"success\"}. If something is genuinely wrong, output: {\"result\":\"issue\",\"message\":\"...\"} and explain." < /dev/null 2>&1 | tee "$verify_out" >/dev/null
             unsetopt pipefail
+            prd_pane_close
             if [[ "$SHUTDOWN_REQUESTED" == "true" ]]; then
                 rm -f "$verify_out"
                 print -P "%F{yellow}[INTERRUPTED]%f Re-prompt interrupted for $id - rolling back to Planned"
@@ -4091,7 +5034,22 @@ FEEDBACK_EOF
 }
 
 # Simple retry logic with shutdown support (infinite retries)
+# tmux-pane wrapper: PRD_PANE_LABEL="..." [PRD_PANE_SESSION=<pi session id>]
+# before the call opens a live viewer pane for the duration of the invocation
+# (all retry attempts included). See the "Tmux live agent panes" block above.
 run_with_retry() {
+    local _pl="$PRD_PANE_LABEL" _ps="$PRD_PANE_SESSION"
+    unset PRD_PANE_LABEL PRD_PANE_SESSION 2>/dev/null
+    [[ -n "$_pl" ]] && prd_pane_open "$_pl" "$_ps"
+    local _log="$PRD_PANE_LOG"
+    _run_with_retry_core "$@"
+    local _rc=$?
+    [[ -n "$PRD_PANE_CUR" ]] && prd_pane_close
+    [[ -n "$_log" ]] && rm -f "$_log" 2>/dev/null
+    return $_rc
+}
+
+_run_with_retry_core() {
     local n=1
     local delay=5
 
@@ -4102,8 +5060,13 @@ run_with_retry() {
         fi
 
         # Run command directly
-        eval "${(q)@}"
-        local exit_status=$?
+        if [[ -n "$PRD_PANE_LOG" ]]; then
+            eval "${(q)@}" > "$PRD_PANE_LOG" 2>&1
+            local exit_status=$?
+        else
+            eval "${(q)@}"
+            local exit_status=$?
+        fi
 
         # Success
         if [[ $exit_status -eq 0 ]]; then
@@ -4124,7 +5087,7 @@ run_with_retry() {
     done
 }
 
-# Like run_with_retry, but feeds the agent's prompt via STDIN instead of as a
+# Like run_with_retry, but feeds the agent's prompt via STDIN instead of a
 # `pi -p "$prompt"` argv string. This is REQUIRED for large prompts: the Linux
 # kernel caps a single argv string at MAX_ARG_STRLEN = 131072 bytes (128KB),
 # independent of ARG_MAX. A PRD embedded in `-p "$TASK_BREAKDOWN_PROMPT"` can
@@ -4140,7 +5103,29 @@ run_with_retry() {
 #
 # Usage: run_with_retry_stdin <prompt_text> <agent> [agent-args...]
 #   (do NOT pass -p or < /dev/null; the helper handles stdin)
+# tmux-pane wrapper: same contract as run_with_retry's wrapper, plus
+# PRD_PANE_JSON=1 for sessionless major calls (validation/fixer): when the pane
+# runs in log mode, `--mode json` is injected after the agent token so the pane
+# renders the live event stream instead of a silent-until-the-end text dump.
+# (When panes are off — or the caller passed a session id — argv is untouched.)
 run_with_retry_stdin() {
+    local _pl="$PRD_PANE_LABEL" _ps="$PRD_PANE_SESSION" _pj="$PRD_PANE_JSON"
+    unset PRD_PANE_LABEL PRD_PANE_SESSION PRD_PANE_JSON 2>/dev/null
+    if [[ -n "$_pl" ]]; then
+        prd_pane_open "$_pl" "$_ps"
+        if [[ -n "$PRD_PANE_LOG" && "$_pj" == "1" && "$#" -ge 2 ]]; then
+            set -- "$1" "$2" --mode json "${@:3}"
+        fi
+    fi
+    local _log="$PRD_PANE_LOG"
+    _run_with_retry_stdin_core "$@"
+    local _rc=$?
+    [[ -n "$PRD_PANE_CUR" ]] && prd_pane_close
+    [[ -n "$_log" ]] && rm -f "$_log" 2>/dev/null
+    return $_rc
+}
+
+_run_with_retry_stdin_core() {
     local prompt_text="$1"; shift
     local tmp
     tmp=$(mktemp -t prd-prompt.XXXXXX) || { print -P "%F{red}[ERROR]%f mktemp failed"; return 1; }
@@ -4161,6 +5146,11 @@ run_with_retry_stdin() {
             # (eval), not tee; tee's status is intentionally ignored.
             eval "${(q)@}" < "$tmp" 2>&1 | tee "$CAPTURE_STDOUT"
             exit_status=$pipestatus[1]
+        elif [[ -n "$PRD_PANE_LOG" ]]; then
+            # tmux-pane log mode: the pane's viewer is the display — send the
+            # combined stream to the log it follows instead of stdout.
+            eval "${(q)@}" < "$tmp" > "$PRD_PANE_LOG" 2>&1
+            exit_status=$?
         else
             eval "${(q)@}" < "$tmp"
             exit_status=$?
@@ -4184,12 +5174,29 @@ run_with_retry_stdin() {
 # that manage their own recovery/retry logic (e.g. the background research
 # supervisor). Same MAX_ARG_STRLEN rationale: feed the prompt via stdin, not argv.
 # Usage: run_agent_stdin <prompt_text> <agent> [agent-args...]
+# tmux-pane wrapper: same contract as the run_with_retry wrapper.
 run_agent_stdin() {
+    local _pl="$PRD_PANE_LABEL" _ps="$PRD_PANE_SESSION"
+    unset PRD_PANE_LABEL PRD_PANE_SESSION 2>/dev/null
+    [[ -n "$_pl" ]] && prd_pane_open "$_pl" "$_ps"
+    local _log="$PRD_PANE_LOG"
+    _run_agent_stdin_core "$@"
+    local _rc=$?
+    [[ -n "$PRD_PANE_CUR" ]] && prd_pane_close
+    [[ -n "$_log" ]] && rm -f "$_log" 2>/dev/null
+    return $_rc
+}
+
+_run_agent_stdin_core() {
     local prompt_text="$1"; shift
     local tmp
     tmp=$(mktemp -t prd-prompt.XXXXXX) || return 1
     print -r -- "$prompt_text" > "$tmp"
-    eval "${(q)@}" < "$tmp"
+    if [[ -n "$PRD_PANE_LOG" ]]; then
+        eval "${(q)@}" < "$tmp" > "$PRD_PANE_LOG" 2>&1
+    else
+        eval "${(q)@}" < "$tmp"
+    fi
     local _s=$?
     rm -f "$tmp"
     return $_s
@@ -4440,10 +5447,16 @@ PYEOF
 restore_critical_files() {
     [[ ! -d ".git" ]] && return 0
 
-    # PRD.md / PRP.md currently staged for deletion (git add -A already ran).
+    # PRD.md / PRP.md / the active PRD-or-standalone-plan file currently
+    # staged for deletion (git add -A already ran).
     local deleted
     deleted=$(git diff --cached --name-only --diff-filter=D 2>/dev/null \
         | grep -E '(^|/)PRD\.md$|(^|/)PRP\.md$')
+    # Also protect the active PRD / standalone plan file, whatever its name
+    # (fixed-string match - no regex escaping of the path needed).
+    if git diff --cached --name-only --diff-filter=D 2>/dev/null | grep -qxF "$PRD_FILE"; then
+        deleted="$deleted"$'\n'"$PRD_FILE"
+    fi
     [[ -z "$deleted" ]] && return 0
 
     local f
@@ -4564,10 +5577,14 @@ launch_commit_async() {
 # orphaned and lands on its own if it can. (exec does NOT trigger EXIT, so
 # await_inflight_commit is also called explicitly before every exec "$0".)
 _exit_await_commit() {
+    prd_pane_cleanup_all   # close agent panes first; nothing watches them anymore
     [[ "$FORCE_SHUTDOWN" == "true" ]] && return 0
     await_inflight_commit
 }
 trap _exit_await_commit EXIT
+# If the user closes the pipeline's own tmux pane, the EXIT trap never fires
+# (SIGHUP kills the shell) — clean the panes up on the way out instead.
+trap 'prd_pane_cleanup_all; exit 129' HUP
 
 # Protects tasks.json and the plan directory from AI "cleanup"
 smart_commit() {
@@ -4683,14 +5700,14 @@ Previous session directory: $PREV_SESSION_DIR
 "
 
     # Run delta PRD generation
-    run_with_retry_stdin "$DELTA_PRD_GENERATION_PROMPT
+    PRD_PANE_LABEL="delta prd $(basename "$SESSION_DIR")" PRD_PANE_SESSION="prd-delta-$(basename "$SESSION_DIR")" run_with_retry_stdin "$DELTA_PRD_GENERATION_PROMPT
 
 $PREVIOUS_SESSION_CONTEXT_PROMPT" $BREAKDOWN_AGENT --session-id "prd-delta-$(basename "$SESSION_DIR")"
 
     # Retry if delta PRD wasn't created
     if [[ ! -f "$SESSION_DIR/delta_prd.md" ]]; then
         print -P "%F{yellow}[DELTA]%f delta_prd.md not found. Demanding agent write it..."
-        run_with_retry $BREAKDOWN_AGENT --session-id "prd-delta-$(basename "$SESSION_DIR")" -p "You did NOT write the delta PRD file. You MUST write it to $SESSION_DIR/delta_prd.md immediately. This file is REQUIRED before we can proceed." < /dev/null
+        PRD_PANE_LABEL="delta prd (retry)" PRD_PANE_SESSION="prd-delta-$(basename "$SESSION_DIR")" run_with_retry $BREAKDOWN_AGENT --session-id "prd-delta-$(basename "$SESSION_DIR")" -p "You did NOT write the delta PRD file. You MUST write it to $SESSION_DIR/delta_prd.md immediately. This file is REQUIRED before we can proceed." < /dev/null
     fi
 
     # Final validation - FAIL if delta PRD is still missing
@@ -4718,6 +5735,10 @@ if [[ "$INTEGRATE_CHANGES" == "true" && -f "$TASKS_FILE" ]]; then
 
     print -P "%F{green}[UPDATE]%f Task hierarchy updated with PRD changes."
 
+    # The update agent may have introduced non-canonical numbering for newly
+    # added items — canonicalize before committing, same as PHASE 0.
+    canonicalize_task_ids "$TASKS_FILE" "$SESSION_DIR"
+
     # Commit the updated tasks
     git add "$TASKS_FILE" 2>/dev/null
     git commit -m "Update tasks for PRD changes (mid-session integration)" &>/dev/null || true
@@ -4742,6 +5763,7 @@ if [[ -z "$SESSION_DIR" ]]; then
     print -P "%F{red}[ERROR]%f No session directory resolved (SESSION_DIR is empty)."
     print -P "%F{cyan}[INFO]%f This usually means $PRD_FILE was not found in $(pwd)."
     print -P "%F{cyan}[INFO]%f Run from the project root containing $PRD_FILE, or set PRD_FILE."
+    print -P "%F{cyan}[INFO]%f No PRD at all? If you have a standalone plan document, run with --plan <file>."
     exit 1
 fi
 
@@ -4798,7 +5820,7 @@ JSON
         print -P "%F{red}[ERROR]%f Failed to write a valid baseline tasks.json to $TASKS_FILE."
         exit 1
     fi
-    git add "$TASKS_FILE" "$SESSION_DIR" 2>/dev/null
+    git add "$TASKS_FILE" "$SESSION_DIR" "$PRD_FILE" 2>/dev/null
     git commit -m "Adopt baseline: stub completed tasks.json (PRD already implemented)" &>/dev/null || true
     SKIP_EXECUTION_LOOP=true
     print -P "%F{green}[ADOPT]%f Baseline established. Proceeding to validation + bug hunt."
@@ -4810,16 +5832,23 @@ if [[ ! -f "$TASKS_FILE" ]]; then
     mkdir -p "$SESSION_DIR/architecture"
     # Always max thinking (xhigh) for breakdowns: decomposition + research
     # synthesis into Phase>Milestone>Task>Subtask needs the deepest reasoning.
-    run_with_retry_stdin "$TASK_BREAKDOWN_PROMPT" $BREAKDOWN_AGENT --thinking xhigh --session-id "prd-breakdown-$(basename "$SESSION_DIR")" --system-prompt "$TASK_BREAKDOWN_SYSTEM_PROMPT"
+    PRD_PANE_LABEL="breakdown $(basename "$SESSION_DIR")" PRD_PANE_SESSION="prd-breakdown-$(basename "$SESSION_DIR")" run_with_retry_stdin "$TASK_BREAKDOWN_PROMPT" $BREAKDOWN_AGENT --thinking xhigh --session-id "prd-breakdown-$(basename "$SESSION_DIR")" --system-prompt "$TASK_BREAKDOWN_SYSTEM_PROMPT"
 
     # If file still doesn't exist, demand the agent write it
     if [[ ! -f "$TASKS_FILE" ]]; then
         print -P "%F{yellow}[PHASE 0]%f $TASKS_FILE not found. Demanding agent write it..."
-        run_with_retry_stdin "You did NOT write the tasks file. You MUST write the JSON breakdown to \`./$TASKS_FILE\` (CURRENT WORKING DIRECTORY) immediately. Do NOT search for tasks.json in other directories. Create a NEW file at exactly \`./$TASKS_FILE\`. Use your file writing tools NOW." $BREAKDOWN_AGENT --thinking xhigh --session-id "prd-breakdown-$(basename "$SESSION_DIR")" --system-prompt "$TASK_BREAKDOWN_SYSTEM_PROMPT"
+        PRD_PANE_LABEL="breakdown (retry)" PRD_PANE_SESSION="prd-breakdown-$(basename "$SESSION_DIR")" run_with_retry_stdin "You did NOT write the tasks file. You MUST write the JSON breakdown to \`./$TASKS_FILE\` (CURRENT WORKING DIRECTORY) immediately. Do NOT search for tasks.json in other directories. Create a NEW file at exactly \`./$TASKS_FILE\`. Use your file writing tools NOW." $BREAKDOWN_AGENT --thinking xhigh --session-id "prd-breakdown-$(basename "$SESSION_DIR")" --system-prompt "$TASK_BREAKDOWN_SYSTEM_PROMPT"
     fi
 
     if [[ -f "$TASKS_FILE" ]]; then
         print -P "%F{green}[PHASE 0]%f Task breakdown complete."
+
+        # Deterministic ID repair before anything consumes the file: models
+        # sometimes number siblings as a continuation (T2's subtasks S4..S6
+        # instead of S1..S3), which breaks every index-derived lookup below.
+        # Renumber positionally and rewrite all references (id fields,
+        # dependencies, prose) so the committed tree is canonical.
+        canonicalize_task_ids "$TASKS_FILE" "$SESSION_DIR"
 
         # Cleanup phase: organize .md files created during breakdown
         print -P "%F{blue}[CLEANUP]%f Organizing files after task breakdown..."
@@ -4827,7 +5856,7 @@ if [[ ! -f "$TASKS_FILE" ]]; then
 
         # Commit the task breakdown
         print -P "%F{blue}[GIT]%f Committing task breakdown..."
-        git add "$TASKS_FILE" "$SESSION_DIR" 2>/dev/null
+        git add "$TASKS_FILE" "$SESSION_DIR" "$PRD_FILE" 2>/dev/null
         git commit -m "Add task breakdown and architecture research" &>/dev/null || true
     fi
 fi
@@ -4838,6 +5867,7 @@ fi
 # Print current scope configuration
 print -P "%F{cyan}[CONFIG]%f Scope: %F{yellow}$SCOPE%f (Default: task)"
 [[ $BREAKDOWN_AGENT != "$AGENT" ]] && print -P "%F{cyan}[CONFIG]%f Breakdown agent: %F{yellow}$BREAKDOWN_AGENT%f"
+[[ "$PRD_TMUX_PANES_ON" == "true" ]] && print -P "%F{cyan}[CONFIG]%f tmux agent panes: %F{yellow}on%f (window $PRD_TMUX_WIN; disable with --no-tmux-panes)"
 print -P "%F{cyan}[CONFIG]%f Planning agent (glm-5.2): %F{yellow}$AGENT%f"
 print -P "%F{cyan}[CONFIG]%f Implementation agent (turbo): %F{yellow}$IMPL_AGENT%f"
 if [[ "$PARALLEL_RESEARCH" == "true" ]]; then
@@ -4881,6 +5911,12 @@ if [[ ! -f "$TASKS_FILE" ]] || [[ ! -s "$TASKS_FILE" ]] || ! jq empty "$TASKS_FI
     fi
     print -P "%F{green}[OK]%f Tasks file recovered successfully"
 fi
+
+# Deterministic ID canonicalization on EVERY load of the task tree (see
+# canonicalize_task_ids): positional numbering + reference rewrites, so a
+# mid-flight file with drifted numbering can never reach the index-derived
+# lookups in the execution loops. No-op (and no write) when already canonical.
+canonicalize_task_ids "$TASKS_FILE" "$SESSION_DIR"
 
 total_phases=$(jq '.backlog | length // 0' "$TASKS_FILE" 2>/dev/null)
 if [[ -z "$total_phases" || "$total_phases" == "null" ]]; then
@@ -5056,7 +6092,7 @@ fi
 # Final Validation Step (skip if bug-hunt only mode)
 if [[ "$ONLY_BUG_HUNT" != "true" ]]; then
 print -P "\n%F{magenta}[VALIDATION]%f Starting final validation..."
-PI_AGENT_TIMEOUT=$VALIDATION_TIMEOUT run_with_retry_stdin "$VALIDATION_PROMPT" $VALIDATION_AGENT --no-session
+PRD_PANE_LABEL="validation" PRD_PANE_JSON=1 PI_AGENT_TIMEOUT=$VALIDATION_TIMEOUT run_with_retry_stdin "$VALIDATION_PROMPT" $VALIDATION_AGENT --no-session
 validation_rc=$?
 if [[ $validation_rc -ne 0 ]]; then
     print -P "%F{red}[ERROR]%f Validation did not finish (exit $validation_rc). Aborting before cleanup/commit/bug-hunt."
@@ -5123,7 +6159,7 @@ if [[ -f "validation_report.md" ]]; then
         # 4h) — same override pattern validation uses. The default PI_AGENT_TIMEOUT
         # (1h) is far too short for a phase that re-runs full test suites.
         fix_rc=0
-        PI_AGENT_TIMEOUT=$FIX_TIMEOUT run_with_retry_stdin "$FIX_PROMPT" $IMPL_AGENT --no-session || fix_rc=$?
+        PRD_PANE_LABEL="fixer" PRD_PANE_JSON=1 PI_AGENT_TIMEOUT=$FIX_TIMEOUT run_with_retry_stdin "$FIX_PROMPT" $IMPL_AGENT --no-session || fix_rc=$?
         if (( fix_rc == 0 )); then
             print -P "%F{green}[FIX]%f Fixes applied."
         elif (( fix_rc == 124 )); then
@@ -5334,7 +6370,7 @@ ${EXPANDED_BUG_PROMPT}"
         # than failing the run. The agent holds its findings in context, making
         # the nudge a lossless self-conversion. stdin prompt + --session-id is the
         # same pattern PRP creation uses.
-        CAPTURE_STDOUT="$BUG_HUNT_TRANSCRIPT" run_with_retry_stdin "$EXPANDED_BUG_PROMPT" $BUG_FINDER_AGENT --session-id "$BUG_HUNT_SESSION_ID"
+        CAPTURE_STDOUT="$BUG_HUNT_TRANSCRIPT" PRD_PANE_LABEL="bug hunt" PRD_PANE_SESSION="$BUG_HUNT_SESSION_ID" run_with_retry_stdin "$EXPANDED_BUG_PROMPT" $BUG_FINDER_AGENT --session-id "$BUG_HUNT_SESSION_ID"
     fi
     # --- Resolve the verdict DETERMINISTICALLY from the agent's own output ---
     #
@@ -5456,9 +6492,11 @@ Output your JSON verdict now.'
             # resolve_bug_verdict still sees it and picks the LAST valid object.
             # pipefail gives us the agent exit status, not tee.
             setopt pipefail
+            prd_pane_open "bug hunt (nudge $nudge_attempt)" "$BUG_HUNT_SESSION_ID"
             $BUG_FINDER_AGENT --session-id "$BUG_HUNT_SESSION_ID" -p "$NUDGE_PROMPT" < /dev/null 2>&1 | tee -a "$BUG_HUNT_TRANSCRIPT" >/dev/null
             nudge_rc=$?
             unsetopt pipefail
+            prd_pane_close
             # ALWAYS re-resolve -- never break on a non-zero exit (see above).
             VERDICT_LINE=$(resolve_bug_verdict "$BUG_HUNT_TRANSCRIPT" "$BUG_RESULTS_JSON" 2>/dev/null)
             BUG_VERDICT=$(echo "$VERDICT_LINE" | jq -r '.verdict // "invalid"' 2>/dev/null)
@@ -5607,18 +6645,26 @@ if [[ "$SINGLE_SESSION" == "false" && -n "$SESSION_DIR" ]]; then
         CURRENT_HASH=$(hash_prd_content "$PRD_FILE")
 
         if [[ "$PENDING_HASH" == "$CURRENT_HASH" ]]; then
-            print -P "%F{cyan}[SESSION]%f Processing queued delta session..."
             rm "$SESSION_DIR/.pending_delta_hash"
 
-            # Create new delta session
+            # Create new session: diff-based delta normally, or a direct plan
+            # session in standalone-plan mode (no delta generation).
             PREV_SESSION_DIR="$SESSION_DIR"
             NEW_SESSION_NUM=$((CURRENT_SESSION_NUM + 1))
             NEW_SESSION_DIR=$(create_session $NEW_SESSION_NUM "$CURRENT_HASH")
-            echo "$CURRENT_SESSION_NUM" > "$NEW_SESSION_DIR/delta_from.txt"
             write_resolved_prd "$NEW_SESSION_DIR/prd_snapshot.md"
 
-            print -P "%F{green}[SESSION]%f Created delta session: $(basename "$NEW_SESSION_DIR")"
-            print -P "%F{cyan}[SESSION]%f Re-running pipeline for delta session..."
+            if [[ "$STANDALONE_PLAN" == "true" ]]; then
+                print -r -- "$PRD_FILE" > "$NEW_SESSION_DIR/.standalone_plan"
+                print -P "%F{cyan}[SESSION]%f Processing queued plan session..."
+                print -P "%F{green}[SESSION]%f Created plan session: $(basename "$NEW_SESSION_DIR")"
+                print -P "%F{cyan}[SESSION]%f Re-running pipeline for plan session..."
+            else
+                echo "$CURRENT_SESSION_NUM" > "$NEW_SESSION_DIR/delta_from.txt"
+                print -P "%F{cyan}[SESSION]%f Processing queued delta session..."
+                print -P "%F{green}[SESSION]%f Created delta session: $(basename "$NEW_SESSION_DIR")"
+                print -P "%F{cyan}[SESSION]%f Re-running pipeline for delta session..."
+            fi
 
             # Ensure the in-flight background commit has landed before replacing
             # this process — exec does NOT fire the EXIT trap, so without this
